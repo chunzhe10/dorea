@@ -464,21 +464,20 @@ def generate_lut(params: dict) -> LUT3D:
     """
     logger.info("Generating %dx%dx%d 3D LUT...", LUT_SIZE, LUT_SIZE, LUT_SIZE)
 
-    # Create a unity LUT as starting point — table[b, g, r, channel]
-    # where channel indices map to (R, G, B)
+    # Create a unity LUT — colour.LUT3D expects table[R, G, B, channel]
     table = np.zeros((LUT_SIZE, LUT_SIZE, LUT_SIZE, 3), dtype=np.float64)
 
     # Generate the grid of input values
     steps = np.linspace(0.0, 1.0, LUT_SIZE)
 
     # Fill the grid with input D-Log M values
-    # .cube format: R changes fastest (innermost), then G, then B (outermost)
-    # colour.LUT3D table indexing: table[B_idx, G_idx, R_idx, channel]
-    for bi, b_val in enumerate(steps):
+    # colour.LUT3D indexing: table[R_idx, G_idx, B_idx, channel]
+    # .cube output: R changes fastest (handled by colour.io writer)
+    for ri, r_val in enumerate(steps):
         for gi, g_val in enumerate(steps):
-            table[bi, gi, :, 0] = steps       # R values
-            table[bi, gi, :, 1] = g_val        # G value (constant for this row)
-            table[bi, gi, :, 2] = b_val        # B value (constant for this slice)
+            table[ri, gi, :, 0] = r_val        # R value (constant for this slice)
+            table[ri, gi, :, 1] = g_val        # G value (constant for this row)
+            table[ri, gi, :, 2] = steps         # B values
 
     # Apply correction to all grid points at once (vectorised)
     original_shape = table.shape

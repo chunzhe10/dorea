@@ -465,7 +465,7 @@ def apply_drx_template(timeline_item, drx_path: str) -> bool:
     Returns True on success, False on failure.
     """
     try:
-        result = timeline_item.ApplyGradeFromDRX(drx_path, grade_mode=0)
+        result = timeline_item.ApplyGradeFromDRX(drx_path, 0)
         if result:
             logger.debug("  Applied DRX template")
             return True
