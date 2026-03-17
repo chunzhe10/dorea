@@ -386,7 +386,7 @@ def main():
 
     if device.startswith("cuda"):
         gpu_name = torch.cuda.get_device_name(0)
-        total_vram = torch.cuda.get_device_properties(0).total_mem / (1024 * 1024)
+        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
         logger.info("GPU: %s (%.0f MB VRAM)", gpu_name, total_vram)
 
     # Load depth model
