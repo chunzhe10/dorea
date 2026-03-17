@@ -76,7 +76,7 @@ def discover_clips(footage_dir: Path) -> list[Path]:
     return clips
 
 
-def extract_frames(clip_path: Path, output_dir: Path) -> int:
+def extract_frames(clip_path: Path, output_dir: Path, fps: float = 0.5) -> int:
     """Extract keyframes from a single clip using ffmpeg.
 
     Returns the number of frames extracted, or -1 on failure.
@@ -85,8 +85,9 @@ def extract_frames(clip_path: Path, output_dir: Path) -> int:
 
     cmd = [
         "ffmpeg",
+        "-y",
         "-i", str(clip_path),
-        "-vf", "fps=0.5,scale=1280:-1",
+        "-vf", f"fps={fps},scale=1280:-1",
         "-q:v", "5",
         str(output_dir / "frame_%06d.jpg"),
     ]
@@ -164,6 +165,10 @@ def main():
 
     logger.info("Found %d clip(s) to process", len(clips))
 
+    # Compute fps from config sample rate
+    sample_rate = config.get("frame_sample_rate_seconds", 2)
+    fps = 1.0 / sample_rate
+
     # Process each clip
     total_frames = 0
     successful_clips = 0
@@ -173,7 +178,7 @@ def main():
         clip_id = clip_path.stem
         output_dir = keyframes_dir / clip_id
 
-        frame_count = extract_frames(clip_path, output_dir)
+        frame_count = extract_frames(clip_path, output_dir, fps=fps)
 
         if frame_count < 0:
             failed_clips += 1
