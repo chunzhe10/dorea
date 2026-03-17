@@ -37,6 +37,10 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Rough pricing per million tokens (claude-sonnet-4-6)
+INPUT_COST_PER_MTOK = 3.0
+OUTPUT_COST_PER_MTOK = 15.0
+
 # System prompt for Claude scene analysis
 SYSTEM_PROMPT = """\
 You are analysing underwater dive footage. You will receive a sequence of keyframes \
@@ -293,8 +297,7 @@ def estimate_batch_cost(batch: list[tuple[int, Path]], model: str) -> dict:
     input_tokens = image_tokens + system_tokens + text_tokens
     output_tokens = 500  # rough estimate for response
 
-    # Pricing for claude-sonnet-4-6 (rough): $3/MTok input, $15/MTok output
-    cost_usd = (input_tokens * 3.0 + output_tokens * 15.0) / 1_000_000
+    cost_usd = (input_tokens * INPUT_COST_PER_MTOK + output_tokens * OUTPUT_COST_PER_MTOK) / 1_000_000
 
     return {
         "input_tokens": input_tokens,
@@ -389,17 +392,27 @@ def analyse_clip(
         new_subjects = parse_claude_response(response_text)
 
         # Validate and add subjects
+        batch_frame_nums = {f[0] for f in batch}
         valid_count = 0
         for subject in new_subjects:
-            if validate_subject(subject):
-                all_subjects.append(subject)
-                valid_count += 1
-                logger.info(
-                    "    Found: %s (frame %d, confidence: %s)",
-                    subject["label"],
-                    subject["first_appearance_frame"],
-                    subject["confidence"],
+            if not validate_subject(subject):
+                continue
+            # Check frame number is in this batch
+            if subject["first_appearance_frame"] not in batch_frame_nums:
+                nearest = min(batch_frame_nums, key=lambda n: abs(n - subject["first_appearance_frame"]))
+                logger.warning(
+                    "    Subject '%s' references frame %d not in batch; clamping to %d",
+                    subject["label"], subject["first_appearance_frame"], nearest,
                 )
+                subject["first_appearance_frame"] = nearest
+            all_subjects.append(subject)
+            valid_count += 1
+            logger.info(
+                "    Found: %s (frame %d, confidence: %s)",
+                subject["label"],
+                subject["first_appearance_frame"],
+                subject["confidence"],
+            )
 
         if valid_count == 0 and new_subjects:
             logger.warning(
@@ -411,7 +424,7 @@ def analyse_clip(
 
     # Log token totals for this clip
     if not dry_run and total_input_tokens > 0:
-        est_cost = (total_input_tokens * 3.0 + total_output_tokens * 15.0) / 1_000_000
+        est_cost = (total_input_tokens * INPUT_COST_PER_MTOK + total_output_tokens * OUTPUT_COST_PER_MTOK) / 1_000_000
         logger.info(
             "Clip %s: %d subject(s) found | Tokens: %d in, %d out (~$%.4f)",
             clip_id, len(all_subjects),
