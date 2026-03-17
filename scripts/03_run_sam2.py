@@ -358,6 +358,16 @@ def load_sam2_model(
     """
     from sam2.build_sam import build_sam2_video_predictor
 
+    # Ensure hydra can find SAM2.1 configs in the configs/sam2.1/ subdirectory
+    # by re-initializing with the configs subpackage as search path
+    from hydra.core.global_hydra import GlobalHydra
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    from hydra import initialize_config_dir
+    import sam2 as _sam2_pkg
+    sam2_configs_dir = str(Path(_sam2_pkg.__file__).parent / "configs" / "sam2.1")
+    initialize_config_dir(config_dir=sam2_configs_dir, version_base="1.2")
+
     logger.info("Loading SAM2 model: config=%s, weights=%s", config_name, checkpoint_path)
 
     if torch.cuda.is_available():
