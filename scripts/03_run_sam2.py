@@ -255,12 +255,12 @@ def bbox_normalised_to_pixel(
     Returns [x_min, y_min, x_max, y_max] in pixel space.
     """
     x_min, y_min, x_max, y_max = bbox_normalised
-    return [
+    return np.array([
         x_min * width,
         y_min * height,
         x_max * width,
         y_max * height,
-    ]
+    ], dtype=np.float32)
 
 
 def save_mask_as_png(
@@ -397,7 +397,7 @@ def track_subject(
     consecutive_empty = 0
     subject_exited = False
 
-    with torch.inference_mode(), torch.autocast(device, dtype=torch.bfloat16):
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         # Initialise SAM2 state for this video
         state = predictor.init_state(
             video_path=frame_dir,
@@ -644,6 +644,7 @@ def main():
         sys.exit(1)
 
     # Load SAM2 model once for all clips
+    predictor = None
     try:
         predictor = load_sam2_model(sam2_config_name, sam2_weights_path, device)
     except Exception as e:
@@ -715,7 +716,8 @@ def main():
 
     finally:
         # Always unload the model, even if processing fails
-        unload_sam2_model(predictor, device)
+        if predictor is not None:
+            unload_sam2_model(predictor, device)
 
     # Summary
     logger.info("--- SAM2 tracking complete ---")

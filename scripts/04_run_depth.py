@@ -46,8 +46,13 @@ VIDEO_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI"}
 
 logger = logging.getLogger(__name__)
 
-# HuggingFace model ID for Depth Anything V2 Small
-HF_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
+# Map config model names to HuggingFace model IDs
+DEPTH_MODEL_MAP = {
+    "depth_anything_v2_small": "depth-anything/Depth-Anything-V2-Small-hf",
+    "depth_anything_v2_base": "depth-anything/Depth-Anything-V2-Base-hf",
+    "depth_anything_v2_large": "depth-anything/Depth-Anything-V2-Large-hf",
+}
+DEFAULT_MODEL = "depth_anything_v2_small"
 
 
 def find_workspace_root() -> Path:
@@ -93,7 +98,7 @@ def discover_clips(footage_dir: Path) -> list[Path]:
 
 
 def load_depth_model(
-    weights_path: Path, device: str
+    weights_path: Path, device: str, model_name: str = DEFAULT_MODEL
 ) -> tuple:
     """Load the Depth Anything V2 model and image processor.
 
@@ -104,15 +109,23 @@ def load_depth_model(
     """
     from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
+    hf_model_id = DEPTH_MODEL_MAP.get(model_name)
+    if not hf_model_id:
+        logger.error(
+            "Unknown depth model '%s'. Supported: %s",
+            model_name, ", ".join(DEPTH_MODEL_MAP.keys()),
+        )
+        sys.exit(1)
+
     # Determine model source: local directory or HuggingFace ID
     if weights_path.is_dir() and (weights_path / "config.json").is_file():
         model_source = str(weights_path)
         logger.info("Loading depth model from local weights: %s", weights_path)
     else:
-        model_source = HF_MODEL_ID
+        model_source = hf_model_id
         logger.info(
             "Local weights not found at %s; loading from HuggingFace: %s",
-            weights_path, HF_MODEL_ID,
+            weights_path, hf_model_id,
         )
 
     try:
@@ -164,7 +177,7 @@ def run_depth_inference(
     inputs = processor(images=image, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model(**inputs)
 
     # Extract predicted depth — shape is (1, H, W) or (1, 1, H, W)
@@ -205,11 +218,13 @@ def save_depth_map_16bit(depth_float: np.ndarray, output_path: Path) -> None:
 
     # Save using OpenCV (reliable 16-bit PNG support)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(
+    success = cv2.imwrite(
         str(output_path),
         depth_uint16,
         [cv2.IMWRITE_PNG_COMPRESSION, 3],  # moderate compression (0-9)
     )
+    if not success:
+        raise RuntimeError(f"cv2.imwrite failed for {output_path}")
 
 
 def process_clip(
@@ -357,6 +372,7 @@ def main():
 
     # Resolve model config
     device = config.get("gpu_device", "cuda:0")
+    model_name = config.get("depth_model", DEFAULT_MODEL)
     weights_path = workspace_root / config.get("depth_weights", "models/depth_anything_v2_small/")
 
     # Check CUDA availability
@@ -376,7 +392,7 @@ def main():
     # Load depth model
     logger.info("Loading Depth Anything V2 model...")
     pipeline_start_time = time.monotonic()
-    processor, model = load_depth_model(weights_path, device)
+    processor, model = load_depth_model(weights_path, device, model_name=model_name)
 
     # Process each clip
     total_depth_maps = 0
