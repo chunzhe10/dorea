@@ -262,20 +262,38 @@ def get_video_info(video_path: Path) -> dict | None:
     return {"width": width, "height": height, "frame_count": frame_count}
 
 
-def extract_frames_to_dir(video_path: Path, output_dir: Path) -> int:
+def extract_frames_to_dir(
+    video_path: Path, output_dir: Path, max_short_edge: int = 1024
+) -> int:
     """Extract all frames from a video to a directory as JPEG files using ffmpeg.
 
     SAM2 expects a directory of JPEG frames named sequentially (e.g., 000000.jpg,
     000001.jpg, ...). We extract starting from frame 0 of the video.
 
+    Frames are downscaled so the short edge is at most max_short_edge pixels.
+    SAM2 internally resizes to 1024px, so extracting at native 4K wastes memory
+    and causes OOM on 6GB VRAM cards with long clips.
+
     Returns the number of frames extracted, or -1 on failure.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Scale so the short edge is at most max_short_edge pixels.
+    # If already small enough, pass through unchanged.
+    # For landscape (w>h): scale height to max_short_edge, width=-2 (auto)
+    # For portrait (h>w): scale width to max_short_edge, height=-2 (auto)
+    scale_filter = (
+        f"scale='if(lte(min(iw,ih),{max_short_edge}),iw,"
+        f"if(lte(iw,ih),{max_short_edge},-2))'"
+        f":'if(lte(min(iw,ih),{max_short_edge}),ih,"
+        f"if(gt(iw,ih),{max_short_edge},-2))'"
+    )
 
     cmd = [
         "ffmpeg",
         "-y",
         "-i", str(video_path),
+        "-vf", scale_filter,
         "-start_number", "0",
         "-q:v", "2",  # high quality JPEG
         str(output_dir / "%06d.jpg"),
