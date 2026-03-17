@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Note: model weights live at workspace root (dorea-workspace/models/),
+# not inside this repo. The workspace .gitignore handles them.
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

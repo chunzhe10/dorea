@@ -1,0 +1,22 @@
+# Dorea pipeline dependencies
+# Install: pip install -r requirements.txt
+
+# Core
+anthropic
+colour-science
+numpy
+Pillow
+opencv-python
+pyyaml
+
+# AI models (pinned to CUDA 12.1 wheels)
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+transformers
+
+# SAM2 — install from GitHub after pip install:
+# pip install git+https://github.com/facebookresearch/sam2.git
+
+# Video
+# ffmpeg must be installed as a system package (apt install ffmpeg)
