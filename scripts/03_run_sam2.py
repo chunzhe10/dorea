@@ -212,9 +212,7 @@ def get_video_info(video_path: Path) -> dict | None:
     return {"width": width, "height": height, "frame_count": frame_count}
 
 
-def extract_frames_to_dir(
-    video_path: Path, output_dir: Path, start_frame: int = 0
-) -> int:
+def extract_frames_to_dir(video_path: Path, output_dir: Path) -> int:
     """Extract all frames from a video to a directory as JPEG files using ffmpeg.
 
     SAM2 expects a directory of JPEG frames named sequentially (e.g., 000000.jpg,
