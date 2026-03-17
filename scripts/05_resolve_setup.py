@@ -12,8 +12,8 @@ Usage:
 
 Inputs:
     - Raw footage files from footage/raw/{date}/ and footage/flat/{date}/
-    - working/masks/{clip_id}/{subject_label}/ — SAM2 mask PNG sequences from Phase 3
-    - working/depth/{clip_id}/ — depth map PNG sequences from Phase 4
+    - working/masks/{date}/{clip_id}/{subject_label}/ — SAM2 mask PNG sequences from Phase 3
+    - working/depth/{date}/{clip_id}/ — depth map PNG sequences from Phase 4
     - repos/dorea/luts/underwater_base.cube — reference LUT from Phase 0
     - repos/dorea/templates/underwater_grade_v1.drx — DRX node graph template
 
@@ -34,14 +34,18 @@ Architecture doc: Sections 5 and 7
 import argparse
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 
-import yaml
-
-# Video file extensions to scan (case-insensitive matching via explicit variants)
-VIDEO_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI"}
+from pipeline_utils import (
+    VIDEO_EXTENSIONS,
+    configure_logging,
+    deduplicate_clips,
+    find_workspace_root,
+    load_config,
+    resolve_working_paths,
+    validate_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,36 +81,6 @@ MARINE_LIFE_KEYWORDS = {
     "coral", "anemone", "sponge", "sea_fan", "sea_star", "starfish",
     "urchin", "cucumber", "bommie",
 }
-
-
-def find_workspace_root() -> Path:
-    """Resolve the workspace root directory.
-
-    Uses $CORVIA_WORKSPACE if set, otherwise walks up from the script location
-    to find the directory containing repos/dorea.
-    """
-    env_root = os.environ.get("CORVIA_WORKSPACE")
-    if env_root:
-        return Path(env_root)
-
-    # Walk up from script location: scripts/ -> dorea/ -> repos/ -> workspace root
-    candidate = Path(__file__).resolve().parent.parent.parent.parent
-    if (candidate / "repos" / "dorea").is_dir():
-        return candidate
-
-    # Fallback: hardcoded devcontainer path
-    return Path("/workspaces/dorea-workspace")
-
-
-def load_config(workspace_root: Path) -> dict:
-    """Load pipeline config from repos/dorea/config.yaml."""
-    config_path = workspace_root / "repos" / "dorea" / "config.yaml"
-    if not config_path.is_file():
-        logger.error("Config file not found: %s", config_path)
-        sys.exit(1)
-
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
 
 
 def discover_footage(raw_dir: Path, flat_dir: Path) -> list[Path]:
@@ -219,7 +193,7 @@ def assign_subjects_to_nodes(subjects: list[dict]) -> dict[int, dict]:
 def find_mask_sequence_dir(masks_base: Path, clip_id: str, label: str) -> Path | None:
     """Find the mask sequence directory for a specific subject.
 
-    Expected path: working/masks/{clip_id}/{label}/
+    Expected path: working/masks/{date}/{clip_id}/{label}/
     Returns the path if it exists and contains PNG files, else None.
     """
     mask_dir = masks_base / clip_id / label
@@ -237,7 +211,7 @@ def find_mask_sequence_dir(masks_base: Path, clip_id: str, label: str) -> Path |
 def find_depth_sequence_dir(depth_base: Path, clip_id: str) -> Path | None:
     """Find the depth map sequence directory for a clip.
 
-    Expected path: working/depth/{clip_id}/
+    Expected path: working/depth/{date}/{clip_id}/
     Returns the path if it exists and contains PNG files, else None.
     """
     depth_dir = depth_base / clip_id
@@ -697,35 +671,105 @@ def process_timeline_item(
     return result
 
 
+def dry_run_validate(
+    clips: list[Path],
+    masks_base: Path,
+    depth_base: Path,
+    scene_analysis_dir: Path,
+    lut_path: Path,
+    drx_path: Path,
+) -> None:
+    """Dry-run mode: validate all inputs and show per-clip summary."""
+    logger.info("[DRY RUN] Validating inputs — Resolve connection skipped")
+    logger.info("")
+
+    # Template/LUT validation
+    logger.info("Templates:")
+    logger.info("  LUT:  %s %s", lut_path, "(OK)" if lut_path.is_file() else "(MISSING)")
+    logger.info("  DRX:  %s %s", drx_path, "(OK)" if drx_path.is_file() else "(MISSING)")
+    logger.info("")
+
+    # Per-clip validation
+    total_issues = 0
+    for clip_path in clips:
+        clip_id = clip_path.stem
+        logger.info("--- Clip: %s ---", clip_id)
+        logger.info("  Source: %s", clip_path)
+
+        # Scene analysis
+        scene_json = scene_analysis_dir / f"{clip_id}.json"
+        if scene_json.is_file():
+            try:
+                with open(scene_json, "r") as f:
+                    data = json.load(f)
+                subjects = data.get("subjects", [])
+                logger.info("  Scene analysis: %d subject(s)", len(subjects))
+                for s in subjects:
+                    logger.info("    - %s (frame %d, %s)", s.get("label"), s.get("first_appearance_frame", 0), s.get("confidence", "?"))
+            except Exception as e:
+                logger.warning("  Scene analysis: ERROR reading %s: %s", scene_json, e)
+                total_issues += 1
+        else:
+            logger.warning("  Scene analysis: MISSING (%s)", scene_json)
+            total_issues += 1
+
+        # Masks
+        mask_clip_dir = masks_base / clip_id
+        if mask_clip_dir.is_dir():
+            mask_labels = [d.name for d in mask_clip_dir.iterdir() if d.is_dir()]
+            logger.info("  Masks: %d label(s) — %s", len(mask_labels), ", ".join(mask_labels) or "none")
+        else:
+            logger.warning("  Masks: MISSING (%s)", mask_clip_dir)
+            total_issues += 1
+
+        # Depth
+        depth_clip_dir = depth_base / clip_id
+        if depth_clip_dir.is_dir():
+            png_count = len([f for f in depth_clip_dir.iterdir() if f.suffix == ".png"])
+            logger.info("  Depth: %d frame(s)", png_count)
+        else:
+            logger.warning("  Depth: MISSING (%s)", depth_clip_dir)
+            total_issues += 1
+
+    logger.info("")
+    logger.info("[DRY RUN] Summary: %d clip(s), %d issue(s) found", len(clips), total_issues)
+    if total_issues == 0:
+        logger.info("[DRY RUN] All inputs validated. Ready for live run.")
+    else:
+        logger.warning("[DRY RUN] Fix %d issue(s) before running live.", total_issues)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Set up DaVinci Resolve project with footage, grades, and mattes"
     )
     parser.add_argument("--date", required=True, help="Dive date YYYY-MM-DD")
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs and show summary without connecting to Resolve",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable debug logging"
     )
     args = parser.parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging(verbose=args.verbose)
+
+    validate_date(args.date)
 
     workspace_root = find_workspace_root()
     logger.info("Workspace root: %s", workspace_root)
 
     config = load_config(workspace_root)
 
-    # Resolve paths from config
+    # Resolve paths from config (date-scoped)
     raw_dir = workspace_root / config["footage_raw"] / args.date
     flat_dir = workspace_root / config["footage_flat"] / args.date
-    working_dir = workspace_root / config["working_dir"]
-    masks_base = working_dir / "masks"
-    depth_base = working_dir / "depth"
-    scene_analysis_dir = working_dir / "scene_analysis"
+    paths = resolve_working_paths(workspace_root, config, args.date)
+    masks_base = paths["masks"]
+    depth_base = paths["depth"]
+    scene_analysis_dir = paths["scene_analysis"]
 
     # Resolve template and LUT paths
     lut_rel = config.get("resolve_lut_path", "repos/dorea/luts/underwater_base.cube")
@@ -763,8 +807,8 @@ def main():
             drx_path,
         )
 
-    # Discover footage
-    clips = discover_footage(raw_dir, flat_dir)
+    # Discover footage (deduplicate raw/flat by stem)
+    clips = deduplicate_clips(discover_footage(raw_dir, flat_dir))
     if not clips:
         logger.error(
             "No footage files found for date %s. "
@@ -776,6 +820,11 @@ def main():
     logger.info("Found %d footage clip(s)", len(clips))
     for clip in clips:
         logger.debug("  %s", clip)
+
+    # --- Dry-run mode: validate and exit ---
+    if args.dry_run:
+        dry_run_validate(clips, masks_base, depth_base, scene_analysis_dir, lut_path, drx_path)
+        return
 
     # --- Connect to Resolve ---
     resolve = connect_to_resolve()

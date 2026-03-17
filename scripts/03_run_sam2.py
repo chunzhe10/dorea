@@ -9,11 +9,11 @@ Usage:
     python 03_run_sam2.py --date 2026-03-17 --verbose
 
 Inputs:
-    - working/scene_analysis/{clip_id}.json — from Phase 2
+    - working/scene_analysis/{date}/{clip_id}.json — from Phase 2
     - Raw footage files (for full-resolution frame access)
 
 Outputs:
-    - working/masks/{clip_id}/{subject_label}/frame_NNNNNN.png
+    - working/masks/{date}/{clip_id}/{subject_label}/frame_NNNNNN.png
       (binary alpha mask, 0 or 255 per pixel)
 
 Dependencies:
@@ -28,21 +28,27 @@ Architecture doc: Section 4.3
 import argparse
 import json
 import logging
-import os
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 from PIL import Image
 
-logger = logging.getLogger(__name__)
+from pipeline_utils import (
+    VIDEO_EXTENSIONS,
+    configure_logging,
+    find_workspace_root,
+    get_progress_bar,
+    load_config,
+    resolve_working_paths,
+    validate_date,
+)
 
-# Video file extensions to scan (case-insensitive matching via explicit variants)
-VIDEO_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI"}
+logger = logging.getLogger(__name__)
 
 # SAM2 model config name mapping
 SAM2_CONFIG_MAP = {
@@ -59,34 +65,75 @@ MASK_EXIT_THRESHOLD = 0.0005  # 0.05% of frame area
 EXIT_FRAME_GAP = 30
 
 
-def find_workspace_root() -> Path:
-    """Resolve the workspace root directory.
+# SAM2 model download URLs (Meta hosted)
+SAM2_DOWNLOAD_URLS = {
+    "sam2_tiny": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
+    "sam2_small": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt",
+    "sam2_base_plus": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt",
+    "sam2_large": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
+}
 
-    Uses $CORVIA_WORKSPACE if set, otherwise walks up from the script location
-    to find the directory containing repos/dorea.
+
+def download_sam2_weights(model_key: str, target_path: Path) -> bool:
+    """Download SAM2 model weights from Meta's servers.
+
+    Downloads to a .tmp file then atomically renames to prevent partial downloads.
+    Logs progress every 10%.
+
+    Returns True on success, False on failure.
     """
-    env_root = os.environ.get("CORVIA_WORKSPACE")
-    if env_root:
-        return Path(env_root)
+    url = SAM2_DOWNLOAD_URLS.get(model_key)
+    if not url:
+        logger.error(
+            "No download URL for model '%s'. Valid options: %s",
+            model_key, ", ".join(SAM2_DOWNLOAD_URLS.keys()),
+        )
+        return False
 
-    # Walk up from script location: scripts/ -> dorea/ -> repos/ -> workspace root
-    candidate = Path(__file__).resolve().parent.parent.parent.parent
-    if (candidate / "repos" / "dorea").is_dir():
-        return candidate
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_suffix(".pt.tmp")
 
-    # Fallback: hardcoded devcontainer path
-    return Path("/workspaces/dorea-workspace")
+    logger.info("Downloading SAM2 weights: %s", url)
+    logger.info("Target: %s", target_path)
 
+    try:
+        response = urllib.request.urlopen(url)
+        total_size = int(response.headers.get("Content-Length", 0))
+        downloaded = 0
+        last_pct = -10
+        chunk_size = 1024 * 1024  # 1MB chunks
 
-def load_config(workspace_root: Path) -> dict:
-    """Load pipeline config from repos/dorea/config.yaml."""
-    config_path = workspace_root / "repos" / "dorea" / "config.yaml"
-    if not config_path.is_file():
-        logger.error("Config file not found: %s", config_path)
-        sys.exit(1)
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_size > 0:
+                    pct = int(downloaded / total_size * 100)
+                    if pct >= last_pct + 10:
+                        logger.info(
+                            "  Download progress: %d%% (%d / %d MB)",
+                            pct, downloaded // (1024 * 1024),
+                            total_size // (1024 * 1024),
+                        )
+                        last_pct = pct
 
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+        # Atomic rename
+        tmp_path.rename(target_path)
+        logger.info("Download complete: %s", target_path)
+        return True
+
+    except Exception as e:
+        logger.error("Download failed: %s", e)
+        if tmp_path.is_file():
+            tmp_path.unlink()
+        logger.error(
+            "Manual download: %s -> %s",
+            url, target_path,
+        )
+        return False
 
 
 def discover_scene_analyses(scene_analysis_dir: Path) -> list[Path]:
@@ -136,7 +183,7 @@ def find_source_video(
 ) -> Path | None:
     """Find the source video file for a given clip_id.
 
-    Searches raw_dir and flat_dir for a video file whose stem matches clip_id.
+    Searches raw_dir first (preserves D-Log M dynamic range), then flat_dir.
     Returns the path or None if not found.
     """
     for footage_dir in [raw_dir, flat_dir]:
@@ -145,6 +192,9 @@ def find_source_video(
         for entry in footage_dir.iterdir():
             if entry.is_file() and entry.suffix in VIDEO_EXTENSIONS:
                 if entry.stem == clip_id:
+                    logger.debug(
+                        "Source video for '%s': %s (raw preferred)", clip_id, entry
+                    )
                     return entry
     return None
 
@@ -514,7 +564,9 @@ def process_clip(
         total_masks = 0
         errors = 0
 
-        for subj_idx, subject in enumerate(subjects):
+        for subj_idx, subject in enumerate(get_progress_bar(
+            subjects, desc=f"Tracking {clip_id}"
+        )):
             label = subject.get("label", f"unknown_{subj_idx}")
             logger.info(
                 "Tracking subject %d/%d: '%s'",
@@ -565,22 +617,19 @@ def main():
     )
     args = parser.parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging(verbose=args.verbose)
+
+    validate_date(args.date)
 
     workspace_root = find_workspace_root()
     logger.info("Workspace root: %s", workspace_root)
 
     config = load_config(workspace_root)
 
-    # Resolve paths
-    working_dir = workspace_root / config["working_dir"]
-    scene_analysis_dir = working_dir / "scene_analysis"
-    masks_base_dir = working_dir / "masks"
+    # Resolve paths (date-scoped)
+    paths = resolve_working_paths(workspace_root, config, args.date)
+    scene_analysis_dir = paths["scene_analysis"]
+    masks_base_dir = paths["masks"]
     raw_dir = workspace_root / config["footage_raw"] / args.date
     flat_dir = workspace_root / config["footage_flat"] / args.date
 
@@ -603,14 +652,11 @@ def main():
     logger.info("SAM2 weights: %s", sam2_weights_path)
     logger.info("GPU device: %s", device)
 
-    # Check that model weights exist
+    # Check that model weights exist; auto-download if missing
     if not sam2_weights_path.is_file():
-        logger.error(
-            "SAM2 model weights not found at %s. "
-            "Download from: https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt",
-            sam2_weights_path,
-        )
-        sys.exit(1)
+        logger.warning("SAM2 model weights not found at %s", sam2_weights_path)
+        if not download_sam2_weights(sam2_model_key, sam2_weights_path):
+            sys.exit(1)
 
     # Check for CUDA availability
     if not torch.cuda.is_available():

@@ -8,6 +8,7 @@ numpy
 Pillow
 opencv-python
 pyyaml
+tqdm
 
 # AI models (pinned to CUDA 12.1 wheels)
 --extra-index-url https://download.pytorch.org/whl/cu121

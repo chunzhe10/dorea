@@ -16,7 +16,7 @@ Inputs:
     - Raw footage files (for full-resolution frame access)
 
 Outputs:
-    - working/depth/{clip_id}/frame_NNNNNN.png
+    - working/depth/{date}/{clip_id}/frame_NNNNNN.png
       (16-bit grayscale PNG, resolution matches source)
 
 Dependencies:
@@ -30,7 +30,6 @@ Architecture doc: Section 4.4
 
 import argparse
 import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -38,11 +37,19 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import yaml
 from PIL import Image
 
-# Video file extensions to scan (case-insensitive matching via explicit variants)
-VIDEO_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI"}
+from pipeline_utils import (
+    VIDEO_EXTENSIONS,
+    configure_logging,
+    deduplicate_clips,
+    discover_clips,
+    find_workspace_root,
+    get_progress_bar,
+    load_config,
+    resolve_working_paths,
+    validate_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,48 +60,6 @@ DEPTH_MODEL_MAP = {
     "depth_anything_v2_large": "depth-anything/Depth-Anything-V2-Large-hf",
 }
 DEFAULT_MODEL = "depth_anything_v2_small"
-
-
-def find_workspace_root() -> Path:
-    """Resolve the workspace root directory.
-
-    Uses $CORVIA_WORKSPACE if set, otherwise walks up from the script location
-    to find the directory containing repos/dorea.
-    """
-    env_root = os.environ.get("CORVIA_WORKSPACE")
-    if env_root:
-        return Path(env_root)
-
-    # Walk up from script location: scripts/ -> dorea/ -> repos/ -> workspace root
-    candidate = Path(__file__).resolve().parent.parent.parent.parent
-    if (candidate / "repos" / "dorea").is_dir():
-        return candidate
-
-    # Fallback: hardcoded devcontainer path
-    return Path("/workspaces/dorea-workspace")
-
-
-def load_config(workspace_root: Path) -> dict:
-    """Load pipeline config from repos/dorea/config.yaml."""
-    config_path = workspace_root / "repos" / "dorea" / "config.yaml"
-    if not config_path.is_file():
-        logger.error("Config file not found: %s", config_path)
-        sys.exit(1)
-
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
-
-
-def discover_clips(footage_dir: Path) -> list[Path]:
-    """Find all video files in a footage directory (non-recursive)."""
-    if not footage_dir.is_dir():
-        return []
-
-    clips = []
-    for entry in sorted(footage_dir.iterdir()):
-        if entry.is_file() and entry.suffix in VIDEO_EXTENSIONS:
-            clips.append(entry)
-    return clips
 
 
 def load_depth_model(
@@ -261,6 +226,19 @@ def process_clip(
     clip_start_time = time.monotonic()
     last_log_time = clip_start_time
 
+    # Use tqdm for TTY, fall back to 10-second log intervals for headless
+    use_tqdm = sys.stderr.isatty()
+    pbar = None
+    if use_tqdm:
+        try:
+            import tqdm
+            pbar = tqdm.tqdm(
+                total=total_frames, desc=f"  {clip_path.stem}",
+                file=sys.stderr, unit="frame",
+            )
+        except ImportError:
+            pass
+
     while True:
         ret, frame_bgr = cap.read()
         if not ret:
@@ -291,19 +269,24 @@ def process_clip(
             )
             continue
 
-        # Log progress every 10 seconds or at milestones
-        now = time.monotonic()
-        if now - last_log_time >= 10.0 or frame_number == total_frames:
-            elapsed = now - clip_start_time
-            fps_rate = frames_processed / elapsed if elapsed > 0 else 0
-            logger.info(
-                "  Progress: %d/%d frames (%.1f%%) | %.2f frames/sec",
-                frame_number, total_frames,
-                (frame_number / total_frames * 100) if total_frames > 0 else 0,
-                fps_rate,
-            )
-            last_log_time = now
+        if pbar is not None:
+            pbar.update(1)
+        else:
+            # Log progress every 10 seconds for headless/batch runs
+            now = time.monotonic()
+            if now - last_log_time >= 10.0 or frame_number == total_frames:
+                elapsed = now - clip_start_time
+                fps_rate = frames_processed / elapsed if elapsed > 0 else 0
+                logger.info(
+                    "  Progress: %d/%d frames (%.1f%%) | %.2f frames/sec",
+                    frame_number, total_frames,
+                    (frame_number / total_frames * 100) if total_frames > 0 else 0,
+                    fps_rate,
+                )
+                last_log_time = now
 
+    if pbar is not None:
+        pbar.close()
     cap.release()
 
     elapsed = time.monotonic() - clip_start_time
@@ -327,12 +310,9 @@ def main():
     )
     args = parser.parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging(verbose=args.verbose)
+
+    validate_date(args.date)
 
     workspace_root = find_workspace_root()
     logger.info("Workspace root: %s", workspace_root)
@@ -342,7 +322,8 @@ def main():
     # Resolve footage directories for the given date
     raw_dir = workspace_root / config["footage_raw"] / args.date
     flat_dir = workspace_root / config["footage_flat"] / args.date
-    depth_output_root = workspace_root / config["working_dir"] / "depth"
+    paths = resolve_working_paths(workspace_root, config, args.date)
+    depth_output_root = paths["depth"]
 
     logger.info("Scanning for footage dated %s", args.date)
     logger.debug("  Raw dir:  %s (exists: %s)", raw_dir, raw_dir.is_dir())
@@ -357,8 +338,8 @@ def main():
         )
         sys.exit(1)
 
-    # Discover all video clips
-    clips = discover_clips(raw_dir) + discover_clips(flat_dir)
+    # Discover all video clips (deduplicate raw/flat by stem)
+    clips = deduplicate_clips(discover_clips(raw_dir) + discover_clips(flat_dir))
 
     if not clips:
         logger.error(
@@ -401,7 +382,7 @@ def main():
     failed_clips = 0
 
     try:
-        for clip_path in clips:
+        for clip_path in get_progress_bar(clips, desc="Depth estimation"):
             clip_id = clip_path.stem
             output_dir = depth_output_root / clip_id
 

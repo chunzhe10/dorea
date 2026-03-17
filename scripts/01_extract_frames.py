@@ -11,7 +11,7 @@ Inputs:
     - footage/flat/YYYY-MM-DD/ — Insta360 X5 flattened clips
 
 Outputs:
-    - working/keyframes/{clip_id}/frame_NNNNNN.jpg (1280px wide, JPEG 85%)
+    - working/keyframes/{date}/{clip_id}/frame_NNNNNN.jpg (1280px wide, JPEG 85%)
 
 Dependencies:
     - ffmpeg (system package, CPU only, no GPU required)
@@ -21,59 +21,24 @@ Architecture doc: Section 4.1
 
 import argparse
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-import yaml
-
-# Video file extensions to scan (case-insensitive matching via explicit variants)
-VIDEO_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI"}
+from pipeline_utils import (
+    VIDEO_EXTENSIONS,
+    check_legacy_working_dir,
+    configure_logging,
+    deduplicate_clips,
+    discover_clips,
+    find_workspace_root,
+    get_progress_bar,
+    load_config,
+    resolve_working_paths,
+    validate_date,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def find_workspace_root() -> Path:
-    """Resolve the workspace root directory.
-
-    Uses $CORVIA_WORKSPACE if set, otherwise walks up from the script location
-    to find the directory containing repos/dorea.
-    """
-    env_root = os.environ.get("CORVIA_WORKSPACE")
-    if env_root:
-        return Path(env_root)
-
-    # Walk up from script location: scripts/ -> dorea/ -> repos/ -> workspace root
-    candidate = Path(__file__).resolve().parent.parent.parent.parent
-    if (candidate / "repos" / "dorea").is_dir():
-        return candidate
-
-    # Fallback: hardcoded devcontainer path
-    return Path("/workspaces/dorea-workspace")
-
-
-def load_config(workspace_root: Path) -> dict:
-    """Load pipeline config from repos/dorea/config.yaml."""
-    config_path = workspace_root / "repos" / "dorea" / "config.yaml"
-    if not config_path.is_file():
-        logger.error("Config file not found: %s", config_path)
-        sys.exit(1)
-
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
-
-
-def discover_clips(footage_dir: Path) -> list[Path]:
-    """Find all video files in a footage directory (non-recursive)."""
-    if not footage_dir.is_dir():
-        return []
-
-    clips = []
-    for entry in sorted(footage_dir.iterdir()):
-        if entry.is_file() and entry.suffix in VIDEO_EXTENSIONS:
-            clips.append(entry)
-    return clips
 
 
 def extract_frames(clip_path: Path, output_dir: Path, fps: float = 0.5) -> int:
@@ -122,12 +87,9 @@ def main():
     )
     args = parser.parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging(verbose=args.verbose)
+
+    validate_date(args.date)
 
     workspace_root = find_workspace_root()
     logger.info("Workspace root: %s", workspace_root)
@@ -137,7 +99,10 @@ def main():
     # Resolve footage directories for the given date
     raw_dir = workspace_root / config["footage_raw"] / args.date
     flat_dir = workspace_root / config["footage_flat"] / args.date
-    keyframes_dir = workspace_root / config["working_dir"] / "keyframes"
+    paths = resolve_working_paths(workspace_root, config, args.date)
+    keyframes_dir = paths["keyframes"]
+
+    check_legacy_working_dir(workspace_root, config, args.date)
 
     logger.info("Scanning for footage dated %s", args.date)
     logger.debug("  Raw dir:  %s (exists: %s)", raw_dir, raw_dir.is_dir())
@@ -152,8 +117,8 @@ def main():
         )
         sys.exit(1)
 
-    # Discover all video clips
-    clips = discover_clips(raw_dir) + discover_clips(flat_dir)
+    # Discover all video clips (deduplicate raw/flat by stem)
+    clips = deduplicate_clips(discover_clips(raw_dir) + discover_clips(flat_dir))
 
     if not clips:
         logger.error(
@@ -174,7 +139,7 @@ def main():
     successful_clips = 0
     failed_clips = 0
 
-    for clip_path in clips:
+    for clip_path in get_progress_bar(clips, desc="Extracting frames"):
         clip_id = clip_path.stem
         output_dir = keyframes_dir / clip_id
 

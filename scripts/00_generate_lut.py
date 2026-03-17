@@ -25,7 +25,6 @@ Architecture doc: Section 4.0
 
 import argparse
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -37,8 +36,12 @@ from colour import LUT3D
 from colour.io import write_LUT_IridasCube
 from colour.models import eotf_sRGB, eotf_inverse_sRGB
 
-# Supported reference image extensions (case-insensitive matching)
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+from pipeline_utils import (
+    IMAGE_EXTENSIONS,
+    configure_logging,
+    discover_images,
+    find_workspace_root,
+)
 
 # LUT grid resolution — 33x33x33 is the industry standard for .cube files
 LUT_SIZE = 33
@@ -141,37 +144,6 @@ def linear_to_dlog_m(x: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Image loading and analysis
 # ---------------------------------------------------------------------------
-
-def find_workspace_root() -> Path:
-    """Resolve the workspace root directory.
-
-    Uses $CORVIA_WORKSPACE if set, otherwise walks up from the script location
-    to find the directory containing repos/dorea.
-    """
-    env_root = os.environ.get("CORVIA_WORKSPACE")
-    if env_root:
-        return Path(env_root)
-
-    # Walk up from script location: scripts/ -> dorea/ -> repos/ -> workspace root
-    candidate = Path(__file__).resolve().parent.parent.parent.parent
-    if (candidate / "repos" / "dorea").is_dir():
-        return candidate
-
-    # Fallback: hardcoded devcontainer path
-    return Path("/workspaces/dorea-workspace")
-
-
-def discover_images(references_dir: Path) -> list[Path]:
-    """Find all valid image files in the references directory."""
-    if not references_dir.is_dir():
-        return []
-
-    images = []
-    for entry in sorted(references_dir.iterdir()):
-        if entry.is_file() and entry.suffix.lower() in IMAGE_EXTENSIONS:
-            images.append(entry)
-    return images
-
 
 def load_image_linear(path: Path) -> np.ndarray:
     """Load an image and convert to linear-light float64 RGB array.
@@ -564,12 +536,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # Configure logging — same style as other pipeline scripts
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging(verbose=args.verbose)
 
     workspace_root = find_workspace_root()
     repo_root = workspace_root / "repos" / "dorea"

@@ -9,10 +9,10 @@ Usage:
     python 02_claude_scene_analysis.py --date 2026-03-17 --dry-run
 
 Inputs:
-    - working/keyframes/{clip_id}/ — extracted keyframes from Phase 1
+    - working/keyframes/{date}/{clip_id}/ — extracted keyframes from Phase 1
 
 Outputs:
-    - working/scene_analysis/{clip_id}.json — per-clip scene analysis
+    - working/scene_analysis/{date}/{clip_id}.json — per-clip scene analysis
       Schema: {"clip_id": str, "subjects": [{"label": str, "first_appearance_frame": int,
                "bbox_normalised": [x_min, y_min, x_max, y_max], "confidence": str}]}
 
@@ -30,10 +30,19 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-import yaml
+from pipeline_utils import (
+    VIDEO_EXTENSIONS,
+    configure_logging,
+    find_workspace_root,
+    load_config,
+    resolve_working_paths,
+    validate_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,36 +93,6 @@ JSON array. Example:
 
 If no new subjects appear in these frames, return an empty array: []
 """
-
-
-def find_workspace_root() -> Path:
-    """Resolve the workspace root directory.
-
-    Uses $CORVIA_WORKSPACE if set, otherwise walks up from the script location
-    to find the directory containing repos/dorea.
-    """
-    env_root = os.environ.get("CORVIA_WORKSPACE")
-    if env_root:
-        return Path(env_root)
-
-    # Walk up from script location: scripts/ -> dorea/ -> repos/ -> workspace root
-    candidate = Path(__file__).resolve().parent.parent.parent.parent
-    if (candidate / "repos" / "dorea").is_dir():
-        return candidate
-
-    # Fallback: hardcoded devcontainer path
-    return Path("/workspaces/dorea-workspace")
-
-
-def load_config(workspace_root: Path) -> dict:
-    """Load pipeline config from repos/dorea/config.yaml."""
-    config_path = workspace_root / "repos" / "dorea" / "config.yaml"
-    if not config_path.is_file():
-        logger.error("Config file not found: %s", config_path)
-        sys.exit(1)
-
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
 
 
 def resolve_api_key(config: dict) -> str:
@@ -434,6 +413,228 @@ def analyse_clip(
     return {"clip_id": clip_id, "subjects": all_subjects}
 
 
+PASS2_SYSTEM_PROMPT = """\
+You are refining the first-appearance frame of an underwater subject. You will receive \
+a sequence of frames extracted every 10 frames from a video, covering a window around \
+where the subject was initially detected.
+
+The subject has label: "{label}"
+Its approximate bounding box (normalised 0-1): {bbox}
+
+Your task: identify the EXACT frame number (from the filename) where this subject FIRST \
+becomes clearly visible. The subject may be partially visible in earlier frames — report \
+the frame where it is first identifiable.
+
+Return ONLY a JSON object with one field:
+{{"first_appearance_frame": <integer frame number>}}
+
+If the subject is not visible in any of these frames, return:
+{{"first_appearance_frame": null}}
+"""
+
+
+def get_source_fps(video_path: Path) -> float | None:
+    """Get the frame rate of a video file via ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        "-select_streams", "v:0",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        logger.error("ffprobe failed for %s: %s", video_path, e)
+        return None
+
+    streams = data.get("streams", [])
+    if not streams:
+        return None
+
+    # Parse r_frame_rate which is a fraction like "30000/1001"
+    r_frame_rate = streams[0].get("r_frame_rate", "")
+    if "/" in r_frame_rate:
+        num, den = r_frame_rate.split("/")
+        try:
+            return float(num) / float(den)
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    # Fallback to avg_frame_rate
+    avg = streams[0].get("avg_frame_rate", "")
+    if "/" in avg:
+        num, den = avg.split("/")
+        try:
+            return float(num) / float(den)
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    return None
+
+
+def find_source_video_for_clip(
+    clip_id: str, workspace_root: Path, config: dict, date: str
+) -> Path | None:
+    """Find the source video file for a clip_id in raw or flat footage dirs."""
+    raw_dir = workspace_root / config["footage_raw"] / date
+    flat_dir = workspace_root / config["footage_flat"] / date
+
+    for footage_dir in [raw_dir, flat_dir]:
+        if not footage_dir.is_dir():
+            continue
+        for entry in footage_dir.iterdir():
+            if entry.is_file() and entry.suffix in VIDEO_EXTENSIONS:
+                if entry.stem == clip_id:
+                    return entry
+    return None
+
+
+def extract_pass2_frames(
+    video_path: Path,
+    center_frame: int,
+    source_fps: float,
+    output_dir: Path,
+    window_frames: int = 120,
+    step: int = 10,
+) -> list[tuple[int, Path]]:
+    """Extract frames around a detection point for Pass 2 refinement.
+
+    Extracts every `step` frames in a window of `window_frames` centered on
+    `center_frame`. Returns list of (frame_number, path) tuples.
+    """
+    start_frame = max(0, center_frame - window_frames // 2)
+    end_frame = center_frame + window_frames // 2
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    frames = []
+    for frame_num in range(start_frame, end_frame + 1, step):
+        timestamp = frame_num / source_fps
+        output_path = output_dir / f"frame_{frame_num:06d}.jpg"
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss", f"{timestamp:.4f}",
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-q:v", "2",
+            str(output_path),
+        ]
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if output_path.is_file():
+                frames.append((frame_num, output_path))
+        except subprocess.CalledProcessError:
+            continue
+
+    return frames
+
+
+def run_pass2_for_subject(
+    subject: dict,
+    video_path: Path,
+    source_fps: float,
+    sample_rate: int,
+    client,
+    model: str,
+) -> dict:
+    """Run Pass 2 refinement for a single subject.
+
+    Updates the subject dict in-place with refined first_appearance_frame
+    and adds pass2_refined flag.
+    """
+    label = subject["label"]
+    keyframe_num = subject["first_appearance_frame"]
+    bbox = subject["bbox_normalised"]
+
+    # Approximate the source frame from the keyframe number
+    # keyframe_num is the keyframe index (1-based), sample_rate is seconds between keyframes
+    approx_source_frame = int(keyframe_num * sample_rate * source_fps)
+
+    logger.info(
+        "  Pass 2: subject '%s', approx source frame %d (from keyframe %d)",
+        label, approx_source_frame, keyframe_num,
+    )
+
+    with tempfile.TemporaryDirectory(prefix=f"pass2_{label}_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        frames = extract_pass2_frames(
+            video_path, approx_source_frame, source_fps, tmp_path
+        )
+
+        if not frames:
+            logger.warning("  Pass 2: no frames extracted for '%s', skipping", label)
+            return subject
+
+        # Build Pass 2 API call
+        prompt = PASS2_SYSTEM_PROMPT.format(label=label, bbox=bbox)
+        content_blocks = [
+            {"type": "text", "text": "Find the exact first appearance frame:"}
+        ]
+
+        for frame_num, frame_path in frames:
+            content_blocks.append({
+                "type": "text",
+                "text": f"Frame {frame_num}:",
+            })
+            with open(frame_path, "rb") as f:
+                img_data = base64.standard_b64encode(f.read()).decode("ascii")
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img_data,
+                },
+            })
+
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=256,
+                system=prompt,
+                messages=[{"role": "user", "content": content_blocks}],
+            )
+        except Exception as e:
+            logger.error("  Pass 2 API call failed for '%s': %s", label, e)
+            return subject
+
+        # Parse response
+        response_text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                response_text += block.text
+
+        try:
+            text = response_text.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+                text = re.sub(r"\n?```\s*$", "", text)
+                text = text.strip()
+            result = json.loads(text)
+            refined_frame = result.get("first_appearance_frame")
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning("  Pass 2: failed to parse response for '%s'", label)
+            return subject
+
+        if refined_frame is not None and isinstance(refined_frame, int):
+            logger.info(
+                "  Pass 2: '%s' refined frame %d -> %d",
+                label, subject["first_appearance_frame"], refined_frame,
+            )
+            subject["first_appearance_frame"] = refined_frame
+            subject["pass2_refined"] = True
+        else:
+            logger.info("  Pass 2: '%s' — subject not found in window", label)
+
+    return subject
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run Claude scene analysis on keyframes"
@@ -445,32 +646,30 @@ def main():
         help="Show what would be sent without making API calls",
     )
     parser.add_argument(
+        "--skip-pass2",
+        action="store_true",
+        help="Skip Pass 2 refinement (keyframe-level precision only)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable debug logging"
     )
     args = parser.parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging(verbose=args.verbose)
+
+    validate_date(args.date)
 
     workspace_root = find_workspace_root()
     logger.info("Workspace root: %s", workspace_root)
 
     config = load_config(workspace_root)
 
-    # Resolve paths
-    working_dir = workspace_root / config["working_dir"]
-    keyframes_root = working_dir / "keyframes"
-    scene_analysis_dir = working_dir / "scene_analysis"
+    # Resolve paths (date-scoped)
+    paths = resolve_working_paths(workspace_root, config, args.date)
+    keyframes_root = paths["keyframes"]
+    scene_analysis_dir = paths["scene_analysis"]
 
     # Check for keyframe directories
-    # Note: We scan all clip directories under keyframes_root. The --date flag
-    # is used for logging/context; keyframes are organised by clip_id, not date.
-    # Phase 1 extracts keyframes into working/keyframes/{clip_id}/ for the given
-    # date's footage, so all clip dirs present are assumed to belong to the session.
     clip_dirs = discover_keyframe_dirs(keyframes_root)
     if not clip_dirs:
         logger.error(
@@ -557,11 +756,74 @@ def main():
     if args.dry_run:
         logger.info("[DRY RUN] No API calls were made. No output files written.")
 
-    # TODO: Pass 2 refinement is deferred. Currently using keyframe-level precision
-    # for first_appearance_frame. When original footage frames are accessible at this
-    # stage, implement Pass 2: around each detected appearance from Pass 1, sample
-    # every 10 frames from the original footage to pinpoint exact first frame.
-    # See architecture doc Section 4.2.3.
+    # --- Pass 2: Refine first_appearance_frame using original footage ---
+    if not args.dry_run and not args.skip_pass2 and total_subjects > 0:
+        sample_rate = config.get("frame_sample_rate_seconds", 2)
+        pass2_refined = 0
+        pass2_failed = 0
+
+        for clip_dir in clip_dirs:
+            clip_id = clip_dir.name
+            output_path = scene_analysis_dir / f"{clip_id}.json"
+            if not output_path.is_file():
+                continue
+
+            with open(output_path, "r") as f:
+                clip_data = json.load(f)
+
+            subjects = clip_data.get("subjects", [])
+            if not subjects:
+                continue
+
+            video_path = find_source_video_for_clip(
+                clip_id, workspace_root, config, args.date
+            )
+            if video_path is None:
+                logger.warning(
+                    "Pass 2: no source video found for '%s', skipping", clip_id
+                )
+                pass2_failed += len(subjects)
+                continue
+
+            source_fps = get_source_fps(video_path)
+            if source_fps is None or source_fps <= 0:
+                logger.warning(
+                    "Pass 2: could not determine FPS for '%s', skipping", clip_id
+                )
+                pass2_failed += len(subjects)
+                continue
+
+            logger.info("--- Pass 2: %s (%.1f fps) ---", clip_id, source_fps)
+
+            for subject in subjects:
+                try:
+                    run_pass2_for_subject(
+                        subject, video_path, source_fps,
+                        sample_rate, client, model,
+                    )
+                    if subject.get("pass2_refined"):
+                        pass2_refined += 1
+                except Exception as e:
+                    logger.error(
+                        "  Pass 2 failed for '%s': %s",
+                        subject.get("label", "?"), e,
+                    )
+                    pass2_failed += 1
+
+            # Re-write the JSON with refined data
+            try:
+                with open(output_path, "w") as f:
+                    json.dump(clip_data, f, indent=2)
+                logger.info("Pass 2: updated %s", output_path)
+            except OSError as e:
+                logger.error("Pass 2: failed to update %s: %s", output_path, e)
+
+        logger.info(
+            "Pass 2: %d subject(s) refined, %d failed/skipped",
+            pass2_refined, pass2_failed,
+        )
+    elif args.skip_pass2:
+        logger.info("Pass 2 skipped (--skip-pass2 flag)")
 
     if failed_clips > 0 and successful_clips == 0:
         logger.error("All clips failed. Check errors above.")
