@@ -211,11 +211,15 @@ def analyse_images(image_paths: list[Path]) -> dict:
             - saturation_mean: mean saturation (0-1) across all pixels
             - hue_histogram: 36-bin hue distribution (each bin = 10 degrees)
     """
-    # Accumulators for zone statistics
-    shadow_pixels = []
-    midtone_pixels = []
-    highlight_pixels = []
-    all_pixels = []
+    # Running-sum accumulators for zone statistics (memory-efficient)
+    shadow_sum = np.zeros(3, dtype=np.float64)
+    shadow_n = 0
+    midtone_sum = np.zeros(3, dtype=np.float64)
+    midtone_n = 0
+    highlight_sum = np.zeros(3, dtype=np.float64)
+    highlight_n = 0
+    overall_sum = np.zeros(3, dtype=np.float64)
+    overall_n = 0
 
     # Hue and saturation accumulators
     hue_bins = np.zeros(36, dtype=np.float64)
@@ -228,22 +232,26 @@ def analyse_images(image_paths: list[Path]) -> dict:
 
         # Reshape to (N, 3)
         pixels = linear.reshape(-1, 3)
-        all_pixels.append(pixels)
+        overall_sum += pixels.sum(axis=0)
+        overall_n += len(pixels)
 
         # Compute luminance for zone classification
         lum = compute_luminance(linear).ravel()
 
-        # Classify pixels into zones
+        # Classify pixels into zones and accumulate running sums
         shadow_mask = lum < SHADOW_UPPER
         midtone_mask = (lum >= SHADOW_UPPER) & (lum < MIDTONE_UPPER)
         highlight_mask = lum >= MIDTONE_UPPER
 
         if shadow_mask.any():
-            shadow_pixels.append(pixels[shadow_mask])
+            shadow_sum += pixels[shadow_mask].sum(axis=0)
+            shadow_n += shadow_mask.sum()
         if midtone_mask.any():
-            midtone_pixels.append(pixels[midtone_mask])
+            midtone_sum += pixels[midtone_mask].sum(axis=0)
+            midtone_n += midtone_mask.sum()
         if highlight_mask.any():
-            highlight_pixels.append(pixels[highlight_mask])
+            highlight_sum += pixels[highlight_mask].sum(axis=0)
+            highlight_n += highlight_mask.sum()
 
         # Convert to sRGB for hue/saturation analysis (HSV works in display space)
         srgb = eotf_inverse_sRGB(linear)
@@ -261,18 +269,17 @@ def analyse_images(image_paths: list[Path]) -> dict:
         saturation_sum += sat.sum()
         saturation_count += len(sat)
 
-    # Compute zone means
-    def safe_mean(pixel_list: list[np.ndarray]) -> np.ndarray:
-        if not pixel_list:
+    # Compute zone means from running sums
+    def safe_mean(zone_sum: np.ndarray, zone_n: int) -> np.ndarray:
+        if zone_n == 0:
             return np.array([0.0, 0.0, 0.0])
-        combined = np.concatenate(pixel_list, axis=0)
-        return combined.mean(axis=0)
+        return zone_sum / zone_n
 
     result = {
-        "shadows_mean_rgb": safe_mean(shadow_pixels),
-        "midtones_mean_rgb": safe_mean(midtone_pixels),
-        "highlights_mean_rgb": safe_mean(highlight_pixels),
-        "overall_mean_rgb": safe_mean(all_pixels),
+        "shadows_mean_rgb": safe_mean(shadow_sum, shadow_n),
+        "midtones_mean_rgb": safe_mean(midtone_sum, midtone_n),
+        "highlights_mean_rgb": safe_mean(highlight_sum, highlight_n),
+        "overall_mean_rgb": safe_mean(overall_sum, overall_n),
         "saturation_mean": saturation_sum / max(saturation_count, 1),
         "hue_histogram": hue_bins / max(hue_bins.sum(), 1),
     }
@@ -315,13 +322,15 @@ def compute_correction_params(analysis: dict) -> dict:
     # Normalise zone means relative to overall brightness
     overall_lum = compute_luminance(overall.reshape(1, 1, 3)).item()
     if overall_lum < 1e-6:
-        overall_lum = 0.18  # fallback to middle grey
+        logger.warning("Overall luminance near zero — using middle grey fallback")
+        overall_lum = 0.18
 
     # --- Lift (shadow correction) ---
     # Lift shifts the black point. Underwater shadows tend to be blue/green.
     # Small offset to push shadows toward the reference look.
     shadow_lum = compute_luminance(shadows.reshape(1, 1, 3)).item()
     if shadow_lum < 1e-6:
+        logger.warning("Shadow luminance near zero — using fallback value")
         shadow_lum = 0.01
     lift = shadows / max(shadow_lum, 0.01) * 0.02  # Small lift per channel
     lift = np.clip(lift, -0.05, 0.05)
@@ -330,6 +339,7 @@ def compute_correction_params(analysis: dict) -> dict:
     # Gain scales the white point. We want highlights to match the reference.
     highlight_lum = compute_luminance(highlights.reshape(1, 1, 3)).item()
     if highlight_lum < 1e-6:
+        logger.warning("Highlight luminance near zero — using fallback value")
         highlight_lum = 0.8
     # Compute per-channel gain relative to luminance
     gain = highlights / highlight_lum
