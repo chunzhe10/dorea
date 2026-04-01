@@ -21,7 +21,8 @@ sam2_weights: models/sam2/sam2.1_hiera_small.pt
 # Depth Anything V2
 depth_model: depth_anything_v2_small
 depth_weights: models/depth_anything_v2_small/
-depth_output_format: png16  # 16-bit PNG for matte precision
+depth_output_format: png16  # png16 (16-bit) or png8 (8-bit)
+depth_output_resolution: native  # "native" = model output (~518px), or "WxH" e.g. "1920x1080"
 
 # DaVinci Resolve (host paths — used by 05_resolve_setup.py on host)
 resolve_lut_path: repos/dorea/luts/underwater_base.cube

@@ -17,7 +17,8 @@ Inputs:
 
 Outputs:
     - working/depth/{date}/{clip_id}/frame_NNNNNN.png
-      (16-bit grayscale PNG, resolution matches source)
+      (16-bit grayscale PNG at native model resolution ~518px;
+       Resolve auto-scales mattes to timeline resolution)
 
 Dependencies:
     - Depth Anything V2 Small (via transformers)
@@ -135,10 +136,9 @@ def run_depth_inference(
 
     Returns a float32 numpy array of shape (H, W) with values in [0.0, 1.0],
     where 1.0 = close to camera (bright) and 0.0 = far from camera (dark).
-    The array is resized to match the original image dimensions.
+    The array is at the model's native resolution (~518px for V2 Small).
+    Resolve auto-scales external mattes to timeline resolution via GPU.
     """
-    original_size = image.size  # (width, height)
-
     inputs = processor(images=image, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -162,30 +162,32 @@ def run_depth_inference(
     # Depth Anything outputs inverse depth (closer = higher values), which
     # matches our convention: bright = close, dark = far. No inversion needed.
 
-    # Resize to match original source resolution for pixel-accurate matte alignment
-    w, h = original_size
-    if depth_normalised.shape[0] != h or depth_normalised.shape[1] != w:
-        depth_normalised = cv2.resize(
-            depth_normalised, (w, h), interpolation=cv2.INTER_LINEAR
-        )
-
     return depth_normalised
 
 
-def save_depth_map_16bit(depth_float: np.ndarray, output_path: Path) -> None:
-    """Save a float32 depth map as a 16-bit grayscale PNG.
+def save_depth_map(
+    depth_float: np.ndarray, output_path: Path, output_format: str = "png16"
+) -> None:
+    """Save a float32 depth map as a grayscale PNG.
 
-    Input: float32 array in [0.0, 1.0]
-    Output: 16-bit PNG where 65535 = close (bright), 0 = far (dark)
+    Args:
+        depth_float: float32 array in [0.0, 1.0]
+        output_path: Destination file path
+        output_format: "png16" for 16-bit (default) or "png8" for 8-bit
+
+    Output: PNG where bright = close, dark = far.
     """
-    # Scale to uint16 range
-    depth_uint16 = (depth_float * 65535.0).clip(0, 65535).astype(np.uint16)
-
-    # Save using OpenCV (reliable 16-bit PNG support)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_format == "png8":
+        depth_out = (depth_float * 255.0).clip(0, 255).astype(np.uint8)
+    else:
+        # Default: 16-bit for matte precision (avoids banding on smooth UW gradients)
+        depth_out = (depth_float * 65535.0).clip(0, 65535).astype(np.uint16)
+
     success = cv2.imwrite(
         str(output_path),
-        depth_uint16,
+        depth_out,
         [cv2.IMWRITE_PNG_COMPRESSION, 3],  # moderate compression (0-9)
     )
     if not success:
@@ -198,8 +200,15 @@ def process_clip(
     processor,
     model,
     device: str,
+    output_format: str = "png16",
+    output_resolution: str = "native",
 ) -> tuple[int, int]:
     """Extract every frame from a video clip and run depth estimation.
+
+    Args:
+        output_format: "png16" or "png8" — controls bit depth of saved PNGs.
+        output_resolution: "native" to keep model output resolution, or
+            "WxH" (e.g. "1920x1080") to resize before saving.
 
     Returns (frames_processed, frames_failed).
     """
@@ -254,11 +263,23 @@ def process_clip(
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(frame_rgb)
 
-            # Run depth inference
+            # Run depth inference (returns native model resolution)
             depth_map = run_depth_inference(pil_image, processor, model, device)
 
-            # Save as 16-bit PNG
-            save_depth_map_16bit(depth_map, output_path)
+            # Optional resize if depth_output_resolution is not "native"
+            if output_resolution != "native":
+                try:
+                    target_w, target_h = (int(x) for x in output_resolution.split("x"))
+                    if depth_map.shape[1] != target_w or depth_map.shape[0] != target_h:
+                        depth_map = cv2.resize(
+                            depth_map, (target_w, target_h),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                except ValueError:
+                    pass  # Invalid format logged once at startup; skip per-frame
+
+            # Save depth map
+            save_depth_map(depth_map, output_path, output_format=output_format)
             frames_processed += 1
 
         except Exception as e:
@@ -355,6 +376,30 @@ def main():
     device = config.get("gpu_device", "cuda:0")
     model_name = config.get("depth_model", DEFAULT_MODEL)
     weights_path = workspace_root / config.get("depth_weights", "models/depth_anything_v2_small/")
+    output_format = config.get("depth_output_format", "png16")
+    output_resolution = config.get("depth_output_resolution", "native")
+
+    # Validate config values
+    if output_format not in ("png16", "png8"):
+        logger.warning(
+            "Unknown depth_output_format '%s', defaulting to 'png16'", output_format
+        )
+        output_format = "png16"
+
+    if output_resolution != "native":
+        try:
+            rw, rh = (int(x) for x in output_resolution.split("x"))
+            logger.info("Depth output resolution: %dx%d", rw, rh)
+        except ValueError:
+            logger.warning(
+                "Invalid depth_output_resolution '%s' (expected 'native' or 'WxH'). "
+                "Defaulting to 'native'.", output_resolution,
+            )
+            output_resolution = "native"
+
+    if output_resolution == "native":
+        logger.info("Depth output resolution: native (model default)")
+    logger.info("Depth output format: %s", output_format)
 
     # Check CUDA availability
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -394,6 +439,8 @@ def main():
                 processor=processor,
                 model=model,
                 device=device,
+                output_format=output_format,
+                output_resolution=output_resolution,
             )
 
             if frames_processed == 0 and frames_failed == 0:
