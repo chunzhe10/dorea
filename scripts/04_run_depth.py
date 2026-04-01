@@ -201,14 +201,14 @@ def process_clip(
     model,
     device: str,
     output_format: str = "png16",
-    output_resolution: str = "native",
+    output_resolution: tuple[int, int] | None = None,
 ) -> tuple[int, int]:
     """Extract every frame from a video clip and run depth estimation.
 
     Args:
         output_format: "png16" or "png8" — controls bit depth of saved PNGs.
-        output_resolution: "native" to keep model output resolution, or
-            "WxH" (e.g. "1920x1080") to resize before saving.
+        output_resolution: None to keep model output resolution, or
+            (width, height) tuple to resize before saving.
 
     Returns (frames_processed, frames_failed).
     """
@@ -266,17 +266,14 @@ def process_clip(
             # Run depth inference (returns native model resolution)
             depth_map = run_depth_inference(pil_image, processor, model, device)
 
-            # Optional resize if depth_output_resolution is not "native"
-            if output_resolution != "native":
-                try:
-                    target_w, target_h = (int(x) for x in output_resolution.split("x"))
-                    if depth_map.shape[1] != target_w or depth_map.shape[0] != target_h:
-                        depth_map = cv2.resize(
-                            depth_map, (target_w, target_h),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
-                except ValueError:
-                    pass  # Invalid format logged once at startup; skip per-frame
+            # Optional resize if a custom output resolution was configured
+            if output_resolution is not None:
+                target_w, target_h = output_resolution
+                if depth_map.shape[1] != target_w or depth_map.shape[0] != target_h:
+                    depth_map = cv2.resize(
+                        depth_map, (target_w, target_h),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
 
             # Save depth map
             save_depth_map(depth_map, output_path, output_format=output_format)
@@ -377,7 +374,7 @@ def main():
     model_name = config.get("depth_model", DEFAULT_MODEL)
     weights_path = workspace_root / config.get("depth_weights", "models/depth_anything_v2_small/")
     output_format = config.get("depth_output_format", "png16")
-    output_resolution = config.get("depth_output_resolution", "native")
+    output_resolution_raw = config.get("depth_output_resolution", "native")
 
     # Validate config values
     if output_format not in ("png16", "png8"):
@@ -386,18 +383,23 @@ def main():
         )
         output_format = "png16"
 
-    if output_resolution != "native":
+    # Parse resolution once at startup: None = native, (w, h) = custom
+    output_resolution: tuple[int, int] | None = None
+    if output_resolution_raw != "native":
         try:
-            rw, rh = (int(x) for x in output_resolution.split("x"))
+            rw, rh = (int(x) for x in output_resolution_raw.split("x"))
+            if rw <= 0 or rh <= 0:
+                raise ValueError("dimensions must be positive")
+            output_resolution = (rw, rh)
             logger.info("Depth output resolution: %dx%d", rw, rh)
         except ValueError:
             logger.warning(
-                "Invalid depth_output_resolution '%s' (expected 'native' or 'WxH'). "
-                "Defaulting to 'native'.", output_resolution,
+                "Invalid depth_output_resolution '%s' (expected 'native' or 'WxH' "
+                "with positive integers, e.g. '1920x1080'). Defaulting to 'native'.",
+                output_resolution_raw,
             )
-            output_resolution = "native"
 
-    if output_resolution == "native":
+    if output_resolution is None:
         logger.info("Depth output resolution: native (model default)")
     logger.info("Depth output format: %s", output_format)
 
