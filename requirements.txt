@@ -10,10 +10,10 @@ opencv-python
 pyyaml
 tqdm
 
-# AI models (pinned to CUDA 12.1 wheels)
---extra-index-url https://download.pytorch.org/whl/cu121
-torch
-torchvision
+# AI models (pinned to CUDA 12.4 wheels — driver 570.x supports up to CUDA 12.8)
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
 transformers
 
 # SAM2 — install from GitHub after pip install:
