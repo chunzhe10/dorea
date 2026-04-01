@@ -31,6 +31,7 @@ Architecture doc: Section 5.1
 """
 
 import argparse
+import importlib
 import logging
 import sys
 import tempfile
@@ -40,17 +41,9 @@ from pipeline_utils import configure_logging, find_workspace_root, load_config
 
 logger = logging.getLogger(__name__)
 
-# Node labels must match the constants in 05_resolve_setup.py
-NODE_LABELS = {
-    1: "Base LUT",
-    2: "Neutral Balance",
-    3: "Depth Grade",
-    4: "Foreground Pop",
-    5: "Diver",
-    6: "Marine Life",
-    7: "Creative Look",
-    8: "Output",
-}
+# Import node constants from 05_resolve_setup to keep them in sync
+_resolve_setup = importlib.import_module("05_resolve_setup")
+NODE_NAMES = _resolve_setup.NODE_NAMES
 
 TOTAL_NODES = 8
 TEMP_PROJECT_NAME = "_DRX_Template_Generator"
@@ -70,20 +63,24 @@ def create_test_image(output_path: Path) -> Path:
     except ImportError:
         pass
 
-    # Fallback: write a minimal valid PNG manually (1x1 black pixel)
+    # Fallback: write a minimal valid 64x64 black PNG manually
     # PNG signature + IHDR + IDAT + IEND
     import struct
     import zlib
+
+    width, height = 64, 64
 
     def _chunk(chunk_type: bytes, data: bytes) -> bytes:
         raw = chunk_type + data
         return struct.pack(">I", len(data)) + raw + struct.pack(">I", zlib.crc32(raw) & 0xFFFFFFFF)
 
     signature = b"\x89PNG\r\n\x1a\n"
-    ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)  # 1x1, 8-bit RGB
+    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 64x64, 8-bit RGB
     ihdr = _chunk(b"IHDR", ihdr_data)
-    raw_row = b"\x00" + b"\x00\x00\x00"  # filter byte + 1 RGB pixel (black)
-    idat = _chunk(b"IDAT", zlib.compress(raw_row))
+    # Each row: filter byte (0) + width * 3 bytes RGB (all zeros = black)
+    raw_row = b"\x00" + b"\x00" * (width * 3)
+    raw_data = raw_row * height
+    idat = _chunk(b"IDAT", zlib.compress(raw_data))
     iend = _chunk(b"IEND", b"")
 
     output_path.write_bytes(signature + ihdr + idat + iend)
@@ -119,27 +116,33 @@ def connect_to_resolve():
 def create_temp_project(resolve):
     """Create a temporary project for DRX generation.
 
-    Returns (project_manager, project) tuple, or (None, None) on failure.
+    Returns (project_manager, project, original_project_name) tuple.
+    Returns (None, None, None) on failure.
     """
     try:
         pm = resolve.GetProjectManager()
     except Exception as e:
         logger.error("Failed to get ProjectManager: %s", e)
-        return None, None
+        return None, None, None
 
     if pm is None:
         logger.error("ProjectManager is None")
-        return None, None
+        return None, None, None
 
-    # Save reference to current project so we can switch back
+    # Save reference to current project so we can restore it after cleanup
+    original_name = None
     try:
         current_project = pm.GetCurrentProject()
-        current_name = current_project.GetName() if current_project else None
+        original_name = current_project.GetName() if current_project else None
     except Exception:
-        current_name = None
+        pass
 
     # Delete old temp project if it exists (from a previous failed run)
     try:
+        existing = pm.GetCurrentProject()
+        if existing and existing.GetName() == TEMP_PROJECT_NAME:
+            pm.CloseProject(existing)
+        logger.info("Deleting leftover temp project: %s", TEMP_PROJECT_NAME)
         pm.DeleteProject(TEMP_PROJECT_NAME)
     except Exception:
         pass
@@ -148,14 +151,14 @@ def create_temp_project(resolve):
         project = pm.CreateProject(TEMP_PROJECT_NAME)
     except Exception as e:
         logger.error("Failed to create temp project: %s", e)
-        return pm, None
+        return pm, None, original_name
 
     if project is None:
         logger.error("CreateProject returned None for '%s'", TEMP_PROJECT_NAME)
-        return pm, None
+        return pm, None, original_name
 
     logger.info("Created temp project: %s", TEMP_PROJECT_NAME)
-    return pm, project
+    return pm, project, original_name
 
 
 def setup_timeline_with_test_clip(project, test_image_path: Path):
@@ -268,7 +271,7 @@ def build_node_graph(timeline_item) -> bool:
 
     # Label each node
     label_failures = 0
-    for node_index, label in NODE_LABELS.items():
+    for node_index, label in NODE_NAMES.items():
         try:
             result = timeline_item.LabelNode(node_index, label)
             if result:
@@ -322,14 +325,16 @@ def export_drx(timeline_item, output_path: Path) -> bool:
         return False
 
 
-def cleanup_temp_project(project_manager):
-    """Delete the temporary project used for DRX generation."""
+def cleanup_temp_project(project_manager, original_project_name: str | None = None):
+    """Delete the temporary project and restore the user's original project."""
     if project_manager is None:
         return
 
+    # Only close if the current project is actually our temp project
     try:
-        # Switch away from the temp project first
-        project_manager.CloseProject(project_manager.GetCurrentProject())
+        current = project_manager.GetCurrentProject()
+        if current and current.GetName() == TEMP_PROJECT_NAME:
+            project_manager.CloseProject(current)
     except Exception:
         pass
 
@@ -342,6 +347,17 @@ def cleanup_temp_project(project_manager):
             "Delete it manually in Resolve's Project Manager.",
             TEMP_PROJECT_NAME, e,
         )
+
+    # Restore the user's original project
+    if original_project_name:
+        try:
+            project_manager.LoadProject(original_project_name)
+            logger.info("Restored original project: %s", original_project_name)
+        except Exception:
+            logger.info(
+                "Could not restore project '%s'. Reopen it manually in Resolve.",
+                original_project_name,
+            )
 
 
 def main():
@@ -393,14 +409,39 @@ def main():
 
     if args.export_only:
         # Export from the current project's first timeline item
-        try:
-            project = resolve.GetProjectManager().GetCurrentProject()
-            timeline = project.GetCurrentTimeline()
-            items = timeline.GetItemListInTrack("video", 1)
-            item = items[0]
-        except Exception as e:
-            logger.error("Failed to get current timeline item for --export-only: %s", e)
+        pm = resolve.GetProjectManager()
+        if pm is None:
+            logger.error("Failed to get ProjectManager")
             sys.exit(1)
+
+        project = pm.GetCurrentProject()
+        if project is None:
+            logger.error("No project is currently open in Resolve")
+            sys.exit(1)
+
+        timeline = project.GetCurrentTimeline()
+        if timeline is None:
+            logger.error("No timeline is selected in project '%s'", project.GetName())
+            sys.exit(1)
+
+        items = timeline.GetItemListInTrack("video", 1)
+        if not items:
+            logger.error("No clips on video track 1 of timeline '%s'", timeline.GetName())
+            sys.exit(1)
+
+        item = items[0]
+
+        # Validate node count before exporting
+        try:
+            node_count = item.GetNumNodes()
+            if node_count != TOTAL_NODES:
+                logger.warning(
+                    "Grade has %d nodes, expected %d. The exported DRX may not "
+                    "work correctly with Phase 5 (which expects nodes at indices 1-8).",
+                    node_count, TOTAL_NODES,
+                )
+        except Exception:
+            logger.debug("Could not verify node count (GetNumNodes not available)")
 
         if not export_drx(item, output_path):
             sys.exit(1)
@@ -409,6 +450,7 @@ def main():
 
     # Full automated flow
     project_manager = None
+    original_name = None
     try:
         # Create test image in temp directory
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -417,7 +459,7 @@ def main():
             logger.debug("Created test image: %s", test_image)
 
             # Create temp project
-            project_manager, project = create_temp_project(resolve)
+            project_manager, project, original_name = create_temp_project(resolve)
             if project is None:
                 sys.exit(1)
 
@@ -440,7 +482,7 @@ def main():
                     "  4. Label nodes: %s\n"
                     "  5. Right-click -> Export -> Export LUT/Grade as DRX\n"
                     "  6. Save to: %s",
-                    ", ".join(NODE_LABELS.values()),
+                    ", ".join(NODE_NAMES.values()),
                     output_path,
                 )
                 sys.exit(1)
@@ -450,9 +492,9 @@ def main():
                 sys.exit(1)
 
     finally:
-        # Clean up temp project
+        # Clean up temp project and restore original
         if not args.no_cleanup and project_manager is not None:
-            cleanup_temp_project(project_manager)
+            cleanup_temp_project(project_manager, original_name)
 
     logger.info("Done. DRX template created at: %s", output_path)
     logger.info(

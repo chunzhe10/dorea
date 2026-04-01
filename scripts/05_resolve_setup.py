@@ -122,14 +122,13 @@ def load_scene_analysis(scene_analysis_dir: Path, clip_id: str) -> list[dict]:
     return data["subjects"]
 
 
-def classify_subject(label: str) -> int | None:
+def classify_subject(label: str) -> int:
     """Map a subject label to its target node index.
 
     Returns:
         NODE_DIVER (5) for diver subjects,
         NODE_MARINE_LIFE (6) for marine life subjects,
-        NODE_FOREGROUND_POP (4) for other identifiable subjects,
-        or None if the label cannot be classified.
+        NODE_FOREGROUND_POP (4) for all other subjects.
     """
     label_lower = label.lower()
 
@@ -803,7 +802,7 @@ def main():
     if drx_path_str is None:
         logger.warning(
             "DRX template not found at %s. 8-node grade structure will not be "
-            "deployed. Place the template file manually or create it in Resolve.",
+            "deployed. Generate it with: python scripts/create_drx_template.py",
             drx_path,
         )
 

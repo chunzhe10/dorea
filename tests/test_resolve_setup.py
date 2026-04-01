@@ -24,6 +24,7 @@ discover_footage = resolve_setup.discover_footage
 load_scene_analysis = resolve_setup.load_scene_analysis
 find_mask_sequence_dir = resolve_setup.find_mask_sequence_dir
 find_depth_sequence_dir = resolve_setup.find_depth_sequence_dir
+get_first_frame_path = resolve_setup.get_first_frame_path
 
 NODE_FOREGROUND_POP = resolve_setup.NODE_FOREGROUND_POP
 NODE_DIVER = resolve_setup.NODE_DIVER
@@ -258,3 +259,30 @@ class TestFindDepthSequenceDir:
         depth_dir.mkdir()
         result = find_depth_sequence_dir(tmp_path, "clip1")
         assert result is None
+
+
+# --- get_first_frame_path ---
+
+
+class TestGetFirstFramePath:
+    def test_returns_first_sorted(self, tmp_path):
+        (tmp_path / "frame_0003.png").write_bytes(b"c")
+        (tmp_path / "frame_0001.png").write_bytes(b"a")
+        (tmp_path / "frame_0002.png").write_bytes(b"b")
+
+        result = get_first_frame_path(tmp_path)
+        assert result == str(tmp_path / "frame_0001.png")
+
+    def test_empty_dir(self, tmp_path):
+        result = get_first_frame_path(tmp_path)
+        assert result is None
+
+    def test_non_png_excluded(self, tmp_path):
+        (tmp_path / "frame_0001.jpg").write_bytes(b"not png")
+        result = get_first_frame_path(tmp_path)
+        assert result is None
+
+    def test_single_frame(self, tmp_path):
+        (tmp_path / "frame_0001.png").write_bytes(b"only one")
+        result = get_first_frame_path(tmp_path)
+        assert result == str(tmp_path / "frame_0001.png")

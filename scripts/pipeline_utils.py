@@ -10,7 +10,6 @@ import re
 import sys
 from pathlib import Path
 
-import numpy as np
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 # D-Log M transfer function (DJI Action 4)
 # ---------------------------------------------------------------------------
 
-def dlog_m_to_linear(x: np.ndarray) -> np.ndarray:
+def dlog_m_to_linear(x):
     """Convert D-Log M encoded values to scene-linear light.
 
     D-Log M is DJI's log gamma curve used in Action 4 and other cameras.
@@ -34,6 +33,7 @@ def dlog_m_to_linear(x: np.ndarray) -> np.ndarray:
     Camera model: DJI Action 4 (D-Log M). If using a different DJI camera,
     verify these constants match its published curve.
     """
+    import numpy as np
     x = np.asarray(x, dtype=np.float64)
 
     # D-Log M curve parameters (DJI published curve)
@@ -63,11 +63,12 @@ def dlog_m_to_linear(x: np.ndarray) -> np.ndarray:
     return np.clip(linear, 0.0, None)
 
 
-def linear_to_dlog_m(x: np.ndarray) -> np.ndarray:
+def linear_to_dlog_m(x):
     """Convert scene-linear light values to D-Log M encoding.
 
     Inverse of dlog_m_to_linear(). Used for verification.
     """
+    import numpy as np
     x = np.asarray(x, dtype=np.float64)
 
     a = 0.9892

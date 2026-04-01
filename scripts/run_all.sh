@@ -2,10 +2,10 @@
 # Master overnight batch script for Dorea pipeline
 # Runs Phases 1-4 inside the devcontainer, then prompts for Phase 5 on host.
 #
-# Usage: bash scripts/run_all.sh
+# Usage: bash scripts/run_all.sh [YYYY-MM-DD]
+#        Defaults to today's date if no argument given.
 #
 # Requires:
-#   - Python venv activated (source /opt/dorea-venv/bin/activate)
 #   - config.yaml configured with correct paths
 #   - Footage dumped to footage/raw/ and/or footage/flat/
 #
@@ -14,7 +14,13 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATE=$(date +%Y-%m-%d)
+DATE="${1:-$(date +%Y-%m-%d)}"
+
+# Activate venv if not already active
+if [ -z "$VIRTUAL_ENV" ] && [ -f /opt/dorea-venv/bin/activate ]; then
+    # shellcheck disable=SC1091
+    source /opt/dorea-venv/bin/activate
+fi
 
 echo "=== Dorea Pipeline — $DATE ==="
 echo ""
@@ -25,7 +31,7 @@ echo ""
 
 # DRX template (create_drx_template.py) is also one-time — run on the HOST with
 # Resolve to generate templates/underwater_grade_v1.drx before first Phase 5 run.
-# Run manually: python scripts/create_drx_template.py
+# On the host: python scripts/create_drx_template.py
 
 echo "=== Phase 1: Extract keyframes ==="
 python "$SCRIPT_DIR/01_extract_frames.py" --date "$DATE"
@@ -45,7 +51,7 @@ echo ""
 echo "Phase 5 must run on the HOST (requires DaVinci Resolve)."
 echo "Open a terminal on the host and run:"
 echo ""
-echo "  cd $(dirname "$SCRIPT_DIR")"
+echo "  cd <your-workspace-root>/repos/dorea"
 echo "  python scripts/05_resolve_setup.py --date $DATE"
 echo ""
 echo "Then open Resolve — your timeline is ready for creative grading."
