@@ -313,11 +313,12 @@ def compute_correction_params(analysis: dict) -> dict:
     if highlight_lum < 1e-6:
         logger.warning("Highlight luminance near zero — using fallback value")
         highlight_lum = 0.8
-    # Compute per-channel gain relative to luminance
+    # Compute per-channel gain relative to luminance.
+    # Note: we intentionally do NOT normalise to max=1.0 here. For underwater
+    # footage, the red channel is always weakest — normalising to the strongest
+    # channel would suppress red further. Instead, clip to a safe range and
+    # let the red recovery boost (below) bring red up.
     gain = highlights / highlight_lum
-    # Normalise so the brightest channel has gain ~1.0
-    gain = gain / max(gain.max(), 1e-6)
-    # Ensure gain stays in reasonable range
     gain = np.clip(gain, 0.5, 1.5)
 
     # --- Gamma (midtone correction) ---
@@ -337,9 +338,12 @@ def compute_correction_params(analysis: dict) -> dict:
     # Typical D-Log M to Rec.709 needs gamma ~0.45-0.55 for good contrast.
     base_gamma = 0.50
 
-    # Adjust per-channel gamma based on midtone colour balance
-    gamma = np.full(3, base_gamma) * (1.0 / np.clip(mid_balance, 0.5, 2.0))
-    gamma = np.clip(gamma, 0.3, 0.8)
+    # Adjust per-channel gamma based on midtone colour balance.
+    # Use a tighter clamp range (0.7-1.3) to prevent the weakest channel
+    # (typically red underwater) from getting significantly less contrast
+    # expansion than the strongest channel.
+    gamma = np.full(3, base_gamma) * (1.0 / np.clip(mid_balance, 0.7, 1.3))
+    gamma = np.clip(gamma, 0.35, 0.65)
 
     # --- Underwater-specific: red channel recovery ---
     # Water absorbs red light first, so underwater images are blue/green biased.
@@ -347,8 +351,10 @@ def compute_correction_params(analysis: dict) -> dict:
     red_ratio = overall[0] / max(overall.mean(), 1e-6)
     red_deficit = max(0.0, 1.0 - red_ratio)
 
-    # Apply graduated red recovery
-    red_boost = 1.0 + red_deficit * 0.3  # Up to 30% boost
+    # Apply graduated red recovery — scaled to the deficit severity.
+    # Underwater red absorption can reach 50-90% depending on depth, so we
+    # allow up to 80% boost (0.8 multiplier) rather than the original 30%.
+    red_boost = 1.0 + red_deficit * 0.8
     gain[0] *= red_boost
 
     # --- Underwater-specific: blue/green balance ---
@@ -391,8 +397,9 @@ def apply_correction(rgb: np.ndarray, params: dict) -> np.ndarray:
         2. Apply lift (shadow offset)
         3. Apply gain (highlight scaling)
         4. Apply gamma (midtone contrast curve)
-        5. Saturation adjustment
-        6. Encode back to output space (clipped to 0-1)
+        5. Highlight rolloff (soft shoulder to prevent hard clipping)
+        6. Saturation adjustment
+        7. Encode back to output space (clipped to 0-1)
 
     Args:
         rgb: Array of shape (..., 3) with D-Log M encoded values (0-1).
@@ -422,14 +429,26 @@ def apply_correction(rgb: np.ndarray, params: dict) -> np.ndarray:
     # Safe power: avoid issues with zero values
     corrected = np.power(corrected + 1e-10, gamma) - np.power(1e-10, gamma)
 
-    # Step 5: Saturation adjustment
+    # Step 5: Highlight rolloff (soft shoulder)
+    # D-Log M stores a wide dynamic range in a flat curve. Expanding with
+    # gamma naturally pushes highlights toward clipping. A soft shoulder
+    # compresses values above a threshold to preserve highlight detail
+    # instead of hard-clipping at 1.0.
+    shoulder = 0.85
+    mask = corrected > shoulder
+    if np.any(mask):
+        excess = corrected[mask] - shoulder
+        headroom = 1.0 - shoulder
+        corrected[mask] = shoulder + headroom * (1.0 - np.exp(-excess / headroom))
+
+    # Step 6: Saturation adjustment
     # Compute luminance and adjust saturation relative to it
     lum = (0.2126 * corrected[..., 0:1]
            + 0.7152 * corrected[..., 1:2]
            + 0.0722 * corrected[..., 2:3])
     corrected = lum + (corrected - lum) * sat_factor
 
-    # Step 6: Clip to valid range
+    # Step 7: Clip to valid range
     corrected = np.clip(corrected, 0.0, 1.0)
 
     return corrected
