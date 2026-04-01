@@ -237,6 +237,7 @@ def resolve_working_paths(workspace_root: Path, config: dict, date: str) -> dict
     return {
         "working_dir": working_dir,
         "keyframes": working_dir / "keyframes" / date,
+        "white_balance": working_dir / "white_balance" / date,
         "scene_analysis": working_dir / "scene_analysis" / date,
         "masks": working_dir / "masks" / date,
         "depth": working_dir / "depth" / date,

@@ -83,6 +83,92 @@ MARINE_LIFE_KEYWORDS = {
 }
 
 
+def load_white_balance(wb_dir: Path, clip_id: str) -> dict | None:
+    """Load white balance correction gains for a clip.
+
+    Returns the white_balance dict with gain_r/gain_g/gain_b, or None if not found.
+    """
+    json_path = wb_dir / f"{clip_id}.json"
+    if not json_path.is_file():
+        logger.debug("No white balance file for clip %s at %s", clip_id, json_path)
+        return None
+
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load white balance for %s: %s", clip_id, e)
+        return None
+
+    wb = data.get("white_balance")
+    if not isinstance(wb, dict):
+        logger.warning("Invalid white balance format for %s", clip_id)
+        return None
+
+    # Validate required fields
+    for field in ("gain_r", "gain_g", "gain_b"):
+        if field not in wb or not isinstance(wb[field], (int, float)):
+            logger.warning("White balance missing or invalid field '%s' for %s", field, clip_id)
+            return None
+
+    return wb
+
+
+def apply_white_balance(timeline_item, node_index: int, wb: dict) -> bool:
+    """Apply per-clip white balance gains to a grade node.
+
+    Sets the Gain (color corrector) on the specified node to the WB correction
+    values. This adjusts the highlight/overall color balance per clip.
+
+    Returns True on success, False on failure.
+    """
+    gain_r = wb["gain_r"]
+    gain_g = wb["gain_g"]
+    gain_b = wb["gain_b"]
+
+    # Try the primary Resolve API approach: SetNodeGain
+    try:
+        # Resolve Color Corrector API — set gain on the target node
+        # The gain values are multipliers around 1.0
+        result = timeline_item.SetNodeGain(node_index, {
+            "red": gain_r,
+            "green": gain_g,
+            "blue": gain_b,
+        })
+        if result:
+            logger.debug(
+                "  Set WB gains on Node %d: R=%.3f G=%.3f B=%.3f",
+                node_index, gain_r, gain_g, gain_b,
+            )
+            return True
+    except AttributeError:
+        logger.debug("  SetNodeGain not available, trying alternative")
+    except Exception as e:
+        logger.debug("  SetNodeGain failed: %s", e)
+
+    # Fallback: try setting via color corrector properties
+    try:
+        # Some Resolve API versions use GetColorCorrector/SetGain
+        corrector = timeline_item.GetNodeColorCorrector(node_index)
+        if corrector:
+            corrector.SetGain(gain_r, gain_g, gain_b, 1.0)
+            logger.debug(
+                "  Set WB gains via corrector on Node %d: R=%.3f G=%.3f B=%.3f",
+                node_index, gain_r, gain_g, gain_b,
+            )
+            return True
+    except (AttributeError, Exception) as e:
+        logger.debug("  Color corrector fallback failed: %s", e)
+
+    logger.warning(
+        "  Could not apply WB gains to Node %d (%s) — "
+        "manual adjustment may be required. Gains: R=%.3f G=%.3f B=%.3f",
+        node_index, NODE_NAMES.get(node_index, "?"),
+        gain_r, gain_g, gain_b,
+    )
+    return False
+
+
 def discover_footage(raw_dir: Path, flat_dir: Path) -> list[Path]:
     """Find all video files in raw and flat footage directories.
 
@@ -575,14 +661,16 @@ def process_timeline_item(
     masks_base: Path,
     depth_base: Path,
     scene_analysis_dir: Path,
+    wb_dir: Path | None = None,
 ) -> dict:
-    """Process a single timeline item: apply DRX, LUT, and attach mattes.
+    """Process a single timeline item: apply DRX, LUT, WB, and attach mattes.
 
     Returns a summary dict with counts of applied elements.
     """
     result = {
         "drx_applied": False,
         "lut_set": False,
+        "wb_applied": False,
         "depth_attached": False,
         "mattes_attached": 0,
         "mattes_failed": 0,
@@ -604,6 +692,28 @@ def process_timeline_item(
             result["warnings"].append("LUT not set on Node 1")
     else:
         result["warnings"].append("LUT file not found, skipped")
+
+    # Step 2b: Apply per-clip white balance to Node 2 (Neutral Balance)
+    if wb_dir is not None:
+        wb = load_white_balance(wb_dir, clip_id)
+        if wb:
+            result["wb_applied"] = apply_white_balance(
+                timeline_item, NODE_NEUTRAL_BALANCE, wb
+            )
+            if result["wb_applied"]:
+                logger.info(
+                    "  WB -> Node %d (%s): R=%.3f G=%.3f B=%.3f (%s confidence)",
+                    NODE_NEUTRAL_BALANCE, NODE_NAMES[NODE_NEUTRAL_BALANCE],
+                    wb["gain_r"], wb["gain_g"], wb["gain_b"],
+                    wb.get("confidence", "?"),
+                )
+            else:
+                result["warnings"].append(
+                    f"WB gains not applied to Node 2 (R={wb['gain_r']:.3f} "
+                    f"G={wb['gain_g']:.3f} B={wb['gain_b']:.3f})"
+                )
+        else:
+            logger.debug("  No white balance data for %s", clip_id)
 
     # Step 3: Find and attach depth sequence to Node 3
     depth_dir = find_depth_sequence_dir(depth_base, clip_id)
@@ -675,6 +785,7 @@ def dry_run_validate(
     masks_base: Path,
     depth_base: Path,
     scene_analysis_dir: Path,
+    wb_dir: Path,
     lut_path: Path,
     drx_path: Path,
 ) -> None:
@@ -711,6 +822,24 @@ def dry_run_validate(
         else:
             logger.warning("  Scene analysis: MISSING (%s)", scene_json)
             total_issues += 1
+
+        # White balance
+        wb_json = wb_dir / f"{clip_id}.json"
+        if wb_json.is_file():
+            try:
+                with open(wb_json, "r") as f:
+                    wb_data = json.load(f)
+                wb = wb_data.get("white_balance", {})
+                logger.info(
+                    "  White balance: R=%.3f G=%.3f B=%.3f (%s, %s confidence)",
+                    wb.get("gain_r", 0), wb.get("gain_g", 0), wb.get("gain_b", 0),
+                    wb.get("method", "?"), wb.get("confidence", "?"),
+                )
+            except Exception as e:
+                logger.warning("  White balance: ERROR reading %s: %s", wb_json, e)
+                total_issues += 1
+        else:
+            logger.info("  White balance: not available (Node 2 will be neutral)")
 
         # Masks
         mask_clip_dir = masks_base / clip_id
@@ -769,6 +898,7 @@ def main():
     masks_base = paths["masks"]
     depth_base = paths["depth"]
     scene_analysis_dir = paths["scene_analysis"]
+    wb_dir = paths["white_balance"]
 
     # Resolve template and LUT paths
     lut_rel = config.get("resolve_lut_path", "repos/dorea/luts/underwater_base.cube")
@@ -822,7 +952,7 @@ def main():
 
     # --- Dry-run mode: validate and exit ---
     if args.dry_run:
-        dry_run_validate(clips, masks_base, depth_base, scene_analysis_dir, lut_path, drx_path)
+        dry_run_validate(clips, masks_base, depth_base, scene_analysis_dir, wb_dir, lut_path, drx_path)
         return
 
     # --- Connect to Resolve ---
@@ -883,6 +1013,7 @@ def main():
 
     total_drx = 0
     total_lut = 0
+    total_wb = 0
     total_depth = 0
     total_mattes = 0
     total_matte_failures = 0
@@ -907,12 +1038,15 @@ def main():
             masks_base=masks_base,
             depth_base=depth_base,
             scene_analysis_dir=scene_analysis_dir,
+            wb_dir=wb_dir,
         )
 
         if item_result["drx_applied"]:
             total_drx += 1
         if item_result["lut_set"]:
             total_lut += 1
+        if item_result["wb_applied"]:
+            total_wb += 1
         if item_result["depth_attached"]:
             total_depth += 1
         total_mattes += item_result["mattes_attached"]
@@ -927,8 +1061,8 @@ def main():
         len(imported_clips), len(timeline_items),
     )
     logger.info(
-        "Grades: %d DRX applied, %d LUT set",
-        total_drx, total_lut,
+        "Grades: %d DRX applied, %d LUT set, %d WB applied",
+        total_drx, total_lut, total_wb,
     )
     logger.info(
         "Mattes: %d depth attached, %d subject mattes attached, %d failed",
