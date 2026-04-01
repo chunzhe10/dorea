@@ -12,6 +12,7 @@ Usage:
 
 Inputs:
     - Raw footage files from footage/raw/{date}/ and footage/flat/{date}/
+    - working/white_balance/{date}/{clip_id}.json — per-clip WB gains from Phase 1b (optional)
     - working/masks/{date}/{clip_id}/{subject_label}/ — SAM2 mask PNG sequences from Phase 3
     - working/depth/{date}/{clip_id}/ — depth map PNG sequences from Phase 4
     - repos/dorea/luts/underwater_base.cube — reference LUT from Phase 0
@@ -34,6 +35,7 @@ Architecture doc: Sections 5 and 7
 import argparse
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -105,10 +107,19 @@ def load_white_balance(wb_dir: Path, clip_id: str) -> dict | None:
         logger.warning("Invalid white balance format for %s", clip_id)
         return None
 
-    # Validate required fields
+    # Validate required fields — check type, finiteness, and range
     for field in ("gain_r", "gain_g", "gain_b"):
         if field not in wb or not isinstance(wb[field], (int, float)):
             logger.warning("White balance missing or invalid field '%s' for %s", field, clip_id)
+            return None
+        if not math.isfinite(wb[field]):
+            logger.warning("White balance field '%s' is not finite for %s", field, clip_id)
+            return None
+        if not (0.1 <= wb[field] <= 5.0):
+            logger.warning(
+                "White balance field '%s' = %.3f out of safe range [0.1, 5.0] for %s",
+                field, wb[field], clip_id,
+            )
             return None
 
     return wb
@@ -157,7 +168,7 @@ def apply_white_balance(timeline_item, node_index: int, wb: dict) -> bool:
                 node_index, gain_r, gain_g, gain_b,
             )
             return True
-    except (AttributeError, Exception) as e:
+    except Exception as e:
         logger.debug("  Color corrector fallback failed: %s", e)
 
     logger.warning(
@@ -785,9 +796,9 @@ def dry_run_validate(
     masks_base: Path,
     depth_base: Path,
     scene_analysis_dir: Path,
-    wb_dir: Path,
     lut_path: Path,
     drx_path: Path,
+    wb_dir: Path | None = None,
 ) -> None:
     """Dry-run mode: validate all inputs and show per-clip summary."""
     logger.info("[DRY RUN] Validating inputs — Resolve connection skipped")
@@ -824,22 +835,25 @@ def dry_run_validate(
             total_issues += 1
 
         # White balance
-        wb_json = wb_dir / f"{clip_id}.json"
-        if wb_json.is_file():
-            try:
-                with open(wb_json, "r") as f:
-                    wb_data = json.load(f)
-                wb = wb_data.get("white_balance", {})
-                logger.info(
-                    "  White balance: R=%.3f G=%.3f B=%.3f (%s, %s confidence)",
-                    wb.get("gain_r", 0), wb.get("gain_g", 0), wb.get("gain_b", 0),
-                    wb.get("method", "?"), wb.get("confidence", "?"),
-                )
-            except Exception as e:
-                logger.warning("  White balance: ERROR reading %s: %s", wb_json, e)
-                total_issues += 1
+        if wb_dir is None:
+            logger.info("  White balance: not configured")
         else:
-            logger.info("  White balance: not available (Node 2 will be neutral)")
+            wb_json = wb_dir / f"{clip_id}.json"
+            if wb_json.is_file():
+                try:
+                    with open(wb_json, "r") as f:
+                        wb_data = json.load(f)
+                    wb = wb_data.get("white_balance", {})
+                    logger.info(
+                        "  White balance: R=%.3f G=%.3f B=%.3f (%s, %s confidence)",
+                        wb.get("gain_r", 0), wb.get("gain_g", 0), wb.get("gain_b", 0),
+                        wb.get("method", "?"), wb.get("confidence", "?"),
+                    )
+                except Exception as e:
+                    logger.warning("  White balance: ERROR reading %s: %s", wb_json, e)
+                    total_issues += 1
+            else:
+                logger.info("  White balance: not available (Node 2 will be neutral)")
 
         # Masks
         mask_clip_dir = masks_base / clip_id
@@ -952,7 +966,7 @@ def main():
 
     # --- Dry-run mode: validate and exit ---
     if args.dry_run:
-        dry_run_validate(clips, masks_base, depth_base, scene_analysis_dir, wb_dir, lut_path, drx_path)
+        dry_run_validate(clips, masks_base, depth_base, scene_analysis_dir, lut_path, drx_path, wb_dir=wb_dir)
         return
 
     # --- Connect to Resolve ---

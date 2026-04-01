@@ -19,7 +19,7 @@ Outputs:
                "keyframes_analyzed": int, "mean_rgb_linear": [R, G, B]}}
 
 Dependencies:
-    - numpy, Pillow, colour-science
+    - numpy, Pillow
     - No GPU required (CPU only)
 
 Architecture doc: Section 4.0 (colour pipeline)
@@ -32,11 +32,11 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from colour.models import eotf_sRGB
 from PIL import Image
 
 from pipeline_utils import (
     configure_logging,
+    dlog_m_to_linear,
     find_workspace_root,
     load_config,
     resolve_working_paths,
@@ -45,14 +45,19 @@ from pipeline_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Pixel filtering thresholds
-MIN_LUMINANCE = 0.05  # Exclude very dark pixels (noise-dominated)
-MAX_LUMINANCE = 0.95  # Exclude clipped highlights
-MAX_SATURATION = 0.90  # Exclude highly saturated pixels (skew neutral estimate)
+# Pixel filtering thresholds (calibrated for D-Log M decoded linear light)
+# D-Log M middle grey (18%) decodes to ~0.18 linear; highlights rarely exceed 0.6 linear
+MIN_LUMINANCE = 0.02  # Exclude very dark pixels (noise-dominated)
+MAX_LUMINANCE = 0.60  # Exclude specular highlights in D-Log M footage
+# Saturation threshold: underwater illuminant itself has high saturation in linear space
+# (~0.85 for typical blue cast) because red is severely absorbed. We set 0.92 to only
+# exclude near-pure-channel artifacts while keeping the water illuminant pixels we need.
+MAX_SATURATION = 0.92
 
-# Gain safety bounds — prevent extreme corrections
+# Gain safety bounds — allow sufficient correction for moderate depth dives
+# Beer-Lambert: 5m needs ~3.67x red correction; LUT provides ~2.0x static
 GAIN_MIN = 0.5
-GAIN_MAX = 2.5
+GAIN_MAX = 3.5
 
 # Minimum keyframes required for a reliable estimate
 MIN_KEYFRAMES = 3
@@ -61,11 +66,15 @@ MIN_KEYFRAMES = 3
 def load_frame_linear(path: Path) -> np.ndarray:
     """Load a JPEG keyframe and convert to linear-light float64 RGB.
 
-    Returns array of shape (H, W, 3) in linear light, range [0, 1].
+    Keyframes are extracted from DJI Action 4 D-Log M footage via ffmpeg
+    without color space conversion, so the pixel values are D-Log M encoded.
+    We decode them to scene-linear light using the D-Log M transfer function.
+
+    Returns array of shape (H, W, 3) in linear light.
     """
     img = Image.open(path).convert("RGB")
     data = np.asarray(img, dtype=np.float64) / 255.0
-    return eotf_sRGB(data)
+    return dlog_m_to_linear(data)
 
 
 def compute_luminance(linear_rgb: np.ndarray) -> np.ndarray:
@@ -89,9 +98,9 @@ def estimate_white_balance(keyframe_dir: Path) -> dict:
     Uses a filtered grey-world algorithm:
     1. Load all keyframes and convert to linear light
     2. Filter out pixels that would skew the estimate:
-       - Very dark pixels (luminance < 5%) — noise-dominated
-       - Clipped highlights (luminance > 95%) — saturated sensor
-       - Highly chromatic pixels (saturation > 90%) — colored subjects, not illuminant
+       - Very dark pixels (luminance < 2%) — noise-dominated
+       - Bright highlights (luminance > 60%) — specular reflections in D-Log M
+       - Near-pure-channel pixels (saturation > 92%) — artifacts, not natural illuminant
     3. Compute mean RGB of filtered pixels across all keyframes
     4. Derive per-channel gains to neutralize the color cast
 
@@ -113,6 +122,8 @@ def estimate_white_balance(keyframe_dir: Path) -> dict:
     # Accumulate filtered pixel sums across all keyframes
     channel_sum = np.zeros(3, dtype=np.float64)
     pixel_count = 0
+    total_pixels = 0
+    frames_processed = 0
 
     for frame_path in frame_paths:
         try:
@@ -121,8 +132,11 @@ def estimate_white_balance(keyframe_dir: Path) -> dict:
             logger.warning("  Skipping unreadable frame %s: %s", frame_path.name, e)
             continue
 
+        frames_processed += 1
+
         # Flatten to (N, 3)
         pixels = linear.reshape(-1, 3)
+        total_pixels += len(pixels)
 
         # Compute filtering masks
         lum = compute_luminance(linear).ravel()
@@ -171,14 +185,14 @@ def estimate_white_balance(keyframe_dir: Path) -> dict:
     gains = np.clip(gains, GAIN_MIN, GAIN_MAX)
 
     # Assess confidence based on pixel coverage and gain magnitude
-    valid_ratio = pixel_count / (len(frame_paths) * linear.shape[0] * linear.shape[1])
+    valid_ratio = pixel_count / max(total_pixels, 1)
     max_gain = gains.max()
 
     if valid_ratio < 0.1:
         confidence = "low"
-    elif max_gain > 2.0:
+    elif max_gain > 3.0:
         confidence = "low"
-    elif valid_ratio < 0.3 or max_gain > 1.5:
+    elif valid_ratio < 0.3 or max_gain > 2.0:
         confidence = "medium"
     else:
         confidence = "high"
@@ -194,7 +208,7 @@ def estimate_white_balance(keyframe_dir: Path) -> dict:
         "gain_b": round(float(gains[2]), 4),
         "method": "grey_world",
         "confidence": confidence,
-        "keyframes_analyzed": len(frame_paths),
+        "keyframes_analyzed": frames_processed,
         "mean_rgb_linear": [round(float(v), 6) for v in mean_rgb],
     }
 

@@ -40,6 +40,9 @@ echo ""
 echo "=== Phase 1: Extract keyframes ==="
 python "$SCRIPT_DIR/01_extract_frames.py" --date "$DATE"
 
+echo "=== Phase 1b: Per-clip white balance estimation ==="
+python "$SCRIPT_DIR/01b_estimate_white_balance.py" --date "$DATE"
+
 echo "=== Phase 2: Claude scene analysis ==="
 python "$SCRIPT_DIR/02_claude_scene_analysis.py" --date "$DATE"
 
