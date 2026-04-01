@@ -230,6 +230,7 @@ def resolve_working_paths(workspace_root: Path, config: dict, date: str) -> dict
         - scene_analysis: working/scene_analysis/{date}/
         - masks: working/masks/{date}/
         - depth: working/depth/{date}/
+        - previews: working/previews/{date}/
         - working_dir: working/
     """
     working_dir = workspace_root / config["working_dir"]
@@ -239,6 +240,7 @@ def resolve_working_paths(workspace_root: Path, config: dict, date: str) -> dict
         "scene_analysis": working_dir / "scene_analysis" / date,
         "masks": working_dir / "masks" / date,
         "depth": working_dir / "depth" / date,
+        "previews": working_dir / "previews" / date,
     }
 
 
@@ -249,7 +251,7 @@ def check_legacy_working_dir(workspace_root: Path, config: dict, date: str) -> N
     date directories (YYYY-MM-DD pattern).
     """
     working_dir = workspace_root / config["working_dir"]
-    subdirs = ["keyframes", "scene_analysis", "masks", "depth"]
+    subdirs = ["keyframes", "scene_analysis", "masks", "depth", "previews"]
 
     for subdir_name in subdirs:
         subdir = working_dir / subdir_name
