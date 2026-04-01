@@ -23,6 +23,10 @@ echo ""
 # that runs once per visual look, not per dive session.
 # Run manually: python scripts/00_generate_lut.py --references references/look_v1/ --output luts/underwater_base.cube
 
+# DRX template (create_drx_template.py) is also one-time — run on the HOST with
+# Resolve to generate templates/underwater_grade_v1.drx before first Phase 5 run.
+# Run manually: python scripts/create_drx_template.py
+
 echo "=== Phase 1: Extract keyframes ==="
 python "$SCRIPT_DIR/01_extract_frames.py" --date "$DATE"
 
