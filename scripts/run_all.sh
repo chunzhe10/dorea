@@ -33,6 +33,10 @@ echo ""
 # Resolve to generate templates/underwater_grade_v1.drx before first Phase 5 run.
 # On the host: python scripts/create_drx_template.py
 
+# LUT preview (preview_lut.py) is an optional evaluation tool — run after Phase 1
+# to visually compare RAW vs LUT-graded keyframes without opening Resolve.
+# Run manually: python scripts/preview_lut.py --date YYYY-MM-DD
+
 echo "=== Phase 1: Extract keyframes ==="
 python "$SCRIPT_DIR/01_extract_frames.py" --date "$DATE"
 

@@ -1,13 +1,16 @@
 """Tests for preview_lut.py — LUT preview generation."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
+import subprocess
 
 import pytest
 
 from preview_lut import (
     _escape_ffmpeg_filter_value,
+    apply_lut,
     discover_keyframes,
+    generate_comparison,
     resolve_lut_path,
 )
 
@@ -110,3 +113,108 @@ class TestResolveLutPath:
 
         result = resolve_lut_path(tmp_path, config, None)
         assert "underwater_base.cube" in result.name
+
+
+class TestApplyLut:
+    @patch("preview_lut.subprocess.run")
+    def test_success_returns_true(self, mock_run, tmp_path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        output = tmp_path / "out" / "frame.jpg"
+        lut = tmp_path / "test.cube"
+
+        result = apply_lut(frame, output, lut)
+
+        assert result is True
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "ffmpeg"
+        assert "format=rgb24,lut3d=file=" in cmd[5]
+        assert str(frame) in cmd
+        assert str(output) in cmd
+
+    @patch("preview_lut.subprocess.run")
+    def test_creates_parent_directory(self, mock_run, tmp_path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        output = tmp_path / "nested" / "dir" / "frame.jpg"
+        lut = tmp_path / "test.cube"
+
+        apply_lut(frame, output, lut)
+
+        assert output.parent.is_dir()
+
+    @patch("preview_lut.subprocess.run", side_effect=subprocess.CalledProcessError(1, "ffmpeg", stderr="error"))
+    def test_failure_returns_false(self, mock_run, tmp_path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        output = tmp_path / "out" / "frame.jpg"
+        lut = tmp_path / "test.cube"
+
+        result = apply_lut(frame, output, lut)
+
+        assert result is False
+
+    @patch("preview_lut.subprocess.run", side_effect=subprocess.TimeoutExpired("ffmpeg", 60))
+    def test_timeout_returns_false(self, mock_run, tmp_path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        output = tmp_path / "out" / "frame.jpg"
+        lut = tmp_path / "test.cube"
+
+        result = apply_lut(frame, output, lut)
+
+        assert result is False
+
+
+class TestGenerateComparison:
+    @patch("preview_lut.subprocess.run")
+    def test_labeled_success(self, mock_run, tmp_path):
+        raw = tmp_path / "raw.jpg"
+        raw.write_bytes(b"fake")
+        graded = tmp_path / "graded.jpg"
+        graded.write_bytes(b"fake")
+        output = tmp_path / "out" / "comparison.jpg"
+
+        result = generate_comparison(raw, graded, output)
+
+        assert result is True
+        assert mock_run.call_count == 1
+        cmd = mock_run.call_args[0][0]
+        assert "drawtext" in cmd[7]
+
+    @patch("preview_lut.subprocess.run")
+    def test_fallback_to_unlabeled(self, mock_run, tmp_path):
+        raw = tmp_path / "raw.jpg"
+        raw.write_bytes(b"fake")
+        graded = tmp_path / "graded.jpg"
+        graded.write_bytes(b"fake")
+        output = tmp_path / "out" / "comparison.jpg"
+
+        # First call (labeled) fails, second call (unlabeled) succeeds
+        mock_run.side_effect = [
+            subprocess.CalledProcessError(1, "ffmpeg"),
+            MagicMock(),
+        ]
+
+        result = generate_comparison(raw, graded, output)
+
+        assert result is True
+        assert mock_run.call_count == 2
+        # Second call should use plain hstack
+        fallback_cmd = mock_run.call_args_list[1][0][0]
+        assert "hstack" in fallback_cmd[7]
+        assert "drawtext" not in fallback_cmd[7]
+
+    @patch("preview_lut.subprocess.run", side_effect=subprocess.CalledProcessError(1, "ffmpeg", stderr="error"))
+    def test_both_fail_returns_false(self, mock_run, tmp_path):
+        raw = tmp_path / "raw.jpg"
+        raw.write_bytes(b"fake")
+        graded = tmp_path / "graded.jpg"
+        graded.write_bytes(b"fake")
+        output = tmp_path / "out" / "comparison.jpg"
+
+        result = generate_comparison(raw, graded, output)
+
+        assert result is False
+        assert mock_run.call_count == 2

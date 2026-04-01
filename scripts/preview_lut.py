@@ -91,6 +91,11 @@ def apply_lut(frame_path: Path, output_path: Path, lut_path: Path) -> bool:
     Converts to RGB before LUT application for correct colour processing,
     matching how DaVinci Resolve applies the same LUT.
 
+    Note: rgb24 is 8-bit per channel. Source keyframes are already 8-bit JPEG,
+    so no additional precision is lost. Resolve processes in 32-bit float
+    internally, so its output will be slightly higher quality (less banding
+    in boosted channels).
+
     Returns True on success, False on failure.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,14 +105,17 @@ def apply_lut(frame_path: Path, output_path: Path, lut_path: Path) -> bool:
         "ffmpeg",
         "-y",
         "-i", str(frame_path),
-        "-vf", f"format=rgb24,lut3d=file='{escaped_lut}'",
+        "-vf", f"format=rgb24,lut3d=file={escaped_lut}",
         "-q:v", "2",
         str(output_path),
     ]
 
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
         return True
+    except subprocess.TimeoutExpired:
+        logger.error("LUT application timed out for %s", frame_path.name)
+        return False
     except subprocess.CalledProcessError as e:
         logger.error("LUT application failed for %s: %s", frame_path.name, e.stderr.strip())
         return False
@@ -123,11 +131,12 @@ def generate_comparison(raw_path: Path, graded_path: Path, output_path: Path) ->
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Try labeled comparison first (drawtext requires fontconfig).
+    # format=rgb24 on both inputs ensures consistent pixel format for hstack.
     filter_labeled = (
-        "[0]drawtext=text='RAW':font='monospace':"
+        "[0]format=rgb24,drawtext=text='RAW':font='monospace':"
         "x=10:y=10:fontsize=28:fontcolor=white:"
         "borderw=2:bordercolor=black[left];"
-        "[1]drawtext=text='GRADED':font='monospace':"
+        "[1]format=rgb24,drawtext=text='GRADED':font='monospace':"
         "x=10:y=10:fontsize=28:fontcolor=white:"
         "borderw=2:bordercolor=black[right];"
         "[left][right]hstack=inputs=2"
@@ -144,14 +153,17 @@ def generate_comparison(raw_path: Path, graded_path: Path, output_path: Path) ->
     ]
 
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
         return True
     except subprocess.CalledProcessError:
         pass
+    except subprocess.TimeoutExpired:
+        logger.error("Comparison timed out for %s", raw_path.name)
+        return False
 
     # Fallback: unlabeled hstack (no font dependency)
     logger.debug("drawtext failed, falling back to unlabeled comparison for %s", raw_path.name)
-    filter_plain = "[0][1]hstack=inputs=2"
+    filter_plain = "[0]format=rgb24[l];[1]format=rgb24[r];[l][r]hstack=inputs=2"
 
     cmd_fallback = [
         "ffmpeg",
@@ -164,8 +176,11 @@ def generate_comparison(raw_path: Path, graded_path: Path, output_path: Path) ->
     ]
 
     try:
-        subprocess.run(cmd_fallback, capture_output=True, text=True, check=True)
+        subprocess.run(cmd_fallback, capture_output=True, text=True, check=True, timeout=60)
         return True
+    except subprocess.TimeoutExpired:
+        logger.error("Comparison timed out for %s", raw_path.name)
+        return False
     except subprocess.CalledProcessError as e:
         logger.error("Comparison failed for %s: %s", raw_path.name, e.stderr.strip())
         return False
@@ -198,7 +213,7 @@ def main():
     )
     parser.add_argument(
         "--lut", default=None,
-        help="Path to .cube LUT file (relative to repos/dorea/, default: from config.yaml)",
+        help="Path to .cube LUT file (absolute, or relative to repos/dorea/; default: from config.yaml)",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -220,6 +235,9 @@ def main():
 
     # Resolve LUT path
     lut_path = resolve_lut_path(workspace_root, config, args.lut)
+    if lut_path.suffix.lower() != ".cube":
+        logger.error("LUT file must be a .cube file, got: %s", lut_path)
+        sys.exit(1)
     if not lut_path.is_file():
         logger.error("LUT file not found: %s", lut_path)
         logger.error(
@@ -275,8 +293,6 @@ def main():
         # Skip existing outputs unless --force
         if not args.force and graded_path.is_file() and comparison_path.is_file():
             skipped += 1
-            graded_ok += 1
-            comparison_ok += 1
             continue
 
         # Step 1: Apply LUT
@@ -292,10 +308,11 @@ def main():
             comparison_failed += 1
 
     # Summary
+    processed = total_frames - skipped
     logger.info("--- Preview generation complete ---")
     logger.info(
-        "Graded: %d/%d | Comparisons: %d/%d | Skipped: %d",
-        graded_ok, total_frames, comparison_ok, total_frames, skipped,
+        "Processed: %d | Skipped: %d | Graded OK: %d | Comparisons OK: %d",
+        processed, skipped, graded_ok, comparison_ok,
     )
     if graded_failed > 0 or comparison_failed > 0:
         logger.warning(
@@ -304,14 +321,18 @@ def main():
         )
 
     # Print path to first comparison for easy viewing
-    first_clip = next(iter(clips))
-    first_comparison = previews_dir / first_clip / "comparison" / clips[first_clip][0].name
-    logger.info("Output: %s", previews_dir)
-    if first_comparison.is_file():
-        logger.info("First comparison: %s", first_comparison)
+    if graded_ok > 0:
+        first_clip = next(iter(clips))
+        first_comparison = previews_dir / first_clip / "comparison" / clips[first_clip][0].name
+        logger.info("Output: %s", previews_dir)
+        if first_comparison.is_file():
+            logger.info("First comparison: %s", first_comparison)
 
     if graded_failed > 0 and graded_ok == 0:
         logger.error("All frames failed. Check ffmpeg errors above.")
+        sys.exit(1)
+
+    if graded_failed > 0 or comparison_failed > 0:
         sys.exit(1)
 
 
