@@ -39,8 +39,10 @@ from colour.models import eotf_sRGB, eotf_inverse_sRGB
 from pipeline_utils import (
     IMAGE_EXTENSIONS,
     configure_logging,
+    dlog_m_to_linear,
     discover_images,
     find_workspace_root,
+    linear_to_dlog_m,
 )
 
 # LUT grid resolution — 33x33x33 is the industry standard for .cube files
@@ -56,89 +58,6 @@ MIDTONE_UPPER = 0.7
 DLOG_M_MID_GREY = 0.39
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# D-Log M transfer function
-# ---------------------------------------------------------------------------
-
-def dlog_m_to_linear(x: np.ndarray) -> np.ndarray:
-    """Convert D-Log M encoded values to scene-linear light.
-
-    D-Log M is DJI's log gamma curve used in Action 4 and other cameras.
-    It has a linear segment in deep shadows and a logarithmic curve above.
-
-    The transfer function is an approximation based on published D-Log M
-    characteristics:
-        - Middle grey (18%) maps to ~0.39 in D-Log M
-        - Very flat contrast curve designed to maximise dynamic range
-
-    The encoding function (linear -> D-Log M) is:
-        For linear >= cut_linear:  encoded = c * log10(a * linear + b) + d
-        For linear < cut_linear:   encoded = slope * linear + intercept
-
-    This function is the inverse (D-Log M -> linear).
-    """
-    x = np.asarray(x, dtype=np.float64)
-
-    # D-Log M curve parameters (DJI published curve)
-    a = 0.9892
-    b = 0.0108
-    c = 0.256663
-    d = 0.584555
-
-    # Cut point in encoded space — below this, the encoding is linear
-    # The linear segment ensures continuity at the boundary.
-    # Compute the cut point values for proper continuity:
-    cut_encoded = 0.14
-
-    # Log segment decode: linear = (10^((encoded - d) / c) - b) / a
-    cut_linear = (10.0 ** ((cut_encoded - d) / c) - b) / a
-
-    # Slope of the encoding function at the cut point (derivative of log segment):
-    # d/d(linear) [c * log10(a*linear + b) + d] = c * a / ((a*linear + b) * ln(10))
-    slope = c * a / ((a * cut_linear + b) * np.log(10.0))
-
-    # Linear segment encoding: encoded = slope * linear + intercept
-    # At cut: cut_encoded = slope * cut_linear + intercept
-    intercept = cut_encoded - slope * cut_linear
-
-    linear = np.where(
-        x <= cut_encoded,
-        # Linear segment inverse: linear = (encoded - intercept) / slope
-        (x - intercept) / slope,
-        # Log segment inverse: linear = (10^((encoded - d) / c) - b) / a
-        (np.power(10.0, (x - d) / c) - b) / a,
-    )
-
-    return np.clip(linear, 0.0, None)
-
-
-def linear_to_dlog_m(x: np.ndarray) -> np.ndarray:
-    """Convert scene-linear light values to D-Log M encoding.
-
-    Inverse of dlog_m_to_linear(). Used for verification.
-    """
-    x = np.asarray(x, dtype=np.float64)
-
-    a = 0.9892
-    b = 0.0108
-    c = 0.256663
-    d = 0.584555
-    cut_encoded = 0.14
-
-    # Compute the same cut/slope/intercept as the decode function
-    cut_linear = (10.0 ** ((cut_encoded - d) / c) - b) / a
-    slope = c * a / ((a * cut_linear + b) * np.log(10.0))
-    intercept = cut_encoded - slope * cut_linear
-
-    encoded = np.where(
-        x <= cut_linear,
-        slope * x + intercept,
-        c * np.log10(a * x + b) + d,
-    )
-
-    return np.clip(encoded, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +119,11 @@ def analyse_images(image_paths: list[Path]) -> dict:
 
     for path in image_paths:
         logger.debug("  Loading: %s", path.name)
-        linear = load_image_linear(path)
+        try:
+            linear = load_image_linear(path)
+        except Exception as e:
+            logger.warning("Skipping unreadable image %s: %s", path.name, e)
+            continue
 
         # Reshape to (N, 3)
         pixels = linear.reshape(-1, 3)
@@ -313,11 +236,12 @@ def compute_correction_params(analysis: dict) -> dict:
     if highlight_lum < 1e-6:
         logger.warning("Highlight luminance near zero — using fallback value")
         highlight_lum = 0.8
-    # Compute per-channel gain relative to luminance
+    # Compute per-channel gain relative to luminance.
+    # Note: we intentionally do NOT normalise to max=1.0 here. For underwater
+    # footage, the red channel is always weakest — normalising to the strongest
+    # channel would suppress red further. Instead, clip to a safe range and
+    # let the red recovery boost (below) bring red up.
     gain = highlights / highlight_lum
-    # Normalise so the brightest channel has gain ~1.0
-    gain = gain / max(gain.max(), 1e-6)
-    # Ensure gain stays in reasonable range
     gain = np.clip(gain, 0.5, 1.5)
 
     # --- Gamma (midtone correction) ---
@@ -337,9 +261,12 @@ def compute_correction_params(analysis: dict) -> dict:
     # Typical D-Log M to Rec.709 needs gamma ~0.45-0.55 for good contrast.
     base_gamma = 0.50
 
-    # Adjust per-channel gamma based on midtone colour balance
-    gamma = np.full(3, base_gamma) * (1.0 / np.clip(mid_balance, 0.5, 2.0))
-    gamma = np.clip(gamma, 0.3, 0.8)
+    # Adjust per-channel gamma based on midtone colour balance.
+    # Use a tighter clamp range (0.7-1.3) to prevent the weakest channel
+    # (typically red underwater) from getting significantly less contrast
+    # expansion than the strongest channel.
+    gamma = np.full(3, base_gamma) * (1.0 / np.clip(mid_balance, 0.7, 1.3))
+    gamma = np.clip(gamma, 0.35, 0.65)
 
     # --- Underwater-specific: red channel recovery ---
     # Water absorbs red light first, so underwater images are blue/green biased.
@@ -347,8 +274,10 @@ def compute_correction_params(analysis: dict) -> dict:
     red_ratio = overall[0] / max(overall.mean(), 1e-6)
     red_deficit = max(0.0, 1.0 - red_ratio)
 
-    # Apply graduated red recovery
-    red_boost = 1.0 + red_deficit * 0.3  # Up to 30% boost
+    # Apply graduated red recovery — scaled to the deficit severity.
+    # Underwater red absorption can reach 50-90% depending on depth, so we
+    # allow up to 80% boost (0.8 multiplier) rather than the original 30%.
+    red_boost = 1.0 + red_deficit * 0.8
     gain[0] *= red_boost
 
     # --- Underwater-specific: blue/green balance ---
@@ -391,8 +320,9 @@ def apply_correction(rgb: np.ndarray, params: dict) -> np.ndarray:
         2. Apply lift (shadow offset)
         3. Apply gain (highlight scaling)
         4. Apply gamma (midtone contrast curve)
-        5. Saturation adjustment
-        6. Encode back to output space (clipped to 0-1)
+        5. Highlight rolloff (soft shoulder to prevent hard clipping)
+        6. Saturation adjustment
+        7. Encode back to output space (clipped to 0-1)
 
     Args:
         rgb: Array of shape (..., 3) with D-Log M encoded values (0-1).
@@ -422,14 +352,26 @@ def apply_correction(rgb: np.ndarray, params: dict) -> np.ndarray:
     # Safe power: avoid issues with zero values
     corrected = np.power(corrected + 1e-10, gamma) - np.power(1e-10, gamma)
 
-    # Step 5: Saturation adjustment
+    # Step 5: Highlight rolloff (soft shoulder)
+    # D-Log M stores a wide dynamic range in a flat curve. Expanding with
+    # gamma naturally pushes highlights toward clipping. A soft shoulder
+    # compresses values above a threshold to preserve highlight detail
+    # instead of hard-clipping at 1.0.
+    shoulder = 0.85
+    mask = corrected > shoulder
+    if np.any(mask):
+        excess = corrected[mask] - shoulder
+        headroom = 1.0 - shoulder
+        corrected[mask] = shoulder + headroom * (1.0 - np.exp(-excess / headroom))
+
+    # Step 6: Saturation adjustment
     # Compute luminance and adjust saturation relative to it
     lum = (0.2126 * corrected[..., 0:1]
            + 0.7152 * corrected[..., 1:2]
            + 0.0722 * corrected[..., 2:3])
     corrected = lum + (corrected - lum) * sat_factor
 
-    # Step 6: Clip to valid range
+    # Step 7: Clip to valid range
     corrected = np.clip(corrected, 0.0, 1.0)
 
     return corrected
