@@ -157,7 +157,13 @@ def run_depth_inference(
     if depth_max - depth_min > 0:
         depth_normalised = (depth - depth_min) / (depth_max - depth_min)
     else:
-        depth_normalised = np.zeros_like(depth)
+        # Uniform depth (e.g. flat wall, heavy turbidity). Default to mid-gray
+        # (neutral) rather than all-black (all-far) to avoid incorrect deep-water
+        # colour correction on close uniform surfaces.
+        logger.warning(
+            "Uniform depth detected (min == max). Outputting neutral mid-gray matte."
+        )
+        depth_normalised = np.full_like(depth, 0.5)
 
     # Depth Anything outputs inverse depth (closer = higher values), which
     # matches our convention: bright = close, dark = far. No inversion needed.
@@ -188,7 +194,7 @@ def save_depth_map(
     success = cv2.imwrite(
         str(output_path),
         depth_out,
-        [cv2.IMWRITE_PNG_COMPRESSION, 3],  # moderate compression (0-9)
+        [cv2.IMWRITE_PNG_COMPRESSION, 6],  # libpng default; ~20% smaller than 3 with negligible CPU cost at 518px
     )
     if not success:
         raise RuntimeError(f"cv2.imwrite failed for {output_path}")
@@ -374,7 +380,7 @@ def main():
     model_name = config.get("depth_model", DEFAULT_MODEL)
     weights_path = workspace_root / config.get("depth_weights", "models/depth_anything_v2_small/")
     output_format = config.get("depth_output_format", "png16")
-    output_resolution_raw = config.get("depth_output_resolution", "native")
+    output_resolution_raw = str(config.get("depth_output_resolution", "native"))
 
     # Validate config values
     if output_format not in ("png16", "png8"):
@@ -390,9 +396,20 @@ def main():
             rw, rh = (int(x) for x in output_resolution_raw.split("x"))
             if rw <= 0 or rh <= 0:
                 raise ValueError("dimensions must be positive")
+            if rw > 7680 or rh > 4320:
+                raise ValueError(
+                    f"dimensions {rw}x{rh} exceed 8K maximum — likely misconfigured"
+                )
             output_resolution = (rw, rh)
+            if rw > 1024 or rh > 1024:
+                logger.warning(
+                    "depth_output_resolution %dx%d exceeds model native output (~518px). "
+                    "This increases storage with no quality benefit — "
+                    "Resolve auto-scales mattes to timeline resolution via GPU.",
+                    rw, rh,
+                )
             logger.info("Depth output resolution: %dx%d", rw, rh)
-        except ValueError:
+        except (ValueError, AttributeError, TypeError):
             logger.warning(
                 "Invalid depth_output_resolution '%s' (expected 'native' or 'WxH' "
                 "with positive integers, e.g. '1920x1080'). Defaulting to 'native'.",
