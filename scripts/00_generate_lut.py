@@ -39,8 +39,10 @@ from colour.models import eotf_sRGB, eotf_inverse_sRGB
 from pipeline_utils import (
     IMAGE_EXTENSIONS,
     configure_logging,
+    dlog_m_to_linear,
     discover_images,
     find_workspace_root,
+    linear_to_dlog_m,
 )
 
 # LUT grid resolution — 33x33x33 is the industry standard for .cube files
@@ -56,89 +58,6 @@ MIDTONE_UPPER = 0.7
 DLOG_M_MID_GREY = 0.39
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# D-Log M transfer function
-# ---------------------------------------------------------------------------
-
-def dlog_m_to_linear(x: np.ndarray) -> np.ndarray:
-    """Convert D-Log M encoded values to scene-linear light.
-
-    D-Log M is DJI's log gamma curve used in Action 4 and other cameras.
-    It has a linear segment in deep shadows and a logarithmic curve above.
-
-    The transfer function is an approximation based on published D-Log M
-    characteristics:
-        - Middle grey (18%) maps to ~0.39 in D-Log M
-        - Very flat contrast curve designed to maximise dynamic range
-
-    The encoding function (linear -> D-Log M) is:
-        For linear >= cut_linear:  encoded = c * log10(a * linear + b) + d
-        For linear < cut_linear:   encoded = slope * linear + intercept
-
-    This function is the inverse (D-Log M -> linear).
-    """
-    x = np.asarray(x, dtype=np.float64)
-
-    # D-Log M curve parameters (DJI published curve)
-    a = 0.9892
-    b = 0.0108
-    c = 0.256663
-    d = 0.584555
-
-    # Cut point in encoded space — below this, the encoding is linear
-    # The linear segment ensures continuity at the boundary.
-    # Compute the cut point values for proper continuity:
-    cut_encoded = 0.14
-
-    # Log segment decode: linear = (10^((encoded - d) / c) - b) / a
-    cut_linear = (10.0 ** ((cut_encoded - d) / c) - b) / a
-
-    # Slope of the encoding function at the cut point (derivative of log segment):
-    # d/d(linear) [c * log10(a*linear + b) + d] = c * a / ((a*linear + b) * ln(10))
-    slope = c * a / ((a * cut_linear + b) * np.log(10.0))
-
-    # Linear segment encoding: encoded = slope * linear + intercept
-    # At cut: cut_encoded = slope * cut_linear + intercept
-    intercept = cut_encoded - slope * cut_linear
-
-    linear = np.where(
-        x <= cut_encoded,
-        # Linear segment inverse: linear = (encoded - intercept) / slope
-        (x - intercept) / slope,
-        # Log segment inverse: linear = (10^((encoded - d) / c) - b) / a
-        (np.power(10.0, (x - d) / c) - b) / a,
-    )
-
-    return np.clip(linear, 0.0, None)
-
-
-def linear_to_dlog_m(x: np.ndarray) -> np.ndarray:
-    """Convert scene-linear light values to D-Log M encoding.
-
-    Inverse of dlog_m_to_linear(). Used for verification.
-    """
-    x = np.asarray(x, dtype=np.float64)
-
-    a = 0.9892
-    b = 0.0108
-    c = 0.256663
-    d = 0.584555
-    cut_encoded = 0.14
-
-    # Compute the same cut/slope/intercept as the decode function
-    cut_linear = (10.0 ** ((cut_encoded - d) / c) - b) / a
-    slope = c * a / ((a * cut_linear + b) * np.log(10.0))
-    intercept = cut_encoded - slope * cut_linear
-
-    encoded = np.where(
-        x <= cut_linear,
-        slope * x + intercept,
-        c * np.log10(a * x + b) + d,
-    )
-
-    return np.clip(encoded, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +119,11 @@ def analyse_images(image_paths: list[Path]) -> dict:
 
     for path in image_paths:
         logger.debug("  Loading: %s", path.name)
-        linear = load_image_linear(path)
+        try:
+            linear = load_image_linear(path)
+        except Exception as e:
+            logger.warning("Skipping unreadable image %s: %s", path.name, e)
+            continue
 
         # Reshape to (N, 3)
         pixels = linear.reshape(-1, 3)

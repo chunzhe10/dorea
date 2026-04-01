@@ -35,41 +35,11 @@ from colour.models import eotf_inverse_sRGB
 from pipeline_utils import (
     IMAGE_EXTENSIONS,
     configure_logging,
+    dlog_m_to_linear,
     find_workspace_root,
 )
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# D-Log M transfer function (copied from 00_generate_lut.py for independence)
-# ---------------------------------------------------------------------------
-
-def dlog_m_to_linear(x: np.ndarray) -> np.ndarray:
-    """Convert D-Log M encoded values to scene-linear light.
-
-    D-Log M is DJI's log gamma curve. Has a linear segment in deep shadows
-    and a logarithmic curve above.
-    """
-    x = np.asarray(x, dtype=np.float64)
-
-    a = 0.9892
-    b = 0.0108
-    c = 0.256663
-    d = 0.584555
-    cut_encoded = 0.14
-
-    cut_linear = (10.0 ** ((cut_encoded - d) / c) - b) / a
-    slope = c * a / ((a * cut_linear + b) * np.log(10.0))
-    intercept = cut_encoded - slope * cut_linear
-
-    linear = np.where(
-        x <= cut_encoded,
-        (x - intercept) / slope,
-        (np.power(10.0, (x - d) / c) - b) / a,
-    )
-
-    return np.clip(linear, 0.0, None)
 
 
 # ---------------------------------------------------------------------------
@@ -90,12 +60,12 @@ DEFAULT_PARAMS = {
 
 def correct_image(
     dlog_m_data: np.ndarray,
-    red_gain: float = 1.35,
-    green_gain: float = 1.05,
-    blue_gain: float = 0.95,
-    gamma: float = 0.50,
-    saturation: float = 1.4,
-    shadow_lift: float = 0.01,
+    red_gain: float = DEFAULT_PARAMS["red_gain"],
+    green_gain: float = DEFAULT_PARAMS["green_gain"],
+    blue_gain: float = DEFAULT_PARAMS["blue_gain"],
+    gamma: float = DEFAULT_PARAMS["gamma"],
+    saturation: float = DEFAULT_PARAMS["saturation"],
+    shadow_lift: float = DEFAULT_PARAMS["shadow_lift"],
 ) -> np.ndarray:
     """Apply underwater colour correction to a D-Log M image.
 
@@ -135,17 +105,27 @@ def correct_image(
     corrected = np.clip(corrected, 0.0, None)
     corrected = np.power(corrected + 1e-10, gamma) - np.power(1e-10, gamma)
 
-    # Step 5: Saturation adjustment
+    # Step 5: Highlight rolloff (soft shoulder)
+    # Match the rolloff in 00_generate_lut.py to keep reference and LUT
+    # highlight handling consistent.
+    shoulder = 0.85
+    mask = corrected > shoulder
+    if np.any(mask):
+        excess = corrected[mask] - shoulder
+        headroom = 1.0 - shoulder
+        corrected[mask] = shoulder + headroom * (1.0 - np.exp(-excess / headroom))
+
+    # Step 6: Saturation adjustment
     lum = (0.2126 * corrected[..., 0:1]
            + 0.7152 * corrected[..., 1:2]
            + 0.0722 * corrected[..., 2:3])
     corrected = lum + (corrected - lum) * saturation
 
-    # Step 6: Encode linear → sRGB
+    # Step 7: Encode linear → sRGB
     corrected = np.clip(corrected, 0.0, 1.0)
     srgb = eotf_inverse_sRGB(corrected)
 
-    # Step 7: Final clip
+    # Step 8: Final clip
     return np.clip(srgb, 0.0, 1.0)
 
 
@@ -167,9 +147,17 @@ def discover_keyframes(input_dir: Path) -> list[Path]:
     return unique
 
 
-def process_image(input_path: Path, output_path: Path, params: dict) -> None:
-    """Load a D-Log M keyframe, apply correction, save as sRGB JPEG."""
-    img = Image.open(input_path).convert("RGB")
+def process_image(input_path: Path, output_path: Path, params: dict) -> bool:
+    """Load a D-Log M keyframe, apply correction, save as sRGB JPEG.
+
+    Returns True on success, False if the image could not be loaded.
+    """
+    try:
+        img = Image.open(input_path).convert("RGB")
+    except Exception as e:
+        logger.warning("Skipping unreadable image %s: %s", input_path.name, e)
+        return False
+
     # Normalise to 0-1 (these are D-Log M encoded, NOT sRGB)
     data = np.asarray(img, dtype=np.float64) / 255.0
 
@@ -179,6 +167,7 @@ def process_image(input_path: Path, output_path: Path, params: dict) -> None:
     out_uint8 = np.clip(corrected * 255.0, 0, 255).astype(np.uint8)
     out_img = Image.fromarray(out_uint8, "RGB")
     out_img.save(output_path, "JPEG", quality=95)
+    return True
 
 
 def main():

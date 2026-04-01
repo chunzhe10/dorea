@@ -10,9 +10,83 @@ import re
 import sys
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# D-Log M transfer function (DJI Action 4)
+# ---------------------------------------------------------------------------
+
+def dlog_m_to_linear(x: np.ndarray) -> np.ndarray:
+    """Convert D-Log M encoded values to scene-linear light.
+
+    D-Log M is DJI's log gamma curve used in Action 4 and other cameras.
+    It has a linear segment in deep shadows and a logarithmic curve above.
+
+    The transfer function is an approximation based on published D-Log M
+    characteristics:
+        - Middle grey (18%) maps to ~0.39 in D-Log M
+        - Very flat contrast curve designed to maximise dynamic range
+
+    Camera model: DJI Action 4 (D-Log M). If using a different DJI camera,
+    verify these constants match its published curve.
+    """
+    x = np.asarray(x, dtype=np.float64)
+
+    # D-Log M curve parameters (DJI published curve)
+    a = 0.9892
+    b = 0.0108
+    c = 0.256663
+    d = 0.584555
+
+    # Cut point in encoded space — below this, the encoding is linear
+    cut_encoded = 0.14
+
+    # Log segment decode: linear = (10^((encoded - d) / c) - b) / a
+    cut_linear = (10.0 ** ((cut_encoded - d) / c) - b) / a
+
+    # Slope of the encoding function at the cut point
+    slope = c * a / ((a * cut_linear + b) * np.log(10.0))
+
+    # Linear segment encoding: encoded = slope * linear + intercept
+    intercept = cut_encoded - slope * cut_linear
+
+    linear = np.where(
+        x <= cut_encoded,
+        (x - intercept) / slope,
+        (np.power(10.0, (x - d) / c) - b) / a,
+    )
+
+    return np.clip(linear, 0.0, None)
+
+
+def linear_to_dlog_m(x: np.ndarray) -> np.ndarray:
+    """Convert scene-linear light values to D-Log M encoding.
+
+    Inverse of dlog_m_to_linear(). Used for verification.
+    """
+    x = np.asarray(x, dtype=np.float64)
+
+    a = 0.9892
+    b = 0.0108
+    c = 0.256663
+    d = 0.584555
+    cut_encoded = 0.14
+
+    cut_linear = (10.0 ** ((cut_encoded - d) / c) - b) / a
+    slope = c * a / ((a * cut_linear + b) * np.log(10.0))
+    intercept = cut_encoded - slope * cut_linear
+
+    encoded = np.where(
+        x <= cut_linear,
+        slope * x + intercept,
+        c * np.log10(a * x + b) + d,
+    )
+
+    return np.clip(encoded, 0.0, 1.0)
 
 # Video file extensions to scan (case-insensitive matching via explicit variants)
 VIDEO_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI"}
