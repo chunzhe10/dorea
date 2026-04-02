@@ -20,7 +20,6 @@
  */
 
 #include <cuda_runtime.h>
-#include <math.h>
 
 __device__ float3 trilinear_sample(
     const float* __restrict__ lut,

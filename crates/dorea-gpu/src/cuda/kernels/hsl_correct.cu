@@ -25,7 +25,6 @@
  */
 
 #include <cuda_runtime.h>
-#include <math.h>
 
 #define N_QUALIFIERS 6
 

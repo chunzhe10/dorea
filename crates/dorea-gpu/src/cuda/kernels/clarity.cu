@@ -20,7 +20,6 @@
  */
 
 #include <cuda_runtime.h>
-#include <math.h>
 
 extern "C"
 __global__ void gaussian_blur_rows(

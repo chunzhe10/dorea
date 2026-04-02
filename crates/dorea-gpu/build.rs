@@ -20,10 +20,24 @@ fn find_nvcc() -> Option<PathBuf> {
         }
     }
 
-    // 3. Common install paths
+    // 3. Scan /usr/local/cuda-* (any version) — handles e.g. cuda-12.8, cuda-12.4
+    if let Ok(entries) = std::fs::read_dir("/usr/local") {
+        let mut cuda_dirs: Vec<_> = entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("cuda-"))
+            .map(|e| e.path().join("bin").join("nvcc"))
+            .filter(|p| p.exists())
+            .collect();
+        // Prefer highest version (sort descending by path string)
+        cuda_dirs.sort_by(|a, b| b.cmp(a));
+        if let Some(p) = cuda_dirs.into_iter().next() {
+            return Some(p);
+        }
+    }
+
+    // 4. Remaining common install paths
     for candidate in &[
         "/usr/local/cuda/bin/nvcc",
-        "/usr/local/cuda-12.4/bin/nvcc",
         "/usr/bin/nvcc",
     ] {
         let p = PathBuf::from(candidate);
@@ -64,16 +78,29 @@ fn main() {
         let src = kernels_dir.join(format!("{name}.cu"));
         let obj = out_dir.join(format!("{name}.o"));
 
+        // Make CUDA includes take priority over system includes so that
+        // CUDA's crt/math_functions.h declarations (e.g. cospi) don't conflict
+        // with glibc 2.35+ mathcalls.h redeclaring them with noexcept(true).
+        let cuda_include = nvcc.parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("targets/x86_64-linux/include"))
+            .filter(|p| p.exists());
+        let mut args = vec![
+            "-c".to_string(),
+            "-O2".to_string(),
+            "-arch=sm_86".to_string(), // RTX 3060 is Ampere sm_86
+            "--compiler-options=-fPIC".to_string(),
+        ];
+        if let Some(ref inc) = cuda_include {
+            args.push("-isystem".to_string());
+            args.push(inc.to_str().unwrap().to_string());
+        }
+        args.push(src.to_str().unwrap().to_string());
+        args.push("-o".to_string());
+        args.push(obj.to_str().unwrap().to_string());
+
         let status = std::process::Command::new(&nvcc)
-            .args([
-                "-c",
-                "-O2",
-                "-arch=native", // target the GPU actually present at compile time
-                "--compiler-options=-fPIC",
-                src.to_str().unwrap(),
-                "-o",
-                obj.to_str().unwrap(),
-            ])
+            .args(&args)
             .status()
             .expect("failed to run nvcc");
 
@@ -92,6 +119,15 @@ fn main() {
     }
     ar.status().expect("failed to run ar");
 
+    // Add CUDA lib directory to linker search path.
+    // nvcc lives at <cuda_root>/bin/nvcc; lib is at <cuda_root>/targets/x86_64-linux/lib/.
+    if let Some(cuda_lib) = nvcc.parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("targets/x86_64-linux/lib"))
+        .filter(|p| p.exists())
+    {
+        println!("cargo:rustc-link-search=native={}", cuda_lib.display());
+    }
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=dorea_cuda_kernels");
     println!("cargo:rustc-link-lib=dylib=cuda");

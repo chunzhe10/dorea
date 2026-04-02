@@ -1,8 +1,8 @@
-/// CUDA-backed grading pipeline.
-///
-/// Only compiled when the `cuda` feature is enabled (detected by build.rs).
-/// Provides `grade_frame_cuda` which launches fused CUDA kernels and falls back
-/// to the CPU path on any runtime error.
+//! CUDA-backed grading pipeline.
+//!
+//! Only compiled when the `cuda` feature is enabled (detected by build.rs).
+//! Provides `grade_frame_cuda` which launches fused CUDA kernels and falls back
+//! to the CPU path on any runtime error.
 
 #[cfg(feature = "cuda")]
 use crate::GradeParams;
