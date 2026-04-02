@@ -90,6 +90,7 @@ fn main() {
             "-O2".to_string(),
             "-arch=sm_86".to_string(), // RTX 3060 is Ampere sm_86
             "--compiler-options=-fPIC".to_string(),
+            "--allow-unsupported-compiler".to_string(), // GCC 14 > officially supported max (13)
         ];
         if let Some(ref inc) = cuda_include {
             args.push("-isystem".to_string());
@@ -105,7 +106,12 @@ fn main() {
             .expect("failed to run nvcc");
 
         if !status.success() {
-            panic!("nvcc failed to compile {name}.cu");
+            println!(
+                "cargo:warning=nvcc failed to compile {name}.cu — \
+                 falling back to CPU-only (GCC/CUDA version mismatch?). \
+                 Install gcc-12 or gcc-13 and set CUDAHOSTCXX to enable CUDA kernels."
+            );
+            return;
         }
         obj_files.push(obj);
     }

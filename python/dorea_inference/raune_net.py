@@ -15,7 +15,9 @@ import numpy as np
 
 # Default location relative to workspace root.
 # __file__ is python/dorea_inference/raune_net.py → parents[4] = workspace root
-_DEFAULT_RAUNE_MODELS_DIR = Path(__file__).parents[4] / "working" / "sea_thru_poc"
+_DEFAULT_RAUNE_MODELS_DIR = (
+    Path(__file__).parents[4] / "working" / "sea_thru_poc" / "models" / "RAUNE-Net"
+)
 _DEFAULT_WEIGHTS = (
     Path(__file__).parents[4]
     / "working" / "sea_thru_poc" / "models" / "RAUNE-Net"
@@ -49,8 +51,17 @@ class RauneNetInference:
 
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
 
-        # Add the sea_thru_poc directory to sys.path so we can import models.raune_net
-        models_dir = Path(raune_models_dir) if raune_models_dir else _DEFAULT_RAUNE_MODELS_DIR
+        # Add the RAUNE-Net directory to sys.path so we can import models.raune_net.
+        # Accepts either the RAUNE-Net dir directly (has models/raune_net.py) or the
+        # parent sea_thru_poc dir (auto-descends to models/RAUNE-Net/).
+        given = Path(raune_models_dir) if raune_models_dir else _DEFAULT_RAUNE_MODELS_DIR
+        if (given / "models" / "raune_net.py").exists():
+            models_dir = given
+        elif (given / "models" / "RAUNE-Net" / "models" / "raune_net.py").exists():
+            models_dir = given / "models" / "RAUNE-Net"
+        else:
+            models_dir = given  # let the import fail with a clear error below
+
         if str(models_dir) not in sys.path:
             sys.path.insert(0, str(models_dir))
 
@@ -59,7 +70,8 @@ class RauneNetInference:
         except ImportError as e:
             raise ImportError(
                 f"Could not import RauneNet from {models_dir}/models/raune_net.py: {e}\n"
-                f"Ensure --raune-models-dir points to the sea_thru_poc directory."
+                f"Pass --raune-models-dir pointing to the RAUNE-Net checkout directory "
+                f"(the one that contains a models/raune_net.py file)."
             ) from e
 
         weights = Path(weights_path) if weights_path else _DEFAULT_WEIGHTS
@@ -69,7 +81,7 @@ class RauneNetInference:
                 "Pass --raune-weights to specify the .pth file."
             )
 
-        self.model = RauneNet().to(self.device)
+        self.model = RauneNet(input_nc=3, output_nc=3, n_blocks=30, n_down=2).to(self.device)
         state = torch.load(str(weights), map_location=self.device, weights_only=False)
         self.model.load_state_dict(state)
         self.model.eval()
