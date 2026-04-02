@@ -5,9 +5,20 @@
 use std::path::PathBuf;
 
 fn find_nvcc() -> Option<PathBuf> {
-    // 1. Check PATH
+    // 1. Check PATH — resolve to full path via `which` so parent-based include lookup works
     if let Ok(output) = std::process::Command::new("nvcc").arg("--version").output() {
         if output.status.success() {
+            if let Ok(which_out) = std::process::Command::new("which").arg("nvcc").output() {
+                if which_out.status.success() {
+                    let resolved = PathBuf::from(
+                        std::str::from_utf8(&which_out.stdout).unwrap_or("").trim()
+                    );
+                    if resolved.exists() {
+                        return Some(resolved);
+                    }
+                }
+            }
+            // Fallback: nvcc is on PATH but `which` unavailable; return relative name
             return Some(PathBuf::from("nvcc"));
         }
     }
@@ -91,6 +102,9 @@ fn main() {
             "-arch=sm_86".to_string(), // RTX 3060 is Ampere sm_86
             "--compiler-options=-fPIC".to_string(),
             "--allow-unsupported-compiler".to_string(), // GCC 14 > officially supported max (13)
+            // Use gcc-12 from Debian bookworm as host compiler (GCC 14 is incompatible with CUDA 12.4)
+            "--compiler-bindir".to_string(),
+            "/usr/bin/gcc-12".to_string(),
         ];
         if let Some(ref inc) = cuda_include {
             args.push("-isystem".to_string());
