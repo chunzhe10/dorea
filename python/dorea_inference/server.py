@@ -105,7 +105,18 @@ def main(argv: Optional[list] = None) -> None:
             req = json.loads(line)
         except json.JSONDecodeError as e:
             resp = ErrorResponse(id=None, message=f"invalid JSON: {e}")
-            print(json.dumps(resp.to_dict()), flush=True)
+            try:
+                print(json.dumps(resp.to_dict()), flush=True)
+            except BrokenPipeError:
+                break
+            continue
+
+        if not isinstance(req, dict):
+            resp = ErrorResponse(id=None, message=f"expected JSON object, got {type(req).__name__}")
+            try:
+                print(json.dumps(resp.to_dict()), flush=True)
+            except BrokenPipeError:
+                break
             continue
 
         req_type = req.get("type", "")
@@ -114,8 +125,6 @@ def main(argv: Optional[list] = None) -> None:
         try:
             if req_type == "ping":
                 resp = PongResponse(version=__version__)
-                print(json.dumps(resp.to_dict()), flush=True)
-
             elif req_type == "raune":
                 if raune_model is None:
                     raise RuntimeError("RAUNE-Net model not loaded (--no-raune or load failed)")
@@ -128,8 +137,6 @@ def main(argv: Optional[list] = None) -> None:
                     width=result.shape[1],
                     height=result.shape[0],
                 )
-                print(json.dumps(resp.to_dict()), flush=True)
-
             elif req_type == "depth":
                 if depth_model is None:
                     raise RuntimeError("Depth Anything model not loaded (--no-depth or load failed)")
@@ -137,22 +144,25 @@ def main(argv: Optional[list] = None) -> None:
                 max_size = int(req.get("max_size", 518))
                 depth = depth_model.infer(img, max_size=max_size)
                 resp = DepthResult.from_array(req_id, depth)
-                print(json.dumps(resp.to_dict()), flush=True)
-
             elif req_type == "shutdown":
                 resp = OkResponse()
-                print(json.dumps(resp.to_dict()), flush=True)
+                try:
+                    print(json.dumps(resp.to_dict()), flush=True)
+                except BrokenPipeError:
+                    pass
                 break
-
             else:
                 resp = ErrorResponse(id=req_id, message=f"unknown request type: {req_type!r}")
-                print(json.dumps(resp.to_dict()), flush=True)
 
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[dorea-inference] ERROR on {req_type}: {e}\n{tb}", file=sys.stderr, flush=True)
             resp = ErrorResponse(id=req_id, message=str(e))
+
+        try:
             print(json.dumps(resp.to_dict()), flush=True)
+        except BrokenPipeError:
+            break
 
     print("[dorea-inference] exiting", file=sys.stderr, flush=True)
 

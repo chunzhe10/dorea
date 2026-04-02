@@ -180,6 +180,14 @@ impl FrameReader {
     }
 }
 
+impl Drop for FrameReader {
+    fn drop(&mut self) {
+        // Kill the child so it doesn't block waiting for a reader that's gone.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Iterator for FrameReader {
     type Item = Result<Frame, FfmpegError>;
 

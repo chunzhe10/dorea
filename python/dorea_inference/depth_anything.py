@@ -13,7 +13,8 @@ from typing import Optional
 import numpy as np
 
 
-_DEFAULT_DEPTH_MODEL = Path(__file__).parents[5] / "models" / "depth_anything_v2_small"
+# __file__ is python/dorea_inference/depth_anything.py → parents[4] = workspace root
+_DEFAULT_DEPTH_MODEL = Path(__file__).parents[4] / "models" / "depth_anything_v2_small"
 
 # ViT-S patch size; input resolution must be multiple of this.
 _PATCH_SIZE = 14
@@ -33,7 +34,7 @@ def _resize_for_depth(
     scale = min(max_size / max(w, h), 1.0)
     tw = _round_to_patch(int(round(w * scale)))
     th = _round_to_patch(int(round(h * scale)))
-    return img.resize((tw, th), _Image.BILINEAR)
+    return img.resize((tw, th), _Image.Resampling.BILINEAR)
 
 
 class DepthAnythingInference:
@@ -82,9 +83,11 @@ class DepthAnythingInference:
         from PIL import Image as _Image
 
         pil = _Image.fromarray(img_rgb)
-        resized = _resize_for_depth(pil, max_size)
+        # Cap to max_size so inference doesn't process enormous frames,
+        # then let the processor handle patch-aligned resizing.
+        capped = _resize_for_depth(pil, max_size)
 
-        inputs = self.processor(images=resized, return_tensors="pt")
+        inputs = self.processor(images=capped, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():

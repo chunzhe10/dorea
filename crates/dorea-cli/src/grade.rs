@@ -63,11 +63,11 @@ pub struct GradeArgs {
     pub python: PathBuf,
 
     /// Force CPU-only mode (no CUDA)
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     pub cpu_only: bool,
 
     /// Enable verbose logging
-    #[arg(short, long, default_value = "false")]
+    #[arg(short, long)]
     pub verbose: bool,
 }
 
@@ -108,8 +108,12 @@ pub fn run(args: GradeArgs) -> Result<()> {
     let mut encoder = FrameEncoder::new(&output, info.width, info.height, info.fps, audio_src)
         .context("failed to spawn ffmpeg encoder")?;
 
-    // Spawn inference server for per-frame depth
-    let inf_cfg = build_inference_config(&args);
+    // Spawn inference server for per-frame depth (depth-only; RAUNE is not needed here).
+    let inf_cfg = InferenceConfig {
+        raune_weights: None,
+        raune_models_dir: None,
+        ..build_inference_config(&args)
+    };
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
         .context("failed to spawn inference server — check --python and --depth-model")?;
 

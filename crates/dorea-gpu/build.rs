@@ -39,11 +39,13 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let kernels_dir = manifest_dir.join("src").join("cuda").join("kernels");
 
-    // Tell cargo to re-run if any .cu file changes
+    // Tell cargo to re-run if any .cu file changes or CUDA env vars change
     println!("cargo:rerun-if-changed=src/cuda/kernels/lut_apply.cu");
     println!("cargo:rerun-if-changed=src/cuda/kernels/hsl_correct.cu");
     println!("cargo:rerun-if-changed=src/cuda/kernels/clarity.cu");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=PATH");
 
     let Some(nvcc) = find_nvcc() else {
         println!("cargo:warning=nvcc not found — building dorea-gpu with CPU-only fallback");
@@ -66,7 +68,7 @@ fn main() {
             .args([
                 "-c",
                 "-O2",
-                "-arch=sm_86", // RTX 3060 is Ampere sm_86
+                "-arch=native", // target the GPU actually present at compile time
                 "--compiler-options=-fPIC",
                 src.to_str().unwrap(),
                 "-o",

@@ -7,7 +7,6 @@ Loads the RAUNE-Net model from the working/sea_thru_poc/models/ directory
 from __future__ import annotations
 
 import sys
-import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -15,9 +14,10 @@ import numpy as np
 
 
 # Default location relative to workspace root.
-_DEFAULT_RAUNE_MODELS_DIR = Path(__file__).parents[5] / "working" / "sea_thru_poc"
+# __file__ is python/dorea_inference/raune_net.py → parents[4] = workspace root
+_DEFAULT_RAUNE_MODELS_DIR = Path(__file__).parents[4] / "working" / "sea_thru_poc"
 _DEFAULT_WEIGHTS = (
-    Path(__file__).parents[5]
+    Path(__file__).parents[4]
     / "working" / "sea_thru_poc" / "models" / "RAUNE-Net"
     / "pretrained" / "RAUNENet" / "test" / "weights_95.pth"
 )
@@ -32,7 +32,7 @@ def _resize_maintain_aspect(
     scale = min(max_size / max(w, h), 1.0)
     tw = int(round(w * scale))
     th = int(round(h * scale))
-    resized = img.resize((tw, th), _Image.BILINEAR)
+    resized = img.resize((tw, th), _Image.Resampling.BILINEAR)
     return resized, tw, th
 
 

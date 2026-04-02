@@ -58,11 +58,11 @@ pub struct PreviewArgs {
     pub python: PathBuf,
 
     /// Force CPU-only mode
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     pub cpu_only: bool,
 
     /// Enable verbose logging
-    #[arg(short, long, default_value = "false")]
+    #[arg(short, long)]
     pub verbose: bool,
 }
 

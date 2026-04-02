@@ -355,8 +355,6 @@ impl Drop for InferenceServer {
 
 /// Encode RGB24 pixels to PNG bytes in memory.
 fn encode_png_bytes(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>, InferenceError> {
-    use std::io::Cursor;
-
     // Minimal uncompressed PNG (for speed; compression is the Python server's concern)
     // Use the `image` crate idiom via raw bytes.
     // Since we don't have image crate here, build a minimal PNG manually.
@@ -399,7 +397,6 @@ fn encode_png_bytes(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>, 
     // IEND
     write_png_chunk(&mut out, b"IEND", &[]);
 
-    let _ = Cursor::new(&out); // prevent optimizer removal
     Ok(out)
 }
 
@@ -518,36 +515,60 @@ fn parse_png_rgb(data: &[u8]) -> Result<Vec<u8>, String> {
     let decompressed = inflate_zlib(&idat)
         .map_err(|e| format!("zlib inflate failed: {e}"))?;
 
-    // Un-filter: each row has a 1-byte filter type
+    // Each row: 1 filter byte + stride pixel bytes
     let stride = width * 3;
+    let expected_decompressed = height * (stride + 1);
+    if decompressed.len() < expected_decompressed {
+        return Err(format!(
+            "decompressed PNG data too short: {} < {expected_decompressed}",
+            decompressed.len()
+        ));
+    }
+
     let mut rgb = vec![0u8; width * height * 3];
 
     for row in 0..height {
         let src_off = row * (stride + 1);
         let filter = decompressed[src_off];
         let src = &decompressed[src_off+1..src_off+1+stride];
+        let dst_start = row * stride;
+
+        // Copy prior row before writing current row (avoids borrow-checker conflict between
+        // reading the prior row and writing the current row within the same `rgb` slice).
+        let prior: Vec<u8> = if row > 0 {
+            rgb[(row - 1) * stride..row * stride].to_vec()
+        } else {
+            vec![0u8; stride]
+        };
 
         match filter {
-            0 => {
-                let dst = &mut rgb[row * stride..(row+1)*stride];
-                dst.copy_from_slice(src);
+            0 => { // None
+                rgb[dst_start..dst_start+stride].copy_from_slice(src);
             }
             1 => { // Sub
-                let dst_start = row * stride;
                 for i in 0..stride {
                     let a = if i >= 3 { rgb[dst_start + i - 3] } else { 0 };
                     rgb[dst_start + i] = src[i].wrapping_add(a);
                 }
             }
-            2 => { // Up — copy prior row first to avoid borrow conflict
-                let prior: Vec<u8> = if row > 0 {
-                    rgb[(row-1)*stride..row*stride].to_vec()
-                } else {
-                    vec![0u8; stride]
-                };
-                let dst_start = row * stride;
+            2 => { // Up
                 for i in 0..stride {
                     rgb[dst_start + i] = src[i].wrapping_add(prior[i]);
+                }
+            }
+            3 => { // Average
+                for i in 0..stride {
+                    let a = if i >= 3 { rgb[dst_start + i - 3] as u16 } else { 0u16 };
+                    let b = prior[i] as u16;
+                    rgb[dst_start + i] = src[i].wrapping_add(((a + b) / 2) as u8);
+                }
+            }
+            4 => { // Paeth
+                for i in 0..stride {
+                    let a = if i >= 3 { rgb[dst_start + i - 3] } else { 0 };
+                    let b = prior[i];
+                    let c = if i >= 3 { prior[i - 3] } else { 0 };
+                    rgb[dst_start + i] = src[i].wrapping_add(paeth_predictor(a, b, c));
                 }
             }
             _ => return Err(format!("unsupported PNG filter type {filter} at row {row}")),
@@ -555,6 +576,20 @@ fn parse_png_rgb(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     Ok(rgb)
+}
+
+/// PNG Paeth predictor function (PNG spec section 9.4).
+fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
+    let a = a as i32;
+    let b = b as i32;
+    let c = c as i32;
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    if pa <= pb && pa <= pc { a as u8 }
+    else if pb <= pc { b as u8 }
+    else { c as u8 }
 }
 
 fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>, String> {
