@@ -83,6 +83,7 @@ pub fn grade_frame(
                     height,
                     params,
                     calibration,
+                    false,  // Task 3 changes this to true when GPU clarity is wired in
                 ));
             }
             Err(e) => {
