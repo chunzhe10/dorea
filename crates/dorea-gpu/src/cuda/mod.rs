@@ -2,14 +2,14 @@
 //!
 //! Only compiled when the `cuda` feature is enabled (detected by build.rs).
 //! Provides `grade_frame_cuda` which runs LUT apply and HSL correct on GPU,
-//! then finishes depth_aware_ambiance + warmth + blend on CPU.
+//! returning f32 intermediate pixels. The caller (`lib.rs`) applies
+//! `cpu::finish_grade` (depth_aware_ambiance, warmth, blend, u8 conversion)
+//! after GPU resources are freed.
 
 #[cfg(feature = "cuda")]
 use crate::{GradeParams, GpuError};
 #[cfg(feature = "cuda")]
 use dorea_cal::Calibration;
-#[cfg(feature = "cuda")]
-use dorea_color::lab::{srgb_to_lab, lab_to_srgb};
 
 #[cfg(feature = "cuda")]
 extern "C" {
@@ -37,11 +37,14 @@ extern "C" {
     ) -> i32;
 }
 
-/// Attempt GPU-accelerated grading.
+/// Attempt GPU-accelerated grading: LUT apply + HSL correct only.
 ///
-/// LUT apply and HSL correct run on GPU via CUDA kernels; depth_aware_ambiance,
-/// warmth, and strength blend run on CPU (LAB math not yet ported to CUDA).
-/// Returns `Err` on any CUDA failure so the caller can fall back to CPU.
+/// Returns the LUT+HSL-processed pixels as f32 [0,1], interleaved RGB.
+/// The caller is responsible for applying `cpu::finish_grade` (depth_aware_ambiance,
+/// warmth, blend, u8 conversion) after this function returns, so GPU resources
+/// are freed before the CPU-heavy ambiance pass begins.
+///
+/// Returns `Err` on any CUDA failure so the caller can fall back to full CPU.
 #[cfg(feature = "cuda")]
 pub fn grade_frame_cuda(
     pixels: &[u8],
@@ -49,8 +52,8 @@ pub fn grade_frame_cuda(
     width: usize,
     height: usize,
     calibration: &Calibration,
-    params: &GradeParams,
-) -> Result<Vec<u8>, GpuError> {
+    _params: &GradeParams,
+) -> Result<Vec<f32>, GpuError> {
     let n = width * height;
 
     // --- u8 → f32 ---
@@ -61,7 +64,6 @@ pub fn grade_frame_cuda(
     let n_zones = depth_luts.n_zones();
     let lut_size = if n_zones > 0 { depth_luts.luts[0].size } else { 33 };
 
-    // Concatenate all zone LUT grids into one contiguous slice
     let luts_flat: Vec<f32> = depth_luts.luts.iter()
         .flat_map(|lg| lg.data.iter().copied())
         .collect();
@@ -84,7 +86,7 @@ pub fn grade_frame_cuda(
         return Err(GpuError::Cuda(format!("dorea_lut_apply_gpu returned CUDA error {status}")));
     }
 
-    // --- Extract HSL arrays (6 qualifiers, ordered Red/Yellow/Green/Cyan/Blue/Magenta) ---
+    // --- Extract HSL arrays (6 qualifiers) ---
     let mut h_offsets = [0.0f32; 6];
     let mut s_ratios  = [1.0f32; 6];
     let mut v_offsets = [0.0f32; 6];
@@ -113,34 +115,6 @@ pub fn grade_frame_cuda(
         return Err(GpuError::Cuda(format!("dorea_hsl_correct_gpu returned CUDA error {status}")));
     }
 
-    // --- CPU: depth_aware_ambiance (LAB conversions, shadow lift, S-curve, etc.) ---
-    crate::cpu::depth_aware_ambiance(&mut rgb_after_hsl, depth, width, height, params.contrast);
-
-    // --- CPU: Warmth (scale LAB a*/b*) ---
-    if (params.warmth - 1.0).abs() > 1e-4 {
-        let warmth_factor = 1.0 + (params.warmth - 1.0) * 0.3;
-        for i in 0..n {
-            let r = rgb_after_hsl[i * 3];
-            let g = rgb_after_hsl[i * 3 + 1];
-            let b = rgb_after_hsl[i * 3 + 2];
-            let (l, a, b_ab) = srgb_to_lab(r, g, b);
-            let (ro, go, bo) = lab_to_srgb(l, a * warmth_factor, b_ab * warmth_factor);
-            rgb_after_hsl[i * 3]     = ro.clamp(0.0, 1.0);
-            rgb_after_hsl[i * 3 + 1] = go.clamp(0.0, 1.0);
-            rgb_after_hsl[i * 3 + 2] = bo.clamp(0.0, 1.0);
-        }
-    }
-
-    // --- CPU: Blend with original ---
-    if params.strength < 1.0 - 1e-4 {
-        for i in 0..rgb_after_hsl.len() {
-            let orig = pixels[i] as f32 / 255.0;
-            rgb_after_hsl[i] = orig * (1.0 - params.strength) + rgb_after_hsl[i] * params.strength;
-        }
-    }
-
-    // --- f32 → u8 ---
-    Ok(rgb_after_hsl.iter()
-        .map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
-        .collect())
+    // GPU work done. Return f32 intermediate — caller applies CPU finish pass.
+    Ok(rgb_after_hsl)
 }

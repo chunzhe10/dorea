@@ -114,6 +114,52 @@ pub fn depth_aware_ambiance(
     apply_clarity(rgb, width, height, radius, clarity_amount);
 }
 
+/// Apply depth_aware_ambiance, warmth, blend, and convert f32 → u8.
+///
+/// Called by both the CPU and CUDA code paths after LUT+HSL processing.
+/// `rgb_f32` is modified in place (ambiance + warmth applied).
+/// `orig_pixels` is the original u8 input used for the strength blend.
+pub(crate) fn finish_grade(
+    rgb_f32: &mut [f32],
+    orig_pixels: &[u8],
+    depth: &[f32],
+    width: usize,
+    height: usize,
+    params: &GradeParams,
+    _cal: &Calibration,  // reserved: available for per-calibration finish adjustments if needed
+) -> Vec<u8> {
+    let n = width * height;
+
+    // 1. Depth-aware ambiance (shadow lift, S-curve, clarity, etc.)
+    depth_aware_ambiance(rgb_f32, depth, width, height, params.contrast);
+
+    // 2. Warmth (scale LAB a*/b*)
+    if (params.warmth - 1.0).abs() > 1e-4 {
+        let warmth_factor = 1.0 + (params.warmth - 1.0) * 0.3;
+        for i in 0..n {
+            let r = rgb_f32[i * 3];
+            let g = rgb_f32[i * 3 + 1];
+            let b = rgb_f32[i * 3 + 2];
+            let (l, a, b_ab) = srgb_to_lab(r, g, b);
+            let (ro, go, bo) = lab_to_srgb(l, a * warmth_factor, b_ab * warmth_factor);
+            rgb_f32[i * 3]     = ro.clamp(0.0, 1.0);
+            rgb_f32[i * 3 + 1] = go.clamp(0.0, 1.0);
+            rgb_f32[i * 3 + 2] = bo.clamp(0.0, 1.0);
+        }
+    }
+
+    // 3. Blend with original using strength
+    if params.strength < 1.0 - 1e-4 {
+        for i in 0..rgb_f32.len() {
+            let orig = orig_pixels[i] as f32 / 255.0;
+            rgb_f32[i] = orig * (1.0 - params.strength) + rgb_f32[i] * params.strength;
+        }
+    }
+
+    // 4. f32 → u8
+    rgb_f32.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect()
+}
+
 /// Apply clarity enhancement: extract low-frequency blur, boost detail.
 fn apply_clarity(rgb: &mut [f32], width: usize, height: usize, radius: usize, clarity: f32) {
     // Work on just the L channel in LAB space for clarity
@@ -206,8 +252,6 @@ pub fn grade_frame_cpu(
     calibration: &Calibration,
     params: &GradeParams,
 ) -> Result<Vec<u8>, String> {
-    let n = width * height;
-
     // Convert u8 → f32
     let mut rgb_f32: Vec<f32> = pixels.iter().map(|&p| p as f32 / 255.0).collect();
 
@@ -220,8 +264,6 @@ pub fn grade_frame_cpu(
         depth,
         &calibration.depth_luts,
     );
-
-    // Write LUT result back into rgb_f32
     for (i, px) in lut_result.iter().enumerate() {
         rgb_f32[i * 3]     = px[0];
         rgb_f32[i * 3 + 1] = px[1];
@@ -240,35 +282,8 @@ pub fn grade_frame_cpu(
         rgb_f32[i * 3 + 2] = px[2];
     }
 
-    // 3. Apply depth_aware_ambiance
-    depth_aware_ambiance(&mut rgb_f32, depth, width, height, params.contrast);
-
-    // 4. Apply warmth (scale LAB a*/b* channels)
-    if (params.warmth - 1.0).abs() > 1e-4 {
-        let warmth_factor = 1.0 + (params.warmth - 1.0) * 0.3;
-        for i in 0..n {
-            let r = rgb_f32[i * 3];
-            let g = rgb_f32[i * 3 + 1];
-            let b = rgb_f32[i * 3 + 2];
-            let (l, a, b_ab) = srgb_to_lab(r, g, b);
-            let (ro, go, bo) = lab_to_srgb(l, a * warmth_factor, b_ab * warmth_factor);
-            rgb_f32[i * 3]     = ro.clamp(0.0, 1.0);
-            rgb_f32[i * 3 + 1] = go.clamp(0.0, 1.0);
-            rgb_f32[i * 3 + 2] = bo.clamp(0.0, 1.0);
-        }
-    }
-
-    // 5. Blend with original using strength
-    if params.strength < 1.0 - 1e-4 {
-        for i in 0..rgb_f32.len() {
-            let orig = pixels[i] as f32 / 255.0;
-            rgb_f32[i] = orig * (1.0 - params.strength) + rgb_f32[i] * params.strength;
-        }
-    }
-
-    // Convert back to u8
-    let out: Vec<u8> = rgb_f32.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
-    Ok(out)
+    // 3–5. Ambiance + warmth + blend + u8 (CPU finish pass)
+    Ok(finish_grade(&mut rgb_f32, pixels, depth, width, height, params, calibration))
 }
 
 #[cfg(test)]
@@ -318,5 +333,39 @@ mod tests {
         for &v in &rgb {
             assert!((0.0..=1.0).contains(&v), "out-of-range: {v}");
         }
+    }
+
+    #[test]
+    fn finish_grade_roundtrip() {
+        use crate::GradeParams;
+        use dorea_cal::Calibration;
+        use dorea_hsl::HslCorrections;
+        use dorea_lut::types::{DepthLuts, LutGrid};
+
+        let width = 2;
+        let height = 2;
+        let n = width * height;
+
+        // Build a minimal identity calibration (1 zone, 2x2x2 identity LUT).
+        let mut lut = LutGrid::new(2);
+        for ri in 0..2usize {
+            for gi in 0..2usize {
+                for bi in 0..2usize {
+                    lut.set(ri, gi, bi, [ri as f32, gi as f32, bi as f32]);
+                }
+            }
+        }
+        let depth_luts = DepthLuts::new(vec![lut], vec![0.0, 1.0]);
+        let hsl_corrections = HslCorrections(vec![]);
+        let cal = Calibration::new(depth_luts, hsl_corrections, 0);
+
+        // Grey pixels, f32
+        let mut rgb_f32: Vec<f32> = vec![0.5; n * 3];
+        let orig_pixels: Vec<u8> = vec![128u8; n * 3];
+        let depth: Vec<f32> = vec![0.5; n];
+        let params = GradeParams::default();
+
+        let out = finish_grade(&mut rgb_f32, &orig_pixels, &depth, width, height, &params, &cal);
+        assert_eq!(out.len(), n * 3);
     }
 }
