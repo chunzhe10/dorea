@@ -31,6 +31,7 @@ from .protocol import (
     ErrorResponse,
     OkResponse,
     decode_png,
+    decode_raw_rgb,
     encode_png,
 )
 
@@ -128,7 +129,11 @@ def main(argv: Optional[list] = None) -> None:
             elif req_type == "raune":
                 if raune_model is None:
                     raise RuntimeError("RAUNE-Net model not loaded (--no-raune or load failed)")
-                img = decode_png(req["image_b64"])
+                fmt = req.get("format", "png")
+                if fmt == "raw_rgb":
+                    img = decode_raw_rgb(req["image_b64"], int(req["width"]), int(req["height"]))
+                else:
+                    img = decode_png(req["image_b64"])
                 max_size = int(req.get("max_size", 1024))
                 result = raune_model.infer(img, max_size=max_size)
                 resp = RauneResult(
@@ -140,7 +145,11 @@ def main(argv: Optional[list] = None) -> None:
             elif req_type == "depth":
                 if depth_model is None:
                     raise RuntimeError("Depth Anything model not loaded (--no-depth or load failed)")
-                img = decode_png(req["image_b64"])
+                fmt = req.get("format", "png")
+                if fmt == "raw_rgb":
+                    img = decode_raw_rgb(req["image_b64"], int(req["width"]), int(req["height"]))
+                else:
+                    img = decode_png(req["image_b64"])
                 max_size = int(req.get("max_size", 518))
                 depth = depth_model.infer(img, max_size=max_size)
                 resp = DepthResult.from_array(req_id, depth)

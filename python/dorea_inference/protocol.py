@@ -153,6 +153,16 @@ def decode_png(b64: str) -> "np.ndarray":
     return np.array(Image.open(io.BytesIO(data)).convert("RGB"))
 
 
+def decode_raw_rgb(b64: str, width: int, height: int) -> "np.ndarray":
+    """Decode base64 raw interleaved RGB uint8 to HxWx3 array."""
+    import numpy as np
+    raw = base64.b64decode(b64)
+    expected = width * height * 3
+    if len(raw) != expected:
+        raise ValueError(f"raw_rgb size mismatch: got {len(raw)}, expected {expected}")
+    return np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+
+
 def decode_depth_f32(b64: str, width: int, height: int) -> "np.ndarray":
     """Decode base64 raw f32 LE array to float32 HxW array."""
     import numpy as np

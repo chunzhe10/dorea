@@ -199,13 +199,15 @@ impl InferenceServer {
         height: usize,
         max_size: usize,
     ) -> Result<(Vec<u8>, usize, usize), InferenceError> {
-        let png = encode_png_bytes(image_rgb, width, height)?;
-        let b64 = B64.encode(&png);
+        let b64 = B64.encode(image_rgb);
 
         let req = serde_json::json!({
             "type": "raune",
             "id": id,
             "image_b64": b64,
+            "format": "raw_rgb",
+            "width": width,
+            "height": height,
             "max_size": max_size
         });
         self.send_line(&req.to_string())?;
@@ -246,13 +248,15 @@ impl InferenceServer {
         height: usize,
         max_size: usize,
     ) -> Result<(Vec<f32>, usize, usize), InferenceError> {
-        let png = encode_png_bytes(image_rgb, width, height)?;
-        let b64 = B64.encode(&png);
+        let b64 = B64.encode(image_rgb);
 
         let req = serde_json::json!({
             "type": "depth",
             "id": id,
             "image_b64": b64,
+            "format": "raw_rgb",
+            "width": width,
+            "height": height,
             "max_size": max_size
         });
         self.send_line(&req.to_string())?;
