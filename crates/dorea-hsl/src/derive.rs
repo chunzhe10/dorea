@@ -32,7 +32,13 @@ pub fn derive_hsl_corrections(
     lut_output: &[[f32; 3]],
     target: &[[f32; 3]],
 ) -> HslCorrections {
-    assert_eq!(lut_output.len(), target.len());
+    assert_eq!(
+        lut_output.len(),
+        target.len(),
+        "lut_output ({}) and target ({}) must have the same length",
+        lut_output.len(),
+        target.len()
+    );
 
     // Convert to HSV
     let lut_hsv: Vec<(f32, f32, f32)> = lut_output
@@ -114,6 +120,7 @@ pub fn derive_hsl_corrections(
 }
 
 /// Angular distance between two hue values (degrees), wrapped to [0, 180].
+#[allow(dead_code)]
 #[inline]
 fn angular_dist(h: f32, center: f32) -> f32 {
     let diff = (h - center).abs();
@@ -124,4 +131,61 @@ fn angular_dist(h: f32, center: f32) -> f32 {
 #[inline]
 fn wrap_hue_diff(diff: f32) -> f32 {
     (diff + 180.0).rem_euclid(360.0) - 180.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dorea_color::hsv::hsv_to_rgb;
+
+    /// I5c: When lut_output == target, all corrections should be zero/identity.
+    #[test]
+    fn test_derive_same_image() {
+        // Build a diverse set of saturated pixels that will activate qualifiers.
+        let mut pixels: Vec<[f32; 3]> = Vec::new();
+        // Generate pixels in different hue ranges with sufficient saturation.
+        for &(h, s, v) in &[
+            (0.0_f32, 0.8, 0.6),    // Red
+            (10.0, 0.9, 0.7),
+            (40.0, 0.85, 0.6),      // Yellow
+            (50.0, 0.9, 0.7),
+            (100.0, 0.8, 0.6),      // Green
+            (115.0, 0.9, 0.7),
+            (170.0, 0.85, 0.65),    // Cyan
+            (180.0, 0.9, 0.6),
+            (210.0, 0.8, 0.7),      // Blue
+            (220.0, 0.9, 0.65),
+            (290.0, 0.85, 0.6),     // Magenta
+            (300.0, 0.9, 0.7),
+        ] {
+            // Repeat each pixel many times to exceed MIN_WEIGHT.
+            for _ in 0..20 {
+                let (r, g, b) = hsv_to_rgb(h, s, v);
+                pixels.push([r, g, b]);
+            }
+        }
+
+        // When lut_output == target, corrections must be identity.
+        let corrs = derive_hsl_corrections(&pixels, &pixels);
+        for (i, c) in corrs.0.iter().enumerate() {
+            if c.weight < crate::qualifiers::MIN_WEIGHT {
+                continue;
+            }
+            assert!(
+                c.h_offset.abs() < 0.5,
+                "qualifier {i}: h_offset should be ~0, got {}",
+                c.h_offset
+            );
+            assert!(
+                (c.s_ratio - 1.0).abs() < 0.01,
+                "qualifier {i}: s_ratio should be ~1.0, got {}",
+                c.s_ratio
+            );
+            assert!(
+                c.v_offset.abs() < 0.01,
+                "qualifier {i}: v_offset should be ~0, got {}",
+                c.v_offset
+            );
+        }
+    }
 }

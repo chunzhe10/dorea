@@ -7,17 +7,19 @@ use dorea_hsl::HslCorrections;
 use dorea_lut::DepthLuts;
 
 /// Current format version.
-pub const FORMAT_VERSION: u8 = 1;
+///
+/// Bumped to 2: `created_at` changed from String to u64 (Unix timestamp, seconds since epoch).
+pub const FORMAT_VERSION: u8 = 2;
 
 /// A saved calibration combining depth-stratified LUTs and HSL corrections.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Calibration {
-    /// Format version; current = 1
+    /// Format version; current = 2
     pub version: u8,
     pub depth_luts: DepthLuts,
     pub hsl_corrections: HslCorrections,
-    /// ISO 8601 timestamp of creation
-    pub created_at: String,
+    /// Unix timestamp (seconds since epoch) of calibration creation.
+    pub created_at_unix_secs: u64,
     pub keyframe_count: usize,
     /// Human-readable description, e.g. "3 keyframes from 2026-04-01 dive"
     pub source_description: String,
@@ -33,7 +35,7 @@ impl Calibration {
             version: FORMAT_VERSION,
             depth_luts,
             hsl_corrections,
-            created_at: chrono_now(),
+            created_at_unix_secs: unix_now(),
             keyframe_count,
             source_description: format!("{keyframe_count} keyframe(s)"),
         }
@@ -52,25 +54,28 @@ impl Calibration {
         let mut file = std::fs::File::open(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
+
+        // L2: check version byte before full deserialization to give a clear error.
+        let version_byte = bytes
+            .first()
+            .copied()
+            .ok_or_else(|| CalError::Serialization("empty file".into()))?;
+        if version_byte != FORMAT_VERSION {
+            return Err(CalError::UnsupportedVersion(version_byte));
+        }
+
         let cal: Calibration =
             bincode::deserialize(&bytes).map_err(|e| CalError::Serialization(e.to_string()))?;
-        if cal.version != FORMAT_VERSION {
-            return Err(CalError::UnsupportedVersion(cal.version));
-        }
         Ok(cal)
     }
 }
 
-/// Simple ISO 8601 timestamp without external crate dependency.
-fn chrono_now() -> String {
-    // Use std::time for a basic UTC timestamp
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Format as seconds-since-epoch; real ISO 8601 needs a time crate but we keep deps minimal
-    format!("{secs}")
+/// Returns the current time as seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Errors that can occur when saving or loading a `.dorea-cal` file.
@@ -80,7 +85,7 @@ pub enum CalError {
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
     Serialization(String),
-    #[error("Format version {0} not supported (expected 1)")]
+    #[error("Format version {0} not supported (expected {FORMAT_VERSION})")]
     UnsupportedVersion(u8),
 }
 

@@ -36,8 +36,18 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    // Parse CLI first so we can inspect the verbose flag before initialising logging.
     let cli = Cli::parse();
+
+    // Determine log level from the verbose flag on the Calibrate subcommand (before init).
+    let verbose = matches!(&cli.command, Command::Calibrate(args) if args.verbose);
+    env_logger::Builder::from_env(env_logger::Env::default())
+        .filter_level(if verbose {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        })
+        .init();
     match cli.command {
         Command::Calibrate(args) => dorea_cli::calibrate::run(args),
         Command::Grade { .. } => {

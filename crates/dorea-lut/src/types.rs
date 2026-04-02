@@ -27,12 +27,14 @@ impl LutGrid {
 
     /// Get the output RGB triple at grid position (ri, gi, bi).
     pub fn get(&self, ri: usize, gi: usize, bi: usize) -> [f32; 3] {
+        debug_assert!(ri < self.size && gi < self.size && bi < self.size);
         let i = self.idx(ri, gi, bi);
         [self.data[i], self.data[i + 1], self.data[i + 2]]
     }
 
     /// Set the output RGB triple at grid position (ri, gi, bi).
     pub fn set(&mut self, ri: usize, gi: usize, bi: usize, val: [f32; 3]) {
+        debug_assert!(ri < self.size && gi < self.size && bi < self.size);
         let i = self.idx(ri, gi, bi);
         self.data[i] = val[0];
         self.data[i + 1] = val[1];
@@ -52,6 +54,14 @@ pub struct DepthLuts {
 
 impl DepthLuts {
     pub fn new(luts: Vec<LutGrid>, zone_boundaries: Vec<f32>) -> Self {
+        // L7: validate that zone_boundaries has exactly luts.len() + 1 entries.
+        assert_eq!(
+            zone_boundaries.len(),
+            luts.len() + 1,
+            "zone_boundaries length ({}) must be luts.len() + 1 ({})",
+            zone_boundaries.len(),
+            luts.len() + 1
+        );
         let n = luts.len();
         let zone_centers = (0..n)
             .map(|i| (zone_boundaries[i] + zone_boundaries[i + 1]) / 2.0)

@@ -3,5 +3,3 @@ name = "dorea-color"
 version.workspace = true
 edition.workspace = true
 
-[dev-dependencies]
-approx = "0.5"

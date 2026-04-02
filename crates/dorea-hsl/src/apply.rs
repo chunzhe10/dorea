@@ -48,3 +48,53 @@ pub fn apply_hsl_corrections(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derive::{HslCorrections, QualifierCorrection};
+    use crate::qualifiers::HSL_QUALIFIERS;
+
+    /// I5d: apply_hsl_corrections with all-zero/identity corrections passes image through unchanged.
+    #[test]
+    fn test_apply_zero_corrections() {
+        let pixels: Vec<[f32; 3]> = vec![
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.5],
+            [0.3, 0.7, 0.2],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+        ];
+
+        // Build identity corrections: h_offset=0, s_ratio=1.0, v_offset=0, weight=0 (inactive).
+        let corrections = HslCorrections(
+            HSL_QUALIFIERS
+                .iter()
+                .map(|q| QualifierCorrection {
+                    h_center: q.h_center,
+                    h_width: q.h_width,
+                    h_offset: 0.0,
+                    s_ratio: 1.0,
+                    v_offset: 0.0,
+                    weight: 0.0, // inactive — weight < MIN_WEIGHT
+                })
+                .collect(),
+        );
+
+        let result = apply_hsl_corrections(&pixels, &corrections);
+
+        assert_eq!(result.len(), pixels.len());
+        for (i, (orig, out)) in pixels.iter().zip(result.iter()).enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (orig[c] - out[c]).abs() < 1e-5,
+                    "pixel {i} channel {c}: expected {:.5} got {:.5}",
+                    orig[c],
+                    out[c]
+                );
+            }
+        }
+    }
+}

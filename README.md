@@ -33,8 +33,7 @@ dorea grade       →  graded video  (Phase 3)
 ### Hardware requirements
 
 - Linux workstation (devcontainer or bare metal)
-- NVIDIA GPU with 6GB VRAM (RTX 3060 or better) — needed for RAUNE-Net inference
-- DaVinci Resolve Studio — for final timeline assembly
+- NVIDIA GPU with 6GB VRAM (RTX 3060 or better) — needed for RAUNE-Net inference (Phase 2)
 
 ### Camera support
 
@@ -48,6 +47,10 @@ dorea grade       →  graded video  (Phase 3)
 cargo build --release
 
 # Calibrate from keyframes
+# NOTE: --targets expects RAUNE-Net output images (Phase 2, not yet implemented).
+# For testing, you can pass the original keyframes directory as a placeholder,
+# which produces an identity-like calibration useful for validating the pipeline.
+# Phase 2 will add `dorea infer` to generate these automatically.
 dorea calibrate \
   --keyframes /path/to/keyframes \
   --depth     /path/to/depth_maps \

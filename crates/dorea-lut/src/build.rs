@@ -170,15 +170,24 @@ fn local_variance_box(data: &[f32], width: usize, height: usize, radius: usize) 
 ///
 /// Returns n_zones+1 boundary values ensuring each zone covers ~equal fraction of pixels.
 pub fn adaptive_zone_boundaries(all_depths: &[f32], n_zones: usize) -> Vec<f32> {
+    // C2: guard against empty input — return uniform linspace.
+    if all_depths.is_empty() {
+        return (0..=n_zones)
+            .map(|i| i as f32 / n_zones as f32)
+            .collect();
+    }
+
     let mut sorted = all_depths.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // I2: use total_cmp to handle NaN values without panic.
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let n = sorted.len();
 
     let mut boundaries = Vec::with_capacity(n_zones + 1);
     boundaries.push(0.0_f32);
     for z in 1..n_zones {
         let idx = (z * n) / n_zones;
-        let idx = idx.min(n - 1);
+        // C2: use saturating_sub to avoid underflow if n == 0 (already guarded above).
+        let idx = idx.min(n.saturating_sub(1));
         boundaries.push(sorted[idx]);
     }
     boundaries.push(1.0_f32);
@@ -189,6 +198,25 @@ pub fn adaptive_zone_boundaries(all_depths: &[f32], n_zones: usize) -> Vec<f32> 
 ///
 /// Returns `DepthLuts` with `N_DEPTH_ZONES` zones, σ=0 (no Gaussian smoothing), NN fill.
 pub fn build_depth_luts(keyframes: &[KeyframeData]) -> DepthLuts {
+    // I7: validate that all keyframe slices have consistent lengths.
+    for (i, kd) in keyframes.iter().enumerate() {
+        assert_eq!(
+            kd.original.len(),
+            kd.target.len(),
+            "keyframe {i}: original and target length mismatch"
+        );
+        assert_eq!(
+            kd.original.len(),
+            kd.depth.len(),
+            "keyframe {i}: original and depth length mismatch"
+        );
+        assert_eq!(
+            kd.original.len(),
+            kd.importance.len(),
+            "keyframe {i}: original and importance length mismatch"
+        );
+    }
+
     // Collect all depth values for adaptive boundaries
     let all_depths: Vec<f32> = keyframes.iter().flat_map(|kd| kd.depth.iter().cloned()).collect();
     let zone_boundaries = adaptive_zone_boundaries(&all_depths, N_DEPTH_ZONES);
@@ -258,6 +286,7 @@ pub fn build_depth_luts(keyframes: &[KeyframeData]) -> DepthLuts {
         }
 
         // NN fill: brute-force L2 in index space
+        // TODO: parallelize with rayon (O(E×P) brute force, acceptable for LUT_SIZE=33 but slow for sparse footage)
         if !populated.is_empty() && !empty.is_empty() {
             for &ec in &empty {
                 let mut best_dist = u64::MAX;

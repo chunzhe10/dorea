@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dorea_cal::Calibration;
+use dorea_color::dlog_m::dlog_m_to_linear;
 use dorea_hsl::derive::{derive_hsl_corrections, HslCorrections, QualifierCorrection};
 use dorea_hsl::qualifiers::HSL_QUALIFIERS;
 use dorea_lut::apply::apply_depth_luts;
@@ -36,13 +37,34 @@ pub struct CalibrateArgs {
     /// Verbose logging
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Encoding of the input keyframe images.
+    ///
+    /// Use `srgb` (default) for standard sRGB PNGs.
+    /// Use `dlog_m` if keyframes are D-Log M encoded (DJI Action 4).
+    /// Note: `--targets` images should always be in sRGB color space regardless of
+    /// keyframe encoding.
+    #[arg(long, default_value = "srgb", value_parser = parse_input_encoding)]
+    pub input_encoding: InputEncoding,
+}
+
+/// Supported input encodings for keyframe images.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputEncoding {
+    Srgb,
+    DlogM,
+}
+
+fn parse_input_encoding(s: &str) -> std::result::Result<InputEncoding, String> {
+    match s {
+        "srgb" => Ok(InputEncoding::Srgb),
+        "dlog_m" => Ok(InputEncoding::DlogM),
+        other => Err(format!("unknown input encoding '{other}'; expected 'srgb' or 'dlog_m'")),
+    }
 }
 
 pub fn run(args: CalibrateArgs) -> Result<()> {
-    if args.verbose {
-        std::env::set_var("RUST_LOG", "debug");
-    }
-
+    // Logging is already initialised by main() based on the verbose flag.
     log::info!("dorea calibrate — scanning keyframes in {:?}", args.keyframes);
 
     // 1. Scan keyframe directory for PNGs
@@ -62,7 +84,6 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
 
     // 2. Load each keyframe + matching depth + target
     let mut keyframe_data_vec: Vec<KeyframeData> = Vec::new();
-    let mut pixel_counts: Vec<usize> = Vec::new();
 
     for kf_path in &keyframe_paths {
         let stem = kf_path.file_stem().context("keyframe has no stem")?;
@@ -72,8 +93,18 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
 
         log::info!("Processing keyframe: {}", kf_path.display());
 
-        let (kf_pixels, kf_w, kf_h) = load_rgb_image(kf_path)
+        let (mut kf_pixels, kf_w, kf_h) = load_rgb_image(kf_path)
             .with_context(|| format!("Failed to load keyframe: {}", kf_path.display()))?;
+
+        // Apply D-Log M → linear decode if requested (I3).
+        if args.input_encoding == InputEncoding::DlogM {
+            log::debug!("Applying D-Log M decode to keyframe {kf_path:?}");
+            for px in kf_pixels.iter_mut() {
+                px[0] = dlog_m_to_linear(px[0]);
+                px[1] = dlog_m_to_linear(px[1]);
+                px[2] = dlog_m_to_linear(px[2]);
+            }
+        }
 
         let (mut depth_pixels, depth_w, depth_h) = load_depth_map(&depth_path)
             .with_context(|| format!("Failed to load depth map: {}", depth_path.display()))?;
@@ -96,7 +127,6 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         // Compute importance
         let importance = compute_importance(&depth_pixels, kf_w, kf_h);
 
-        pixel_counts.push(kf_w * kf_h);
         keyframe_data_vec.push(KeyframeData {
             original: kf_pixels,
             target: tgt_pixels,
@@ -123,13 +153,14 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     let mut active_count = vec![0_usize; n_quals];
     let mut total_weight_acc = vec![0.0_f64; n_quals];
 
-    for (kd, &px_count) in keyframe_data_vec.iter().zip(pixel_counts.iter()) {
+    for kd in keyframe_data_vec.iter() {
         let lut_output = apply_depth_luts(&kd.original, &kd.depth, &depth_luts);
         let corrs = derive_hsl_corrections(&lut_output, &kd.target);
 
         for (qi, corr) in corrs.0.iter().enumerate() {
             if corr.weight >= dorea_hsl::MIN_WEIGHT {
-                let w = px_count as f64;
+                // Use the qualifier's own pixel coverage weight (I4), not total frame pixels.
+                let w = corr.weight as f64;
                 h_offset_acc[qi] += corr.h_offset as f64 * w;
                 s_ratio_acc[qi] += corr.s_ratio as f64 * w;
                 v_offset_acc[qi] += corr.v_offset as f64 * w;
@@ -226,8 +257,24 @@ fn load_depth_map(path: &Path) -> Result<(Vec<f32>, usize, usize)> {
     let img = ImageReader::open(path)
         .with_context(|| format!("Cannot open {}", path.display()))?
         .decode()
-        .with_context(|| format!("Cannot decode {}", path.display()))?
-        .into_luma16();
+        .with_context(|| format!("Cannot decode {}", path.display()))?;
+
+    // Warn if source is not a grayscale format (L6).
+    if !matches!(
+        img.color(),
+        image::ColorType::L8
+            | image::ColorType::L16
+            | image::ColorType::La8
+            | image::ColorType::La16
+    ) {
+        log::warn!(
+            "Depth map {:?} is not grayscale (got {:?}); converting via luminance",
+            path,
+            img.color()
+        );
+    }
+
+    let img = img.into_luma16();
 
     let (w, h) = (img.width() as usize, img.height() as usize);
     let pixels: Vec<f32> = img.pixels().map(|p| p[0] as f32 / 65535.0).collect();
