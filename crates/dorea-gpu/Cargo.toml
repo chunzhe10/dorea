@@ -9,6 +9,7 @@ dorea-lut = { workspace = true }
 dorea-hsl = { workspace = true }
 dorea-cal = { workspace = true }
 log.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 
 [features]
