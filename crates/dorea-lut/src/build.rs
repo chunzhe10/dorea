@@ -3,6 +3,7 @@
 //! Ported from `run_fixed_hsl_lut_poc.py::build_fixed_depth_luts`.
 
 use crate::types::{DepthLuts, LutGrid};
+use rayon::prelude::*;
 
 pub const LUT_SIZE: usize = 33;
 pub const N_DEPTH_ZONES: usize = 5;
@@ -30,33 +31,33 @@ pub struct KeyframeData {
 pub fn compute_importance(depth: &[f32], width: usize, height: usize) -> Vec<f32> {
     let n = width * height;
     assert_eq!(depth.len(), n);
+    assert_eq!(n, width * height, "n ({n}) must equal width ({width}) × height ({height})");
 
-    // --- Sobel edge detection ---
+    // --- Sobel edge detection (row-parallel) ---
     let mut edge_mag = vec![0.0_f32; n];
-    for y in 0..height {
-        for x in 0..width {
-            // 3×3 Sobel kernels
-            // dx: [[-1,0,1],[-2,0,2],[-1,0,1]]
-            // dy: [[-1,-2,-1],[0,0,0],[1,2,1]]
-            let mut dx = 0.0_f32;
-            let mut dy = 0.0_f32;
-            for ky in -1_i32..=1 {
-                for kx in -1_i32..=1 {
-                    let ny = (y as i32 + ky).clamp(0, height as i32 - 1) as usize;
-                    let nx = (x as i32 + kx).clamp(0, width as i32 - 1) as usize;
-                    let v = depth[ny * width + nx];
-                    let kx_w = kx as f32;
-                    let ky_w = ky as f32;
-                    // Sobel X: weight = kx * (2 - |ky|)
-                    let wx = kx_w * (2.0 - ky_w.abs());
-                    let wy = ky_w * (2.0 - kx_w.abs());
-                    dx += v * wx;
-                    dy += v * wy;
+    edge_mag
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, out) in row.iter_mut().enumerate() {
+                let mut dx = 0.0_f32;
+                let mut dy = 0.0_f32;
+                for ky in -1_i32..=1 {
+                    for kx in -1_i32..=1 {
+                        let ny = (y as i32 + ky).clamp(0, height as i32 - 1) as usize;
+                        let nx = (x as i32 + kx).clamp(0, width as i32 - 1) as usize;
+                        let v = depth[ny * width + nx];
+                        let kx_w = kx as f32;
+                        let ky_w = ky as f32;
+                        let wx = kx_w * (2.0 - ky_w.abs());
+                        let wy = ky_w * (2.0 - kx_w.abs());
+                        dx += v * wx;
+                        dy += v * wy;
+                    }
                 }
+                *out = (dx * dx + dy * dy).sqrt();
             }
-            edge_mag[y * width + x] = (dx * dx + dy * dy).sqrt();
-        }
-    }
+        });
 
     // --- Gaussian blur σ=8 on edge magnitude (separated 1D) ---
     let sigma = 8.0_f32;
@@ -75,30 +76,40 @@ pub fn compute_importance(depth: &[f32], width: usize, height: usize) -> Vec<f32
         *k /= kernel_sum;
     }
 
-    // Horizontal pass
+    // Horizontal pass (row-parallel)
     let mut temp = vec![0.0_f32; n];
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = 0.0_f32;
-            for (ki, &kv) in kernel.iter().enumerate() {
-                let nx = (x as i32 + ki as i32 - radius as i32).clamp(0, width as i32 - 1) as usize;
-                acc += edge_mag[y * width + nx] * kv;
+    temp.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, out) in row.iter_mut().enumerate() {
+                let mut acc = 0.0_f32;
+                for (ki, &kv) in kernel.iter().enumerate() {
+                    let nx = (x as i32 + ki as i32 - radius as i32)
+                        .clamp(0, width as i32 - 1) as usize;
+                    acc += edge_mag[y * width + nx] * kv;
+                }
+                *out = acc;
             }
-            temp[y * width + x] = acc;
-        }
-    }
-    // Vertical pass
+        });
+    // Vertical pass (row-parallel).
+    // IMPORTANT: Must stay sequential with the H-pass above — `temp` is fully written
+    // by H-pass `for_each` (which blocks) before this begins. Do NOT run H+V concurrently
+    // (e.g. via rayon::join) — that would race on `temp`.
     let mut edge_dilated = vec![0.0_f32; n];
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = 0.0_f32;
-            for (ki, &kv) in kernel.iter().enumerate() {
-                let ny = (y as i32 + ki as i32 - radius as i32).clamp(0, height as i32 - 1) as usize;
-                acc += temp[ny * width + x] * kv;
+    edge_dilated
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let mut acc = 0.0_f32;
+                for (ki, &kv) in kernel.iter().enumerate() {
+                    let ny = (y as i32 + ki as i32 - radius as i32)
+                        .clamp(0, height as i32 - 1) as usize;
+                    acc += temp[ny * width + x] * kv;
+                }
+                row[x] = acc;
             }
-            edge_dilated[y * width + x] = acc;
-        }
-    }
+        });
 
     let edge_max = edge_dilated.iter().cloned().fold(0.0_f32, f32::max).max(1e-6);
     let edge_norm: Vec<f32> = edge_dilated.iter().map(|&v| v / edge_max).collect();
@@ -164,6 +175,28 @@ fn local_variance_box(data: &[f32], width: usize, height: usize, radius: usize) 
         }
     }
     var_out
+}
+
+/// Index coordinates of a single LUT cell (r, g, b) in the [0, LUT_SIZE) grid.
+type CellIdx = [usize; 3];
+
+/// Find the nearest populated LUT cell to `empty_cell` by brute-force L2 in index space.
+///
+/// `populated` must be non-empty. Returns (empty_cell, best_populated_cell).
+fn find_nearest(empty_cell: &CellIdx, populated: &[CellIdx]) -> (CellIdx, CellIdx) {
+    let mut best_dist = u64::MAX;
+    let mut best_pop = populated[0];
+    for &pc in populated {
+        let dr = (empty_cell[0] as i64 - pc[0] as i64).pow(2) as u64;
+        let dg = (empty_cell[1] as i64 - pc[1] as i64).pow(2) as u64;
+        let db = (empty_cell[2] as i64 - pc[2] as i64).pow(2) as u64;
+        let dist = dr + dg + db;
+        if dist < best_dist {
+            best_dist = dist;
+            best_pop = pc;
+        }
+    }
+    (*empty_cell, best_pop)
 }
 
 /// Build adaptive zone boundaries from depth distribution.
@@ -285,22 +318,15 @@ pub fn build_depth_luts(keyframes: &[KeyframeData]) -> DepthLuts {
             }
         }
 
-        // NN fill: brute-force L2 in index space
-        // TODO: parallelize with rayon (O(E×P) brute force, acceptable for LUT_SIZE=33 but slow for sparse footage)
+        // NN fill: brute-force L2 in index space (parallel per empty cell)
         if !populated.is_empty() && !empty.is_empty() {
-            for &ec in &empty {
-                let mut best_dist = u64::MAX;
-                let mut best_pop = populated[0];
-                for &pc in &populated {
-                    let dr = (ec[0] as i64 - pc[0] as i64).pow(2) as u64;
-                    let dg = (ec[1] as i64 - pc[1] as i64).pow(2) as u64;
-                    let db = (ec[2] as i64 - pc[2] as i64).pow(2) as u64;
-                    let dist = dr + dg + db;
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_pop = pc;
-                    }
-                }
+            // Each empty cell search is fully independent — populated is read-only.
+            let filled: Vec<([usize; 3], [usize; 3])> = empty
+                .par_iter()
+                .map(|ec| find_nearest(ec, &populated))
+                .collect();
+            // Sequential write-back (each empty cell is distinct, no conflicts).
+            for (ec, best_pop) in filled {
                 let val = lut.get(best_pop[0], best_pop[1], best_pop[2]);
                 lut.set(ec[0], ec[1], ec[2], val);
             }

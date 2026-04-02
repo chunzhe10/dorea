@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 dorea-color = { workspace = true }
 serde = { workspace = true }
+rayon = { workspace = true }
 

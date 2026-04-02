@@ -3,6 +3,7 @@
 //! Ported from `run_fixed_hsl_lut_poc.py::apply_depth_luts`.
 
 use crate::types::{DepthLuts, LutGrid};
+use rayon::prelude::*;
 
 /// Trilinear interpolation through a single LutGrid for one pixel.
 fn trilinear(lut: &LutGrid, rgb: [f32; 3]) -> [f32; 3] {
@@ -78,33 +79,38 @@ pub fn apply_depth_luts(
 
     let mut result = vec![[0.0_f32; 3]; pixels.len()];
 
-    for (idx, (&px, &d)) in pixels.iter().zip(depth.iter()).enumerate() {
-        let mut acc = [0.0_f32; 3];
-        let mut total_w = 0.0_f32;
+    // `luts` is a shared `&DepthLuts` across threads. DepthLuts contains only
+    // Vec<LutGrid> + Vec<f32>, which are Sync — safe to share across rayon threads.
+    result
+        .par_iter_mut()
+        .zip(pixels.par_iter())
+        .zip(depth.par_iter())
+        .for_each(|((out, &px), &d)| {
+            let mut acc = [0.0_f32; 3];
+            let mut total_w = 0.0_f32;
 
-        for z in 0..n_zones {
-            // I1: use actual adaptive zone width from boundaries, not a fixed 1/n_zones.
-            let zone_width = luts.zone_boundaries[z + 1] - luts.zone_boundaries[z];
-            let dist = (d - luts.zone_centers[z]).abs();
-            let w = (1.0 - dist / zone_width.max(1e-6)).max(0.0);
-            if w < 1e-7 {
-                continue;
+            for z in 0..n_zones {
+                let zone_width = luts.zone_boundaries[z + 1] - luts.zone_boundaries[z];
+                let dist = (d - luts.zone_centers[z]).abs();
+                let w = (1.0 - dist / zone_width.max(1e-6)).max(0.0);
+                if w < 1e-7 {
+                    continue;
+                }
+                let lut_out = trilinear(&luts.luts[z], px);
+                for (c, lo) in lut_out.iter().enumerate() {
+                    acc[c] += lo * w;
+                }
+                total_w += w;
             }
-            let lut_out = trilinear(&luts.luts[z], px);
-            for (c, lo) in lut_out.iter().enumerate() {
-                acc[c] += lo * w;
-            }
-            total_w += w;
-        }
 
-        if total_w > 1e-6 {
-            for (c, val) in acc.iter().enumerate() {
-                result[idx][c] = (val / total_w).clamp(0.0, 1.0);
+            if total_w > 1e-6 {
+                for c in 0..3 {
+                    out[c] = (acc[c] / total_w).clamp(0.0, 1.0);
+                }
+            } else {
+                *out = px;
             }
-        } else {
-            result[idx] = px;
-        }
-    }
+        });
 
     result
 }
