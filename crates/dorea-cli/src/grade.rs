@@ -207,17 +207,24 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
         .context("failed to spawn inference server for auto-calibration")?;
 
+    // Calibration runs at proxy resolution so pixels, RAUNE target, and depth all match.
+    // Max 1024px on the long edge, maintaining aspect ratio.
+    let cal_max = 1024usize;
+    let cal_scale = (cal_max as f64 / info.width.max(info.height) as f64).min(1.0);
+    let kf_w = ((info.width as f64 * cal_scale) as usize).max(1);
+    let kf_h = ((info.height as f64 * cal_scale) as usize).max(1);
+
     let mut inputs: Vec<CalibrationInput> = Vec::new();
 
     for i in 0..n_kf {
         let ts = (i as f64 + 0.5) * duration / n_kf as f64;
-        let pixels = ffmpeg::extract_frame_at(&args.input, ts, info.width, info.height)
+        let pixels = ffmpeg::extract_frame_at(&args.input, ts, kf_w, kf_h)
             .with_context(|| format!("failed to extract keyframe at {ts:.2}s"))?;
 
         let id = format!("kf{i:03}");
 
-        // Run RAUNE-Net for target
-        let target = match inf_server.run_raune(&id, &pixels, info.width, info.height, 1024) {
+        // Run RAUNE-Net for target (at proxy resolution — output matches input size)
+        let target = match inf_server.run_raune(&id, &pixels, kf_w, kf_h, kf_w) {
             Ok((t, _, _)) => t,
             Err(e) => {
                 log::warn!("RAUNE-Net failed for {id}: {e} — using original as target");
@@ -225,19 +232,18 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
             }
         };
 
-        // Run Depth Anything for depth map
-        let (depth_proxy, dw, dh) = match inf_server.run_depth(&id, &pixels, info.width, info.height, 518) {
+        // Run Depth Anything for depth map, upscale to proxy resolution
+        let (depth_proxy, dw, dh) = match inf_server.run_depth(&id, &pixels, kf_w, kf_h, 518) {
             Ok(d) => d,
             Err(e) => {
                 log::warn!("Depth failed for {id}: {e} — using uniform depth 0.5");
-                let n = info.width * info.height;
-                (vec![0.5f32; n], info.width, info.height)
+                (vec![0.5f32; kf_w * kf_h], kf_w, kf_h)
             }
         };
 
-        let depth = InferenceServer::upscale_depth(&depth_proxy, dw, dh, info.width, info.height);
+        let depth = InferenceServer::upscale_depth(&depth_proxy, dw, dh, kf_w, kf_h);
 
-        inputs.push(CalibrationInput { pixels, target, depth, width: info.width, height: info.height });
+        inputs.push(CalibrationInput { pixels, target, depth, width: kf_w, height: kf_h });
     }
 
     let _ = inf_server.shutdown();
