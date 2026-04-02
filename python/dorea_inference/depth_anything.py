@@ -46,14 +46,19 @@ class DepthAnythingInference:
         device: str = "cpu",
     ) -> None:
         import torch
-        from transformers import AutoModelForDepthEstimation, AutoImageProcessor
+        from transformers import AutoModelForDepthEstimation
+
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA requested but torch.cuda.is_available() is False. "
+                "Cannot run depth inference on CPU — GPU is required for dorea grade."
+            )
 
         self.device = torch.device(
             device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
         )
 
         path = Path(model_path) if model_path else _DEFAULT_DEPTH_MODEL
-        # If the directory is empty or doesn't have model files, use HF hub ID.
         model_id_or_path = str(path)
         has_local = path.is_dir() and any(
             (path / f).exists() for f in ("config.json", "pytorch_model.bin", "model.safetensors")
@@ -66,13 +71,15 @@ class DepthAnythingInference:
                 "Pass --depth-model to suppress this.",
                 file=sys.stderr,
             )
-            # Fall back to HuggingFace hub (requires internet access)
             model_id_or_path = "depth-anything/Depth-Anything-V2-Small-hf"
 
-        self.processor = AutoImageProcessor.from_pretrained(model_id_or_path)
         self.model = AutoModelForDepthEstimation.from_pretrained(model_id_or_path)
         self.model = self.model.to(self.device)
         self.model.eval()
+
+    # ImageNet normalization constants (Depth Anything V2 uses these)
+    _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    _STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     def infer(self, img_rgb: np.ndarray, max_size: int = 518) -> np.ndarray:
         """Run depth estimation on uint8 HxWx3 RGB image.
@@ -83,20 +90,18 @@ class DepthAnythingInference:
         from PIL import Image as _Image
 
         pil = _Image.fromarray(img_rgb)
-        # Cap to max_size so inference doesn't process enormous frames,
-        # then let the processor handle patch-aligned resizing.
         capped = _resize_for_depth(pil, max_size)
 
-        inputs = self.processor(images=capped, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Direct tensor construction — bypass AutoImageProcessor
+        arr = np.array(capped).astype(np.float32) / 255.0
+        arr = (arr - self._MEAN) / self._STD
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            outputs = self.model(**inputs)
+            outputs = self.model(pixel_values=tensor)
 
-        # predicted_depth: (1, H, W)
         depth = outputs.predicted_depth.squeeze(0).cpu().numpy()
 
-        # Normalize to [0, 1]
         d_min, d_max = float(depth.min()), float(depth.max())
         if d_max - d_min < 1e-6:
             depth = np.zeros_like(depth, dtype=np.float32)

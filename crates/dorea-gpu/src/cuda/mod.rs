@@ -162,9 +162,9 @@ pub fn grade_frame_cuda(
         )
     };
     if status != 0 {
-        log::warn!("dorea_clarity_gpu returned CUDA error {status} — clarity skipped");
-        // Fall back gracefully: return hsl result without clarity
-        return Ok(rgb_after_hsl);
+        return Err(GpuError::Cuda(format!(
+            "dorea_clarity_gpu returned CUDA error {status}"
+        )));
     }
 
     Ok(rgb_after_clarity)

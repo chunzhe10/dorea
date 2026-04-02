@@ -87,11 +87,15 @@ pub fn grade_frame(
                 ));
             }
             Err(e) => {
-                log::warn!("CUDA grading failed ({e}), falling back to CPU");
+                return Err(e);
             }
         }
     }
 
-    cpu::grade_frame_cpu(pixels, depth, width, height, calibration, params)
-        .map_err(|e| GpuError::InvalidInput(e.to_string()))
+    #[cfg(not(feature = "cuda"))]
+    {
+        Err(GpuError::Cuda(
+            "dorea grade requires CUDA. Rebuild with GPU support (build.rs auto-detects nvcc).".to_string()
+        ))
+    }
 }
