@@ -222,8 +222,8 @@ fn three_pass_box_blur(input: &[f32], width: usize, height: usize, radius: usize
     let mut buf_a = input.to_vec();
     let mut buf_b = vec![0.0_f32; input.len()];
     for _ in 0..3 {
-        box_blur_rows(&buf_a, &mut buf_b, width, height, radius);
-        box_blur_cols(&buf_b, &mut buf_a, width, height, radius);
+        box_blur_rows_sliding(&buf_a, &mut buf_b, width, height, radius);
+        box_blur_cols_via_transpose(&buf_b, &mut buf_a, width, height, radius);
     }
     buf_a
 }
@@ -240,6 +240,64 @@ fn box_blur_rows(src: &[f32], dst: &mut [f32], width: usize, height: usize, radi
                 s += src[base + k];
             }
             dst[base + col] = s / (hi - lo + 1) as f32;
+        }
+    }
+}
+
+/// Sliding-window box blur over rows. O(W) per row — replaces the naive O(W×radius) version.
+fn box_blur_rows_sliding(src: &[f32], dst: &mut [f32], width: usize, height: usize, radius: usize) {
+    let r = radius as isize;
+    for row in 0..height {
+        let base = row * width;
+        let mut sum = 0.0f32;
+        let mut count = 0usize;
+
+        // Seed window for col=0: indices [0..min(r, W-1)]
+        let init_hi = r.min(width as isize - 1) as usize;
+        for k in 0..=init_hi {
+            sum += src[base + k];
+            count += 1;
+        }
+
+        for col in 0..width {
+            dst[base + col] = sum / count as f32;
+
+            // Expand right edge for next column
+            let add = col as isize + r + 1;
+            if add < width as isize {
+                sum += src[base + add as usize];
+                count += 1;
+            }
+            // Shrink left edge for next column
+            let rem = col as isize - r;
+            if rem >= 0 {
+                sum -= src[base + rem as usize];
+                count -= 1;
+            }
+        }
+    }
+}
+
+/// Column box blur using transpose → row blur → transpose back.
+/// Avoids the strided-memory cache thrash of direct column access.
+fn box_blur_cols_via_transpose(
+    src: &[f32],
+    dst: &mut [f32],
+    width: usize,
+    height: usize,
+    radius: usize,
+) {
+    let mut transposed = vec![0.0f32; width * height];
+    for row in 0..height {
+        for col in 0..width {
+            transposed[col * height + row] = src[row * width + col];
+        }
+    }
+    let mut blurred_t = vec![0.0f32; width * height];
+    box_blur_rows_sliding(&transposed, &mut blurred_t, height, width, radius);
+    for row in 0..height {
+        for col in 0..width {
+            dst[row * width + col] = blurred_t[col * height + row];
         }
     }
 }
@@ -348,6 +406,58 @@ mod tests {
         // Values should remain in [0, 1]
         for &v in &rgb {
             assert!((0.0..=1.0).contains(&v), "out-of-range: {v}");
+        }
+    }
+
+    #[test]
+    fn box_blur_rows_sliding_matches_naive_small() {
+        let src: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0,
+            5.0, 4.0, 3.0, 2.0, 1.0,
+        ];
+        let mut dst_sliding = vec![0.0f32; 10];
+        let mut dst_naive   = vec![0.0f32; 10];
+        box_blur_rows_sliding(&src, &mut dst_sliding, 5, 2, 1);
+        box_blur_rows(&src, &mut dst_naive, 5, 2, 1);
+        for (a, b) in dst_sliding.iter().zip(dst_naive.iter()) {
+            assert!((a - b).abs() < 1e-5, "mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn box_blur_rows_sliding_radius_zero() {
+        let src: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut dst = vec![0.0f32; 3];
+        box_blur_rows_sliding(&src, &mut dst, 3, 1, 0);
+        assert_eq!(dst, src, "radius=0 should be identity");
+    }
+
+    #[test]
+    fn box_blur_rows_sliding_radius_exceeds_width() {
+        let src: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let expected_mean = 2.0f32;
+        let mut dst = vec![0.0f32; 3];
+        box_blur_rows_sliding(&src, &mut dst, 3, 1, 100);
+        for v in &dst {
+            assert!((v - expected_mean).abs() < 1e-5, "expected {expected_mean}, got {v}");
+        }
+    }
+
+    #[test]
+    fn box_blur_cols_via_transpose_matches_naive_small() {
+        let src: Vec<f32> = vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+            6.0, 5.0, 4.0,
+            3.0, 2.0, 1.0,
+        ];
+        let mut dst_transpose = vec![0.0f32; 15];
+        let mut dst_naive     = vec![0.0f32; 15];
+        box_blur_cols_via_transpose(&src, &mut dst_transpose, 3, 5, 1);
+        box_blur_cols(&src, &mut dst_naive, 3, 5, 1);
+        for (i, (a, b)) in dst_transpose.iter().zip(dst_naive.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-5, "pixel {i}: {a} vs {b}");
         }
     }
 

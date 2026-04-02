@@ -10,4 +10,5 @@
 
 pub mod ffmpeg;
 pub mod inference;
+pub mod resize;
 pub mod scene;

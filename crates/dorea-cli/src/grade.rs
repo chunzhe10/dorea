@@ -138,13 +138,29 @@ pub fn run(args: GradeArgs) -> Result<()> {
             // TODO(Phase 3+): trigger re-calibration on scene cut
         }
 
+        // Downscale to proxy resolution before sending to inference.
+        // Avoids serializing 24 MB/frame over the pipe when Python resizes to 518 px anyway.
+        let (proxy_w, proxy_h) =
+            dorea_video::resize::proxy_dims(frame.width, frame.height, args.proxy_size);
+        let proxy_pixels = if proxy_w != frame.width || proxy_h != frame.height {
+            dorea_video::resize::resize_rgb_bilinear(
+                &frame.pixels,
+                frame.width,
+                frame.height,
+                proxy_w,
+                proxy_h,
+            )
+        } else {
+            frame.pixels.clone()
+        };
+
         // Run depth inference at proxy resolution
         let (depth_proxy, dw, dh) = inf_server
             .run_depth(
                 &frame.index.to_string(),
-                &frame.pixels,
-                frame.width,
-                frame.height,
+                &proxy_pixels,
+                proxy_w,
+                proxy_h,
                 args.proxy_size,
             )
             .unwrap_or_else(|e| {
