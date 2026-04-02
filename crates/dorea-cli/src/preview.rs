@@ -97,6 +97,7 @@ pub fn run(args: PreviewArgs) -> Result<()> {
         python_exe: args.python.clone(),
         raune_weights: args.raune_weights.clone(),
         raune_models_dir: args.raune_models_dir.clone(),
+        skip_raune: false,
         depth_model: args.depth_model.clone(),
         device: if args.cpu_only { Some("cpu".to_string()) } else { None },
         startup_timeout: Duration::from_secs(180),

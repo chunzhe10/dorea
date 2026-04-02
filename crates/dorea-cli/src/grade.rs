@@ -95,6 +95,11 @@ pub fn run(args: GradeArgs) -> Result<()> {
         contrast: args.contrast,
     };
 
+    // Open encoder first — validate output path before doing expensive calibration.
+    let audio_src = if info.has_audio { Some(args.input.as_path()) } else { None };
+    let mut encoder = FrameEncoder::new(&output, info.width, info.height, info.fps, audio_src)
+        .context("failed to spawn ffmpeg encoder")?;
+
     // Load or derive calibration
     let calibration = if let Some(cal_path) = &args.calibration {
         log::info!("Loading calibration from {}", cal_path.display());
@@ -104,15 +109,9 @@ pub fn run(args: GradeArgs) -> Result<()> {
         auto_calibrate(&args, &info)?
     };
 
-    // Open encoder
-    let audio_src = if info.has_audio { Some(args.input.as_path()) } else { None };
-    let mut encoder = FrameEncoder::new(&output, info.width, info.height, info.fps, audio_src)
-        .context("failed to spawn ffmpeg encoder")?;
-
     // Spawn inference server for per-frame depth (depth-only; RAUNE is not needed here).
     let inf_cfg = InferenceConfig {
-        raune_weights: None,
-        raune_models_dir: None,
+        skip_raune: true,
         ..build_inference_config(&args)
     };
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
@@ -273,6 +272,7 @@ fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
         python_exe: args.python.clone(),
         raune_weights: args.raune_weights.clone(),
         raune_models_dir: args.raune_models_dir.clone(),
+        skip_raune: false,
         depth_model: args.depth_model.clone(),
         device: if args.cpu_only { Some("cpu".to_string()) } else { None },
         startup_timeout: Duration::from_secs(180),

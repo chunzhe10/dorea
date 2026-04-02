@@ -2,7 +2,7 @@
 
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::OnceLock;
 use thiserror::Error;
 
@@ -281,6 +281,7 @@ pub fn extract_frame_at(
 pub struct FrameEncoder {
     child: Child,
     stdin: ChildStdin,
+    stderr: Option<ChildStderr>,
     frame_bytes: usize,
 }
 
@@ -296,6 +297,16 @@ impl FrameEncoder {
         fps: f64,
         input_for_audio: Option<&Path>,
     ) -> Result<Self, FfmpegError> {
+        // Validate output directory exists before doing any expensive work.
+        if let Some(parent) = output.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                return Err(FfmpegError::EncodeFailed(format!(
+                    "output directory does not exist: {}",
+                    parent.display()
+                )));
+            }
+        }
+
         let w_s = width.to_string();
         let h_s = height.to_string();
         let fps_s = format!("{fps:.3}");
@@ -338,16 +349,32 @@ impl FrameEncoder {
         cmd.arg(out_s);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped()); // capture stderr so we can report ffmpeg errors
 
         let mut child = cmd.spawn().map_err(FfmpegError::NotFound)?;
         let stdin = child.stdin.take().ok_or_else(|| {
             FfmpegError::EncodeFailed("could not open encoder stdin".to_string())
         })?;
+        let stderr = child.stderr.take();
+
+        // Check immediately if ffmpeg exited (e.g. bad codec args, permissions, etc.)
+        if let Ok(Some(status)) = child.try_wait() {
+            let stderr_msg = stderr.map(|mut s| {
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            }).unwrap_or_default();
+            return Err(FfmpegError::EncodeFailed(format!(
+                "ffmpeg encoder exited immediately (code {:?}): {}",
+                status.code(),
+                stderr_msg.trim()
+            )));
+        }
 
         Ok(Self {
             child,
             stdin,
+            stderr,
             frame_bytes: width * height * 3,
         })
     }
@@ -361,17 +388,54 @@ impl FrameEncoder {
                 pixels.len()
             )));
         }
-        self.stdin.write_all(pixels).map_err(FfmpegError::NotFound)
+        if let Err(e) = self.stdin.write_all(pixels) {
+            // Broken pipe means ffmpeg exited — check its stderr for a real error message.
+            let stderr_msg = self.stderr.as_mut().map(|s| {
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            }).unwrap_or_default();
+            let exit_code = self.child.try_wait().ok().flatten()
+                .and_then(|s| s.code())
+                .map(|c| format!(" (exit code {c})"))
+                .unwrap_or_default();
+            let detail = if stderr_msg.trim().is_empty() {
+                format!("{e}{exit_code}")
+            } else {
+                format!("{}{exit_code}: {}", e, stderr_msg.trim())
+            };
+            return Err(FfmpegError::EncodeFailed(format!("ffmpeg encoder died: {detail}")));
+        }
+        Ok(())
     }
 
     /// Finalize encoding. Must be called after all frames are written.
     pub fn finish(mut self) -> Result<(), FfmpegError> {
         drop(self.stdin); // close stdin → signal EOF to ffmpeg
-        let status = self.child.wait().map_err(FfmpegError::NotFound)?;
+
+        // Drain stderr in a background thread to prevent pipe-buffer deadlock:
+        // if ffmpeg writes enough progress output to fill the 64KB pipe buffer
+        // it will block, and wait() below would deadlock.
+        let stderr_thread = self.stderr.take().map(|mut s| {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            })
+        });
+
+        let status = self.child.wait()
+            .map_err(|e| FfmpegError::EncodeFailed(format!("failed to wait for encoder: {e}")))?;
+
+        let stderr_msg = stderr_thread
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default();
+
         if !status.success() {
             return Err(FfmpegError::EncodeFailed(format!(
-                "ffmpeg encoder exited with code {:?}",
-                status.code()
+                "ffmpeg encoder exited with code {:?}: {}",
+                status.code(),
+                stderr_msg.trim()
             )));
         }
         Ok(())

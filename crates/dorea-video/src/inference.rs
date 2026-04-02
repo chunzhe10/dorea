@@ -30,11 +30,16 @@ pub enum InferenceError {
 pub struct InferenceConfig {
     /// Python executable path (e.g. `/opt/dorea-venv/bin/python`).
     pub python_exe: PathBuf,
-    /// Path to the RAUNE-Net weights .pth file. None = skip RAUNE.
+    /// Path to the RAUNE-Net weights .pth file.
+    /// `None` = let Python use its built-in default path.
+    /// Set `skip_raune = true` to disable RAUNE entirely.
     pub raune_weights: Option<PathBuf>,
     /// Path to the sea_thru_poc directory (contains models/raune_net.py).
     pub raune_models_dir: Option<PathBuf>,
-    /// Path to Depth Anything V2 model directory. None = skip depth.
+    /// Skip RAUNE-Net entirely (pass `--no-raune` to the server).
+    /// Use this for inference phases that only need depth (e.g. per-frame grading).
+    pub skip_raune: bool,
+    /// Path to Depth Anything V2 model directory. None = use Python default / HF.
     pub depth_model: Option<PathBuf>,
     /// Compute device: "cpu" or "cuda". None = auto-detect.
     pub device: Option<String>,
@@ -48,6 +53,7 @@ impl Default for InferenceConfig {
             python_exe: PathBuf::from("/opt/dorea-venv/bin/python"),
             raune_weights: None,
             raune_models_dir: None,
+            skip_raune: false,
             depth_model: None,
             device: None,
             startup_timeout: Duration::from_secs(120),
@@ -71,11 +77,12 @@ impl InferenceServer {
         let mut cmd = Command::new(&config.python_exe);
         cmd.args(["-m", "dorea_inference.server"]);
 
-        if let Some(p) = &config.raune_weights {
-            cmd.args(["--raune-weights", p.to_str().unwrap_or("")]);
-        } else {
+        if config.skip_raune {
             cmd.arg("--no-raune");
+        } else if let Some(p) = &config.raune_weights {
+            cmd.args(["--raune-weights", p.to_str().unwrap_or("")]);
         }
+        // raune_weights = None + skip_raune = false → no args → Python uses its default path
 
         if let Some(p) = &config.raune_models_dir {
             cmd.args(["--raune-models-dir", p.to_str().unwrap_or("")]);
