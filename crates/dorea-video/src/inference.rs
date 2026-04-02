@@ -83,9 +83,9 @@ impl InferenceServer {
 
         if let Some(p) = &config.depth_model {
             cmd.args(["--depth-model", p.to_str().unwrap_or("")]);
-        } else {
-            cmd.arg("--no-depth");
         }
+        // depth_model = None means "use the Python-side default path / HF fallback"
+        // do NOT pass --no-depth unless explicitly requested
 
         if let Some(d) = &config.device {
             cmd.args(["--device", d]);

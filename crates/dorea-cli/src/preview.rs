@@ -45,7 +45,8 @@ pub struct PreviewArgs {
     #[arg(long)]
     pub raune_weights: Option<PathBuf>,
 
-    /// Path to RAUNE-Net models dir (sea_thru_poc directory)
+    /// Path to RAUNE-Net checkout directory (contains models/raune_net.py).
+    /// Also accepts the parent sea_thru_poc dir — auto-descends to RAUNE-Net/.
     #[arg(long)]
     pub raune_models_dir: Option<PathBuf>,
 
