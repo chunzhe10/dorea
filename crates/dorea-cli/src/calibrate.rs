@@ -311,74 +311,37 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         let _ = srv.shutdown();
     }
 
-    // 3. Build depth-stratified LUTs
-    log::info!("Building depth-stratified LUTs...");
-    let depth_luts = build_depth_luts(&keyframe_data_vec);
-    log::info!("LUTs built ({} zones)", depth_luts.n_zones());
+    // 3+4. Build LUTs + HSL corrections via shared helper, then set source description
+    log::info!("Building depth-stratified LUTs and HSL corrections...");
+    let cal_inputs: Vec<CalibrationInput> = keyframe_data_vec.iter()
+        .map(|kd| CalibrationInput {
+            pixels: kd.original.iter()
+                .flat_map(|p| {
+                    [
+                        (p[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (p[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (p[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ]
+                })
+                .collect(),
+            target: kd.target.iter()
+                .flat_map(|p| {
+                    [
+                        (p[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (p[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (p[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ]
+                })
+                .collect(),
+            depth: kd.depth.clone(),
+            width: kd.width,
+            height: kd.height,
+        })
+        .collect();
+    let mut cal = run_calibration_from_frames(&cal_inputs)?;
+    log::info!("LUTs built ({} zones), HSL corrections derived", cal.depth_luts.n_zones());
 
-    // 4. Derive HSL corrections per keyframe, then aggregate
-    log::info!("Deriving HSL corrections...");
-
-    let n_quals = HSL_QUALIFIERS.len();
-    let mut h_offset_acc = vec![0.0_f64; n_quals];
-    let mut s_ratio_acc = vec![0.0_f64; n_quals];
-    let mut v_offset_acc = vec![0.0_f64; n_quals];
-    let mut active_count = vec![0_usize; n_quals];
-    let mut total_weight_acc = vec![0.0_f64; n_quals];
-
-    for kd in keyframe_data_vec.iter() {
-        let lut_output = apply_depth_luts(&kd.original, &kd.depth, &depth_luts);
-        let corrs = derive_hsl_corrections(&lut_output, &kd.target);
-
-        for (qi, corr) in corrs.0.iter().enumerate() {
-            if corr.weight >= dorea_hsl::MIN_WEIGHT {
-                let w = corr.weight as f64;
-                h_offset_acc[qi] += corr.h_offset as f64 * w;
-                s_ratio_acc[qi] += corr.s_ratio as f64 * w;
-                v_offset_acc[qi] += corr.v_offset as f64 * w;
-                active_count[qi] += 1;
-                total_weight_acc[qi] += w;
-            }
-        }
-    }
-
-    let mut avg_corrections: Vec<QualifierCorrection> = Vec::with_capacity(n_quals);
-    for qi in 0..n_quals {
-        let qual = &HSL_QUALIFIERS[qi];
-        if active_count[qi] > 0 {
-            let tw = total_weight_acc[qi];
-            avg_corrections.push(QualifierCorrection {
-                h_center: qual.h_center,
-                h_width: qual.h_width,
-                h_offset: (h_offset_acc[qi] / tw) as f32,
-                s_ratio: (s_ratio_acc[qi] / tw) as f32,
-                v_offset: (v_offset_acc[qi] / tw) as f32,
-                weight: tw as f32,
-            });
-        } else {
-            avg_corrections.push(QualifierCorrection {
-                h_center: qual.h_center,
-                h_width: qual.h_width,
-                h_offset: 0.0,
-                s_ratio: 1.0,
-                v_offset: 0.0,
-                weight: 0.0,
-            });
-        }
-    }
-
-    log::info!("HSL corrections derived:");
-    for c in &avg_corrections {
-        log::info!(
-            "  {:>12}: h_offset={:+.2}° s_ratio={:.3} v_offset={:+.4} weight={:.0}",
-            c.h_center, c.h_offset, c.s_ratio, c.v_offset, c.weight,
-        );
-    }
-
-    let hsl_corrections = HslCorrections(avg_corrections);
-
-    // 5. Build and save calibration
-    let mut cal = Calibration::new(depth_luts, hsl_corrections, keyframe_data_vec.len());
+    // 5. Set source description and save
     cal.source_description = format!(
         "{} keyframe(s) from {}",
         keyframe_data_vec.len(),

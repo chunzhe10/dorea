@@ -387,7 +387,6 @@ version = "0.1.0"
 name = "dorea-gpu"
 version = "0.1.0"
 dependencies = [
- "cc",
  "dorea-cal",
  "dorea-color",
  "dorea-hsl",
@@ -419,6 +418,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "flate2",
  "log",
  "serde",
  "serde_json",

@@ -70,7 +70,7 @@ class RauneNetInference:
             )
 
         self.model = RauneNet().to(self.device)
-        state = torch.load(str(weights), map_location=self.device)
+        state = torch.load(str(weights), map_location=self.device, weights_only=False)
         self.model.load_state_dict(state)
         self.model.eval()
 

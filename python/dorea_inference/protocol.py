@@ -9,7 +9,6 @@ Protocol: JSON lines over stdin/stdout.
 from __future__ import annotations
 
 import base64
-import struct
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -104,8 +103,8 @@ class DepthResult:
     def from_array(id: str, depth: "np.ndarray") -> "DepthResult":
         """Encode a 2-D float32 depth array as DepthResult."""
         import numpy as np
-        arr = depth.astype(np.float32)
-        raw = struct.pack(f"{arr.size}f", *arr.flatten().tolist())
+        arr = np.ascontiguousarray(depth, dtype="<f4")
+        raw = arr.tobytes()
         return DepthResult(
             id=id,
             depth_f32_b64=base64.b64encode(raw).decode("ascii"),

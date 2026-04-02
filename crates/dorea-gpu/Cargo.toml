@@ -11,11 +11,8 @@ dorea-cal = { workspace = true }
 log.workspace = true
 thiserror.workspace = true
 
-[build-dependencies]
-# cc is only used when nvcc is found
-cc = { version = "1", optional = true }
-
 [features]
-# Enabled automatically by build.rs when nvcc is found in PATH or CUDA_HOME/bin/nvcc.
-# Do NOT set manually — build.rs drives this.
-cuda = ["cc"]
+# Declared so Cargo recognises `#[cfg(feature = "cuda")]` as a valid condition.
+# Activation is driven by build.rs (nvcc detection), NOT by Cargo feature flags.
+# Do NOT pass --features cuda manually; build.rs handles it.
+cuda = []

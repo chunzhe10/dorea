@@ -5,6 +5,7 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -63,6 +64,9 @@ pub struct InferenceServer {
 
 impl InferenceServer {
     /// Spawn the inference server and wait for it to signal readiness.
+    ///
+    /// Enforces `config.startup_timeout`: returns `InferenceError::Timeout` if the
+    /// Python process does not respond to the initial ping within the deadline.
     pub fn spawn(config: &InferenceConfig) -> Result<Self, InferenceError> {
         let mut cmd = Command::new(&config.python_exe);
         cmd.args(["-m", "dorea_inference.server"]);
@@ -87,32 +91,80 @@ impl InferenceServer {
             cmd.args(["--device", d]);
         }
 
-        // The Python server searches for dorea_inference in its own package tree.
-        // Ensure the python/ directory is in PYTHONPATH.
-        if let Some(python_dir) = config.python_exe.parent().and_then(|p| p.parent()) {
-            let inference_dir = python_dir.parent().map(|r| r.join("python"))
-                .unwrap_or_else(|| PathBuf::from("python"));
-            cmd.env("PYTHONPATH", inference_dir.to_str().unwrap_or("python"));
+        // Set PYTHONPATH to the python/ dir adjacent to the target/ build directory.
+        // Binary lives at <workspace>/target/{debug,release}/dorea; python/ is a sibling of target/.
+        let pythonpath = std::env::current_exe().ok()
+            .and_then(|exe| {
+                // .parent() = target/debug|release, .parent() = target, .parent() = workspace root
+                exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+                    .map(|root| root.join("python"))
+            })
+            .filter(|p| p.exists());
+        if let Some(ref p) = pythonpath {
+            cmd.env("PYTHONPATH", p);
+        } else {
+            log::debug!(
+                "PYTHONPATH not set: could not derive python/ dir from binary path; \
+                 ensure dorea_inference is installed in the Python environment"
+            );
         }
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()); // let stderr pass through for debugging
+            .stderr(Stdio::inherit()); // let stderr pass through for diagnostics
 
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
             InferenceError::Ipc("could not open inference server stdin".to_string())
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
             InferenceError::Ipc("could not open inference server stdout".to_string())
         })?;
-        let stdout_reader = BufReader::new(stdout);
 
-        let mut server = Self { child, stdin, stdout_reader };
+        // Send ping immediately so the server starts loading models ASAP.
+        stdin.write_all(b"{\"type\":\"ping\"}\n")
+            .and_then(|_| stdin.flush())
+            .map_err(|e| InferenceError::Ipc(format!("write ping: {e}")))?;
 
-        // Send a ping and wait for pong to confirm readiness
-        server.ping()?;
-        Ok(server)
+        // Read pong in a background thread so we can enforce the startup timeout.
+        // BufReader<ChildStdout> is Send, so this is safe.
+        let timeout = config.startup_timeout;
+        let (tx, rx) = mpsc::channel::<io::Result<(String, BufReader<std::process::ChildStdout>)>>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let result = reader.read_line(&mut line).map(|_| (line, reader));
+            let _ = tx.send(result);
+        });
+
+        let (pong_line, stdout_reader) = match rx.recv_timeout(timeout) {
+            Ok(Ok((line, reader))) => (line, reader),
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                return Err(InferenceError::Ipc(format!("read from server: {e}")));
+            }
+            Err(_) => {
+                log::warn!("Inference server startup timed out after {timeout:?}");
+                let _ = child.kill();
+                return Err(InferenceError::Timeout);
+            }
+        };
+
+        let trimmed = pong_line.trim_end_matches('\n').trim_end_matches('\r');
+        if trimmed.is_empty() {
+            let _ = child.kill();
+            return Err(InferenceError::Ipc(
+                "server sent empty response during startup (may have crashed)".to_string(),
+            ));
+        }
+        let v: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|e| InferenceError::Ipc(format!("ping response parse error: {e}")))?;
+        if v["type"].as_str() != Some("pong") {
+            let _ = child.kill();
+            return Err(InferenceError::Ipc(format!("expected pong, got: {trimmed}")));
+        }
+
+        Ok(Self { child, stdin, stdout_reader })
     }
 
     /// Send a ping and verify the server responds.
@@ -434,6 +486,9 @@ fn parse_png_rgb(data: &[u8]) -> Result<Vec<u8>, String> {
     while pos + 12 <= data.len() {
         let length = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
         let chunk_type = &data[pos+4..pos+8];
+        if pos + 8 + length > data.len() {
+            return Err(format!("truncated PNG chunk at offset {pos}"));
+        }
         let chunk_data = &data[pos+8..pos+8+length];
         pos += 12 + length;
 
@@ -503,49 +558,12 @@ fn parse_png_rgb(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>, String> {
-    if data.len() < 6 {
-        return Err("truncated zlib stream".to_string());
-    }
-    // Skip 2-byte zlib header, skip 4-byte adler32 trailer
-    let deflate_data = &data[2..data.len()-4];
-    inflate_deflate(deflate_data)
-}
-
-fn inflate_deflate(data: &[u8]) -> Result<Vec<u8>, String> {
-    // Only handles DEFLATE store mode (type 00) blocks — matches our encoder.
-    // For real PNG inputs from Python (which use actual compression), this will fail.
-    // TODO: replace with a real inflate implementation or add `flate2` dependency.
-    //
-    // For now: attempt to decode store-mode blocks; return error for compressed data.
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
     let mut out = Vec::new();
-    let mut pos = 0usize;
-    loop {
-        if pos >= data.len() { break; }
-        let bfinal_btype = data[pos];
-        pos += 1;
-        let bfinal = bfinal_btype & 1;
-        let btype  = (bfinal_btype >> 1) & 3;
-
-        match btype {
-            0 => {
-                // Store mode: skip to byte boundary (already aligned after bfinal_btype)
-                if pos + 4 > data.len() { return Err("truncated store block".to_string()); }
-                let len  = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
-                pos += 4; // skip len + nlen
-                if pos + len > data.len() { return Err("store block overflows input".to_string()); }
-                out.extend_from_slice(&data[pos..pos+len]);
-                pos += len;
-            }
-            _ => {
-                // Compressed block — need a real inflate implementation
-                return Err(format!(
-                    "DEFLATE btype={btype} (compressed) not supported by minimal inflate; \
-                     add flate2 dependency to dorea-video for production use"
-                ));
-            }
-        }
-        if bfinal != 0 { break; }
-    }
+    ZlibDecoder::new(data)
+        .read_to_end(&mut out)
+        .map_err(|e| e.to_string())?;
     Ok(out)
 }
 

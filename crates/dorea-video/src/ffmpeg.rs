@@ -3,6 +3,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::OnceLock;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -138,6 +139,8 @@ fn spawn_decoder(input: &Path, info: &VideoInfo) -> Result<Child, FfmpegError> {
 
     if let Ok(child) = hw_result {
         return Ok(child);
+    } else if let Err(ref e) = hw_result {
+        log::debug!("nvdec spawn failed ({e}), falling back to software decode");
     }
 
     // Software fallback
@@ -207,12 +210,21 @@ impl Iterator for FrameReader {
     }
 }
 
-/// Read exactly `buf.len()` bytes; returns 0 on clean EOF, error on partial EOF.
+/// Read exactly `buf.len()` bytes.
+///
+/// Returns `Ok(0)` only on a clean EOF before any bytes are read (end of stream).
+/// Returns `Err(UnexpectedEof)` if the stream ends mid-frame (partial frame).
 fn read_exact(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut pos = 0;
     while pos < buf.len() {
         match reader.read(&mut buf[pos..]) {
-            Ok(0) => return Ok(0), // EOF
+            Ok(0) if pos == 0 => return Ok(0), // clean EOF before frame starts
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("partial frame: got {pos}/{} bytes", buf.len()),
+                ));
+            }
             Ok(n) => pos += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
@@ -303,12 +315,15 @@ impl FrameEncoder {
         let nvenc_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18"];
         let sw_args = ["-c:v", "libx264", "-crf", "18", "-preset", "fast"];
 
-        // Probe whether nvenc is available
-        let nvenc_available = Command::new("ffmpeg")
-            .args(["-hide_banner", "-encoders"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_nvenc"))
-            .unwrap_or(false);
+        // Probe whether nvenc is available (cached across FrameEncoder instances).
+        static NVENC_AVAILABLE: OnceLock<bool> = OnceLock::new();
+        let nvenc_available = *NVENC_AVAILABLE.get_or_init(|| {
+            Command::new("ffmpeg")
+                .args(["-hide_banner", "-encoders"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_nvenc"))
+                .unwrap_or(false)
+        });
 
         let codec_args: &[&str] = if nvenc_available { &nvenc_args } else { &sw_args };
         cmd.args(codec_args);
@@ -331,7 +346,13 @@ impl FrameEncoder {
 
     /// Write one RGB24 frame to the encoder.
     pub fn write_frame(&mut self, pixels: &[u8]) -> Result<(), FfmpegError> {
-        assert_eq!(pixels.len(), self.frame_bytes, "wrong frame size");
+        if pixels.len() != self.frame_bytes {
+            return Err(FfmpegError::EncodeFailed(format!(
+                "frame size mismatch: expected {} bytes, got {}",
+                self.frame_bytes,
+                pixels.len()
+            )));
+        }
         self.stdin.write_all(pixels).map_err(FfmpegError::NotFound)
     }
 

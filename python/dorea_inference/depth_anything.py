@@ -58,6 +58,13 @@ class DepthAnythingInference:
             (path / f).exists() for f in ("config.json", "pytorch_model.bin", "model.safetensors")
         )
         if not has_local:
+            import sys
+            print(
+                f"[dorea_inference] WARNING: local depth model not found at {path}; "
+                "falling back to HuggingFace hub download (requires internet access). "
+                "Pass --depth-model to suppress this.",
+                file=sys.stderr,
+            )
             # Fall back to HuggingFace hub (requires internet access)
             model_id_or_path = "depth-anything/Depth-Anything-V2-Small-hf"
 

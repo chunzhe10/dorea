@@ -20,7 +20,7 @@ pub struct GradeParams {
     pub warmth: f32,
     /// Blend strength between original and graded \[0.0–1.0\].
     pub strength: f32,
-    /// Ambiance contrast multiplier \[0.0–1.0\].
+    /// Ambiance contrast multiplier. Typical range \[0.0–2.0\]; 1.0 = neutral default.
     pub contrast: f32,
 }
 

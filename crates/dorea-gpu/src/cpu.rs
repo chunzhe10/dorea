@@ -12,7 +12,8 @@ use crate::GradeParams;
 ///
 /// `rgb`: interleaved f32 RGB \[0,1\], length = width * height * 3.
 /// `depth`: f32 depth \[0,1\], length = width * height.
-/// `contrast_scale`: multiplier for contrast/clarity effects (1.0 = default).
+/// `contrast_scale`: multiplier for contrast/clarity effects. Typical range \[0.0–2.0\];
+/// 1.0 is the neutral default. Values > 1.0 boost contrast and clarity beyond the default.
 ///
 /// # Panics
 /// Panics if slice lengths are inconsistent with width/height.
@@ -23,6 +24,9 @@ pub fn depth_aware_ambiance(
     height: usize,
     contrast_scale: f32,
 ) {
+    if width == 0 || height == 0 {
+        return;
+    }
     assert_eq!(rgb.len(), width * height * 3, "rgb length mismatch");
     assert_eq!(depth.len(), width * height, "depth length mismatch");
 
@@ -179,9 +183,9 @@ fn box_blur_rows(src: &[f32], dst: &mut [f32], width: usize, height: usize, radi
 }
 
 fn box_blur_cols(src: &[f32], dst: &mut [f32], width: usize, height: usize, radius: usize) {
+    let r = radius.min(height - 1) as isize;
     for col in 0..width {
         for row in 0..height {
-            let r = radius.min(height - 1) as isize;
             let lo = (row as isize - r).max(0) as usize;
             let hi = (row as isize + r).min(height as isize - 1) as usize;
             let mut s = 0.0_f32;

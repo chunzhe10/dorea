@@ -199,11 +199,6 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
 
     // Extract keyframes
     let inf_cfg = build_inference_config(args);
-    // Enable RAUNE for calibration
-    if args.raune_weights.is_some() || inf_cfg.raune_weights.is_some() {
-        // Already set in build_inference_config
-    }
-
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
         .context("failed to spawn inference server for auto-calibration")?;
 
