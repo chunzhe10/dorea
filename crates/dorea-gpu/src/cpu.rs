@@ -107,8 +107,18 @@ pub fn depth_aware_ambiance(
         rgb[i * 3 + 2] = apply_knee(bo).clamp(0.0, 1.0);
     }
 
-    // Clarity: separable box-blur approximation of Gaussian (σ=30px at proxy).
-    // We run a 3-pass box blur (approximates Gaussian well).
+}
+
+/// Run the clarity pass (box-blur detail extraction) at full resolution on CPU.
+/// Called by `finish_grade` when `skip_clarity` is false (CPU-only path).
+pub(crate) fn apply_cpu_clarity(
+    rgb: &mut [f32],
+    depth: &[f32],
+    width: usize,
+    height: usize,
+    contrast_scale: f32,
+) {
+    let mean_d: f32 = depth.iter().sum::<f32>() / depth.len() as f32;
     let radius = (30.0_f32 * 3.0).ceil() as usize;
     let clarity_amount = (0.2 + 0.25 * mean_d) * contrast_scale;
     apply_clarity(rgb, width, height, radius, clarity_amount);
@@ -127,11 +137,17 @@ pub(crate) fn finish_grade(
     height: usize,
     params: &GradeParams,
     _cal: &Calibration,  // reserved: available for per-calibration finish adjustments if needed
+    skip_clarity: bool,
 ) -> Vec<u8> {
     let n = width * height;
 
-    // 1. Depth-aware ambiance (shadow lift, S-curve, clarity, etc.)
+    // 1. Depth-aware ambiance (shadow lift, S-curve, etc.)
     depth_aware_ambiance(rgb_f32, depth, width, height, params.contrast);
+
+    // 1b. Clarity — skip when the CUDA path already ran the GPU clarity kernel.
+    if !skip_clarity {
+        apply_cpu_clarity(rgb_f32, depth, width, height, params.contrast);
+    }
 
     // 2. Warmth (scale LAB a*/b*)
     if (params.warmth - 1.0).abs() > 1e-4 {
@@ -282,8 +298,8 @@ pub fn grade_frame_cpu(
         rgb_f32[i * 3 + 2] = px[2];
     }
 
-    // 3–5. Ambiance + warmth + blend + u8 (CPU finish pass)
-    Ok(finish_grade(&mut rgb_f32, pixels, depth, width, height, params, calibration))
+    // 3–5. Ambiance + clarity + warmth + blend + u8 (CPU finish pass)
+    Ok(finish_grade(&mut rgb_f32, pixels, depth, width, height, params, calibration, false))
 }
 
 #[cfg(test)]
@@ -336,6 +352,41 @@ mod tests {
     }
 
     #[test]
+    fn finish_grade_skip_clarity_runs_without_panic() {
+        use crate::GradeParams;
+        use dorea_cal::Calibration;
+        use dorea_hsl::HslCorrections;
+        use dorea_lut::types::{DepthLuts, LutGrid};
+
+        let width = 4; let height = 4; let n = width * height;
+        let mut lut = LutGrid::new(2);
+        for ri in 0..2usize { for gi in 0..2usize { for bi in 0..2usize {
+            lut.set(ri, gi, bi, [ri as f32, gi as f32, bi as f32]);
+        }}}
+        let cal = Calibration::new(
+            DepthLuts::new(vec![lut], vec![0.0, 1.0]),
+            HslCorrections(vec![]),
+            0,
+        );
+
+        let mut rgb_f32: Vec<f32> = vec![0.5; n * 3];
+        let orig: Vec<u8>  = vec![128u8; n * 3];
+        let depth: Vec<f32> = vec![0.5; n];
+
+        // skip_clarity = true: must not panic, output must be in [0,1]
+        let out = finish_grade(&mut rgb_f32, &orig, &depth, width, height,
+                               &GradeParams::default(), &cal, true);
+        assert_eq!(out.len(), n * 3);
+        for &v in &out { assert!(v <= 255, "out of range: {v}"); }
+
+        // skip_clarity = false: same shape, must not panic
+        let mut rgb_f32b: Vec<f32> = vec![0.5; n * 3];
+        let out2 = finish_grade(&mut rgb_f32b, &orig, &depth, width, height,
+                                &GradeParams::default(), &cal, false);
+        assert_eq!(out2.len(), n * 3);
+    }
+
+    #[test]
     fn finish_grade_roundtrip() {
         use crate::GradeParams;
         use dorea_cal::Calibration;
@@ -365,7 +416,7 @@ mod tests {
         let depth: Vec<f32> = vec![0.5; n];
         let params = GradeParams::default();
 
-        let out = finish_grade(&mut rgb_f32, &orig_pixels, &depth, width, height, &params, &cal);
+        let out = finish_grade(&mut rgb_f32, &orig_pixels, &depth, width, height, &params, &cal, false);
         assert_eq!(out.len(), n * 3);
     }
 }

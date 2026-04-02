@@ -1,9 +1,9 @@
 //! CUDA-backed grading pipeline.
 //!
 //! Only compiled when the `cuda` feature is enabled (detected by build.rs).
-//! Provides `grade_frame_cuda` which runs LUT apply and HSL correct on GPU,
+//! Provides `grade_frame_cuda` which runs LUT apply, HSL correct, and clarity on GPU,
 //! returning f32 intermediate pixels. The caller (`lib.rs`) applies
-//! `cpu::finish_grade` (depth_aware_ambiance, warmth, blend, u8 conversion)
+//! `cpu::finish_grade` (depth_aware_ambiance WITHOUT clarity, warmth, blend, u8)
 //! after GPU resources are freed.
 
 #[cfg(feature = "cuda")]
@@ -35,14 +35,39 @@ extern "C" {
         h_weights: *const f32,
         n_pixels: i32,
     ) -> i32;
+
+    /// GPU launcher: clarity at proxy resolution. Returns cudaError_t (0 = success).
+    fn dorea_clarity_gpu(
+        h_rgb_in: *const f32,
+        h_rgb_out: *mut f32,
+        full_w: i32,
+        full_h: i32,
+        proxy_w: i32,
+        proxy_h: i32,
+        blur_radius: i32,
+        clarity_amount: f32,
+    ) -> i32;
 }
 
-/// Attempt GPU-accelerated grading: LUT apply + HSL correct only.
+/// Compute proxy dimensions: scale so the long edge ≤ max_size.
+/// Inline here to avoid a dep on dorea-video just for this helper.
+#[cfg(feature = "cuda")]
+fn proxy_dims(src_w: usize, src_h: usize, max_size: usize) -> (usize, usize) {
+    let long_edge = src_w.max(src_h);
+    if long_edge <= max_size {
+        return (src_w, src_h);
+    }
+    let scale = max_size as f64 / long_edge as f64;
+    let pw = ((src_w as f64 * scale).round() as usize).max(1);
+    let ph = ((src_h as f64 * scale).round() as usize).max(1);
+    (pw, ph)
+}
+
+/// Attempt GPU-accelerated grading: LUT apply + HSL correct + clarity.
 ///
-/// Returns the LUT+HSL-processed pixels as f32 [0,1], interleaved RGB.
-/// The caller is responsible for applying `cpu::finish_grade` (depth_aware_ambiance,
-/// warmth, blend, u8 conversion) after this function returns, so GPU resources
-/// are freed before the CPU-heavy ambiance pass begins.
+/// Returns the fully-graded pixels as f32 [0,1], interleaved RGB (clarity applied).
+/// The caller is responsible for applying `cpu::finish_grade(skip_clarity=true)` —
+/// which runs depth_aware_ambiance WITHOUT clarity, warmth, blend, and u8 conversion.
 ///
 /// Returns `Err` on any CUDA failure so the caller can fall back to full CPU.
 #[cfg(feature = "cuda")]
@@ -52,7 +77,7 @@ pub fn grade_frame_cuda(
     width: usize,
     height: usize,
     calibration: &Calibration,
-    _params: &GradeParams,
+    params: &GradeParams,
 ) -> Result<Vec<f32>, GpuError> {
     let n = width * height;
 
@@ -115,6 +140,32 @@ pub fn grade_frame_cuda(
         return Err(GpuError::Cuda(format!("dorea_hsl_correct_gpu returned CUDA error {status}")));
     }
 
-    // GPU work done. Return f32 intermediate — caller applies CPU finish pass.
-    Ok(rgb_after_hsl)
+    // --- GPU: Clarity at proxy resolution ---
+    // Compute clarity_amount from depth mean + contrast param (mirrors cpu.rs::apply_cpu_clarity)
+    let mean_d = depth.iter().sum::<f32>() / depth.len().max(1) as f32;
+    let clarity_amount = (0.2 + 0.25 * mean_d) * params.contrast;
+
+    let (proxy_w, proxy_h) = proxy_dims(width, height, 518);
+    const BLUR_RADIUS: i32 = 30;
+
+    let mut rgb_after_clarity = vec![0.0f32; n * 3];
+    let status = unsafe {
+        dorea_clarity_gpu(
+            rgb_after_hsl.as_ptr(),
+            rgb_after_clarity.as_mut_ptr(),
+            width as i32,
+            height as i32,
+            proxy_w as i32,
+            proxy_h as i32,
+            BLUR_RADIUS,
+            clarity_amount,
+        )
+    };
+    if status != 0 {
+        log::warn!("dorea_clarity_gpu returned CUDA error {status} — clarity skipped");
+        // Fall back gracefully: return hsl result without clarity
+        return Ok(rgb_after_hsl);
+    }
+
+    Ok(rgb_after_clarity)
 }

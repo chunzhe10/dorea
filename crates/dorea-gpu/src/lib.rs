@@ -83,6 +83,7 @@ pub fn grade_frame(
                     height,
                     params,
                     calibration,
+                    true,  // GPU clarity kernel already applied in grade_frame_cuda
                 ));
             }
             Err(e) => {
