@@ -120,13 +120,13 @@ pub fn depth_aware_ambiance(
 /// `rgb_f32` is modified in place (ambiance + warmth applied).
 /// `orig_pixels` is the original u8 input used for the strength blend.
 pub(crate) fn finish_grade(
-    rgb_f32: &mut Vec<f32>,
+    rgb_f32: &mut [f32],
     orig_pixels: &[u8],
     depth: &[f32],
     width: usize,
     height: usize,
     params: &GradeParams,
-    _cal: &Calibration,
+    _cal: &Calibration,  // reserved: Task 2 CUDA path passes calibration here
 ) -> Vec<u8> {
     let n = width * height;
 
@@ -367,8 +367,5 @@ mod tests {
 
         let out = finish_grade(&mut rgb_f32, &orig_pixels, &depth, width, height, &params, &cal);
         assert_eq!(out.len(), n * 3);
-        for &v in &out {
-            assert!(v <= 255, "out-of-range u8: {v}");
-        }
     }
 }
