@@ -1,60 +1,84 @@
 # Dorea
 
-Automated underwater video AI editing pipeline. Named after the Dorado
+Automated underwater video color grading pipeline. Named after the Dorado
 constellation (the golden fish).
 
-## What it does
+## v2 — Rust rewrite
 
-Dorea automates the technically repetitive stages of underwater video
-post-production while preserving full creative control for the human editor.
+Dorea v2 is a Rust workspace that ports the proven Python/NumPy algorithms from
+the Sea-Thru POC into a fast, maintainable native binary.
 
-### Pipeline phases
+### Architecture
 
-| # | Script | What it does | GPU |
-|---|--------|-------------|-----|
-| 0 | `00_generate_lut.py` | Reference images → .cube LUT | No |
-| 1 | `01_extract_frames.py` | ffmpeg keyframe extraction | No |
-| 1b | `01b_estimate_white_balance.py` | Per-clip WB estimation from keyframes | No |
-| 2 | `02_claude_scene_analysis.py` | Claude API scene + subject detection | No |
-| 3 | `03_run_sam2.py` | SAM2 per-subject mask tracking | ~3GB |
-| 4 | `04_run_depth.py` | Depth Anything V2 depth maps | ~1.5GB |
-| 5 | `05_resolve_setup.py` | Resolve API: import, DRX, WB, mattes | No |
+```
+crates/
+├── dorea-color   — D-Log M, sRGB↔LAB, RGB↔HSV color math
+├── dorea-lut     — Depth-stratified 33³ LUT build + trilinear apply
+├── dorea-hsl     — 6-vector HSL qualifier derive + apply
+├── dorea-cal     — .dorea-cal calibration file format (bincode)
+├── dorea-video   — Phase 2: ffmpeg NVDEC/NVENC integration (placeholder)
+└── dorea-cli     — `dorea` binary (calibrate / grade / preview)
+```
+
+### Pipeline (Phase 1)
+
+```
+keyframes + depth maps + RAUNE targets
+         ↓
+dorea calibrate   →  calibration.dorea-cal
+         ↓
+dorea grade       →  graded video  (Phase 3)
+```
 
 ### Hardware requirements
 
-- Linux workstation
-- NVIDIA GPU with 6GB+ VRAM (RTX 3060 or better)
-- 64GB RAM recommended
-- DaVinci Resolve Studio (one-time purchase)
+- Linux workstation (devcontainer or bare metal)
+- NVIDIA GPU with 6GB VRAM (RTX 3060 or better) — needed for RAUNE-Net inference
+- DaVinci Resolve Studio — for final timeline assembly
 
 ### Camera support
 
-- DJI Action 4 (D-Log M)
+- DJI Action 4 (D-Log M transfer function in `dorea-color::dlog_m`)
 - Insta360 X5 (pre-flattened via Insta360 Studio)
 
 ## Quick start
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-pip install git+https://github.com/facebookresearch/sam2.git
+# Build
+cargo build --release
 
-# 2. Download model weights
-# SAM2: https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
-# Depth Anything V2: auto-downloads from HuggingFace on first run
+# Calibrate from keyframes
+dorea calibrate \
+  --keyframes /path/to/keyframes \
+  --depth     /path/to/depth_maps \
+  --targets   /path/to/raune_targets \
+  --output    calibration.dorea-cal
 
-# 3. Configure
-# Edit config.yaml with your paths and API key
-
-# 4. One-time: generate reference LUT
-python scripts/00_generate_lut.py --references references/look_v1/ --output luts/underwater_base.cube
-
-# 5. After each dive: run overnight batch
-bash scripts/run_all.sh
-
-# 6. Morning: open Resolve — timeline is ready for creative grading
+# Grade (Phase 3 — not yet implemented)
+dorea grade --input dive.mp4 --calibration calibration.dorea-cal --output graded.mp4
 ```
 
-## Architecture
+## Development
+
+```bash
+cargo test
+cargo clippy -- -D warnings
+```
+
+## Key design decisions
+
+- **σ=0** — no Gaussian smoothing on LUT cells (critical fix from POC)
+- **NN fill** — empty LUT cells get nearest populated cell's value (brute-force L2 in index space)
+- **Adaptive zone boundaries** — depth quantiles, not linspace
+- **6-vector HSL qualifier** — matches DaVinci Resolve secondary color corrector
+
+## Repository layout
+
+```
+Cargo.toml          Workspace manifest
+crates/             Rust crates (see above)
+luts/               Reference .cube LUT files (data, not generated)
+references/         Reference still images for LUT generation
+```
 
 See `underwater_pipeline_architecture.docx` for the full architecture document.

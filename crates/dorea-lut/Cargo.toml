@@ -1,0 +1,13 @@
+[package]
+name = "dorea-lut"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dorea-color = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
+rayon = "1"
+
+[dev-dependencies]
+approx = "0.5"

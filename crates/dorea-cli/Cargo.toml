@@ -1,0 +1,20 @@
+[package]
+name = "dorea-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dorea"
+path = "src/main.rs"
+
+[dependencies]
+dorea-color = { workspace = true }
+dorea-lut = { workspace = true }
+dorea-hsl = { workspace = true }
+dorea-cal = { workspace = true }
+dorea-video = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+image = "0.25"
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"

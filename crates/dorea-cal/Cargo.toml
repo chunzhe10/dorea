@@ -1,0 +1,11 @@
+[package]
+name = "dorea-cal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dorea-lut = { workspace = true }
+dorea-hsl = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }

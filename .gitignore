@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 .venv/
 
+# Rust
+/target/
+
 # Note: model weights live at workspace root (dorea-workspace/models/),
 # not inside this repo. The workspace .gitignore handles them.
 

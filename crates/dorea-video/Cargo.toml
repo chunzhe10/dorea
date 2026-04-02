@@ -1,0 +1,4 @@
+[package]
+name = "dorea-video"
+version.workspace = true
+edition.workspace = true

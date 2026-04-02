@@ -1,0 +1,11 @@
+[package]
+name = "dorea-hsl"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dorea-color = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"
