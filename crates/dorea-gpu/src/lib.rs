@@ -73,7 +73,18 @@ pub fn grade_frame(
     #[cfg(feature = "cuda")]
     {
         match cuda::grade_frame_cuda(pixels, depth, width, height, calibration, params) {
-            Ok(result) => return Ok(result),
+            Ok(mut rgb_f32) => {
+                // GPU resources are now freed. Apply CPU-only ambiance + warmth + blend.
+                return Ok(cpu::finish_grade(
+                    &mut rgb_f32,
+                    pixels,
+                    depth,
+                    width,
+                    height,
+                    params,
+                    calibration,
+                ));
+            }
             Err(e) => {
                 log::warn!("CUDA grading failed ({e}), falling back to CPU");
             }
