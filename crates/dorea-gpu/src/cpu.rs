@@ -126,7 +126,7 @@ pub(crate) fn finish_grade(
     width: usize,
     height: usize,
     params: &GradeParams,
-    _cal: &Calibration,  // reserved: Task 2 CUDA path passes calibration here
+    _cal: &Calibration,  // reserved: available for per-calibration finish adjustments if needed
 ) -> Vec<u8> {
     let n = width * height;
 
