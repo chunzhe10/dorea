@@ -2,6 +2,8 @@
 //!
 //! Ported from `run_fixed_hsl_lut_poc.py::derive_hsl_corrections`.
 
+use rayon::prelude::*;
+
 use dorea_color::hsv::rgb_to_hsv;
 
 use crate::qualifiers::{HSL_QUALIFIERS, MIN_SATURATION, MIN_WEIGHT};
@@ -25,6 +27,32 @@ pub struct QualifierCorrection {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HslCorrections(pub Vec<QualifierCorrection>);
 
+/// Accumulator for weighted HSL qualifier statistics.
+/// Used in the parallel fold/reduce pass over pixels.
+#[derive(Debug, Clone, Copy)]
+struct QualifierAccum {
+    total_weight: f64,
+    h_offset_sum: f64,
+    lut_s_sum: f64,
+    tgt_s_sum: f64,
+    v_diff_sum: f64,
+}
+
+impl QualifierAccum {
+    fn zero() -> Self {
+        Self { total_weight: 0.0, h_offset_sum: 0.0, lut_s_sum: 0.0, tgt_s_sum: 0.0, v_diff_sum: 0.0 }
+    }
+    fn combine(self, other: Self) -> Self {
+        Self {
+            total_weight: self.total_weight + other.total_weight,
+            h_offset_sum: self.h_offset_sum + other.h_offset_sum,
+            lut_s_sum: self.lut_s_sum + other.lut_s_sum,
+            tgt_s_sum: self.tgt_s_sum + other.tgt_s_sum,
+            v_diff_sum: self.v_diff_sum + other.v_diff_sum,
+        }
+    }
+}
+
 /// Derive per-qualifier HSL corrections from (lut_output, raune_target) pixel pairs.
 ///
 /// Both slices must be the same length. Values in [0.0, 1.0].
@@ -40,13 +68,15 @@ pub fn derive_hsl_corrections(
         target.len()
     );
 
-    // Convert to HSV
+    // Convert to HSV (parallel — each pixel is independent).
+    // Note: materialises two Vecs of (n_pixels × 12 bytes) before the qualifier loop.
+    // For 4K images this is ~200 MB peak; acceptable for a batch calibration tool.
     let lut_hsv: Vec<(f32, f32, f32)> = lut_output
-        .iter()
+        .par_iter()
         .map(|&[r, g, b]| rgb_to_hsv(r, g, b))
         .collect();
     let tgt_hsv: Vec<(f32, f32, f32)> = target
-        .iter()
+        .par_iter()
         .map(|&[r, g, b]| rgb_to_hsv(r, g, b))
         .collect();
 
@@ -56,18 +86,31 @@ pub fn derive_hsl_corrections(
         let hc = qual.h_center;
         let hw = qual.h_width;
 
-        // Build soft qualifier mask
-        let mut total_weight = 0.0_f64;
-        let mut weights: Vec<f32> = Vec::with_capacity(lut_hsv.len());
+        // Single parallel pass: compute weight and accumulate in one scan.
+        // fold() builds partial sums per rayon thread; reduce() merges them.
+        // Outer qualifier loop stays serial — inner par_iter already saturates the thread pool.
+        let accum: QualifierAccum = lut_hsv
+            .par_iter()
+            .zip(tgt_hsv.par_iter())
+            .fold(QualifierAccum::zero, |mut acc, (&(lh, ls, lv), &(th, ts, tv))| {
+                let h_dist = angular_dist(lh, hc);
+                let mask = (1.0 - h_dist / hw).max(0.0)
+                    * if ls > MIN_SATURATION { 1.0_f32 } else { 0.0_f32 };
+                if mask < 1e-7 {
+                    return acc;
+                }
+                let w = mask as f64;
+                let h_diff = wrap_hue_diff(th - lh) as f64;
+                acc.total_weight += w;
+                acc.h_offset_sum += h_diff * w;
+                acc.lut_s_sum += ls as f64 * w;
+                acc.tgt_s_sum += ts as f64 * w;
+                acc.v_diff_sum += (tv - lv) as f64 * w;
+                acc
+            })
+            .reduce(QualifierAccum::zero, QualifierAccum::combine);
 
-        for &(lh, ls, _lv) in &lut_hsv {
-            let h_dist = angular_dist(lh, hc);
-            let mask = (1.0 - h_dist / hw).max(0.0) * if ls > MIN_SATURATION { 1.0 } else { 0.0 };
-            weights.push(mask);
-            total_weight += mask as f64;
-        }
-
-        if total_weight < MIN_WEIGHT as f64 {
+        if accum.total_weight < MIN_WEIGHT as f64 {
             corrections.push(QualifierCorrection {
                 h_center: hc,
                 h_width: hw,
@@ -79,32 +122,11 @@ pub fn derive_hsl_corrections(
             continue;
         }
 
-        // Weighted hue difference (circular, wrapped to [-180, 180])
-        let mut h_offset_sum = 0.0_f64;
-        let mut lut_s_sum = 0.0_f64;
-        let mut tgt_s_sum = 0.0_f64;
-        let mut v_diff_sum = 0.0_f64;
-
-        for (i, &w) in weights.iter().enumerate() {
-            if w < 1e-7 {
-                continue;
-            }
-            let w = w as f64;
-            let (lh, ls, lv) = lut_hsv[i];
-            let (th, ts, tv) = tgt_hsv[i];
-
-            let h_diff = wrap_hue_diff(th - lh);
-            h_offset_sum += h_diff as f64 * w;
-            lut_s_sum += ls as f64 * w;
-            tgt_s_sum += ts as f64 * w;
-            v_diff_sum += (tv - lv) as f64 * w;
-        }
-
-        let h_offset = (h_offset_sum / total_weight) as f32;
-        let lut_s_mean = (lut_s_sum / total_weight) as f32;
-        let tgt_s_mean = (tgt_s_sum / total_weight) as f32;
+        let h_offset = (accum.h_offset_sum / accum.total_weight) as f32;
+        let lut_s_mean = (accum.lut_s_sum / accum.total_weight) as f32;
+        let tgt_s_mean = (accum.tgt_s_sum / accum.total_weight) as f32;
         let s_ratio = tgt_s_mean / lut_s_mean.max(1e-6);
-        let v_offset = (v_diff_sum / total_weight) as f32;
+        let v_offset = (accum.v_diff_sum / accum.total_weight) as f32;
 
         corrections.push(QualifierCorrection {
             h_center: hc,
@@ -112,7 +134,7 @@ pub fn derive_hsl_corrections(
             h_offset,
             s_ratio,
             v_offset,
-            weight: total_weight as f32,
+            weight: accum.total_weight as f32,
         });
     }
 
@@ -120,7 +142,6 @@ pub fn derive_hsl_corrections(
 }
 
 /// Angular distance between two hue values (degrees), wrapped to [0, 180].
-#[allow(dead_code)]
 #[inline]
 fn angular_dist(h: f32, center: f32) -> f32 {
     let diff = (h - center).abs();

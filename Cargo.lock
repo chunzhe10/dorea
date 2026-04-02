@@ -400,6 +400,7 @@ name = "dorea-hsl"
 version = "0.1.0"
 dependencies = [
  "dorea-color",
+ "rayon",
  "serde",
 ]
 
@@ -409,6 +410,7 @@ version = "0.1.0"
 dependencies = [
  "dorea-color",
  "log",
+ "rayon",
  "serde",
 ]
 

@@ -7,3 +7,4 @@ edition.workspace = true
 dorea-color = { workspace = true }
 serde = { workspace = true }
 log = { workspace = true }
+rayon = { workspace = true }
