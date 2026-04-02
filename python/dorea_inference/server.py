@@ -1,0 +1,161 @@
+"""Dorea inference subprocess server.
+
+Reads JSON-lines requests from stdin, writes JSON-lines responses to stdout.
+See protocol.py for message format.
+
+Usage:
+    python -m dorea_inference.server [OPTIONS]
+
+Options:
+    --raune-weights PATH        Path to RAUNE-Net weights .pth
+    --raune-models-dir PATH     Path to sea_thru_poc directory (contains models/raune_net.py)
+    --depth-model PATH          Path to Depth Anything V2 model dir or HF id
+    --device cpu|cuda           Compute device (default: cuda if available, else cpu)
+    --no-raune                  Skip loading RAUNE-Net (depth only)
+    --no-depth                  Skip loading Depth Anything (RAUNE only)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import traceback
+from typing import Optional
+
+from . import __version__
+from .protocol import (
+    PongResponse,
+    RauneResult,
+    DepthResult,
+    ErrorResponse,
+    OkResponse,
+    decode_png,
+    encode_png,
+)
+
+
+def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="python -m dorea_inference.server",
+        description="Dorea inference subprocess server",
+    )
+    p.add_argument("--raune-weights", default=None)
+    p.add_argument("--raune-models-dir", default=None)
+    p.add_argument("--depth-model", default=None)
+    p.add_argument("--device", default=None, choices=["cpu", "cuda"])
+    p.add_argument("--no-raune", action="store_true")
+    p.add_argument("--no-depth", action="store_true")
+    return p.parse_args(argv)
+
+
+def _choose_device(requested: Optional[str]) -> str:
+    if requested:
+        return requested
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+def main(argv: Optional[list] = None) -> None:
+    args = _parse_args(argv)
+    device = _choose_device(args.device)
+
+    # Write startup message to stderr (not stdout — stdout is the IPC channel)
+    print(f"[dorea-inference] v{__version__} starting on device={device}", file=sys.stderr, flush=True)
+
+    # Lazy-load models to avoid startup cost when not needed
+    raune_model = None
+    depth_model = None
+
+    if not args.no_raune:
+        try:
+            from .raune_net import RauneNetInference
+            raune_model = RauneNetInference(
+                weights_path=args.raune_weights,
+                device=device,
+                raune_models_dir=args.raune_models_dir,
+            )
+            print("[dorea-inference] RAUNE-Net loaded", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[dorea-inference] WARNING: RAUNE-Net failed to load: {e}", file=sys.stderr, flush=True)
+
+    if not args.no_depth:
+        try:
+            from .depth_anything import DepthAnythingInference
+            depth_model = DepthAnythingInference(
+                model_path=args.depth_model,
+                device=device,
+            )
+            print("[dorea-inference] Depth Anything V2 loaded", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[dorea-inference] WARNING: Depth Anything V2 failed to load: {e}", file=sys.stderr, flush=True)
+
+    print("[dorea-inference] ready", file=sys.stderr, flush=True)
+
+    # Main request loop
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as e:
+            resp = ErrorResponse(id=None, message=f"invalid JSON: {e}")
+            print(json.dumps(resp.to_dict()), flush=True)
+            continue
+
+        req_type = req.get("type", "")
+        req_id = req.get("id")
+
+        try:
+            if req_type == "ping":
+                resp = PongResponse(version=__version__)
+                print(json.dumps(resp.to_dict()), flush=True)
+
+            elif req_type == "raune":
+                if raune_model is None:
+                    raise RuntimeError("RAUNE-Net model not loaded (--no-raune or load failed)")
+                img = decode_png(req["image_b64"])
+                max_size = int(req.get("max_size", 1024))
+                result = raune_model.infer(img, max_size=max_size)
+                resp = RauneResult(
+                    id=req_id,
+                    image_b64=encode_png(result),
+                    width=result.shape[1],
+                    height=result.shape[0],
+                )
+                print(json.dumps(resp.to_dict()), flush=True)
+
+            elif req_type == "depth":
+                if depth_model is None:
+                    raise RuntimeError("Depth Anything model not loaded (--no-depth or load failed)")
+                img = decode_png(req["image_b64"])
+                max_size = int(req.get("max_size", 518))
+                depth = depth_model.infer(img, max_size=max_size)
+                resp = DepthResult.from_array(req_id, depth)
+                print(json.dumps(resp.to_dict()), flush=True)
+
+            elif req_type == "shutdown":
+                resp = OkResponse()
+                print(json.dumps(resp.to_dict()), flush=True)
+                break
+
+            else:
+                resp = ErrorResponse(id=req_id, message=f"unknown request type: {req_type!r}")
+                print(json.dumps(resp.to_dict()), flush=True)
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[dorea-inference] ERROR on {req_type}: {e}\n{tb}", file=sys.stderr, flush=True)
+            resp = ErrorResponse(id=req_id, message=str(e))
+            print(json.dumps(resp.to_dict()), flush=True)
+
+    print("[dorea-inference] exiting", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()

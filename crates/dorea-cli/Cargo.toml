@@ -12,6 +12,7 @@ dorea-color = { workspace = true }
 dorea-lut = { workspace = true }
 dorea-hsl = { workspace = true }
 dorea-cal = { workspace = true }
+dorea-gpu = { workspace = true }
 dorea-video = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 image = "0.25"

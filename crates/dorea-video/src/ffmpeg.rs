@@ -1,0 +1,363 @@
+// ffmpeg subprocess integration: probe, decode, encode, single-frame extraction.
+
+use std::io::{self, Read, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum FfmpegError {
+    #[error("ffmpeg not found in PATH: {0}")]
+    NotFound(#[from] io::Error),
+    #[error("ffprobe failed: {0}")]
+    ProbeFailed(String),
+    #[error("ffmpeg decode failed: {0}")]
+    DecodeFailed(String),
+    #[error("ffmpeg encode failed: {0}")]
+    EncodeFailed(String),
+    #[error("invalid video metadata: {0}")]
+    InvalidMetadata(String),
+}
+
+/// Video metadata returned by `probe`.
+#[derive(Debug, Clone)]
+pub struct VideoInfo {
+    pub width: usize,
+    pub height: usize,
+    /// Frames per second (rational rounded to f64).
+    pub fps: f64,
+    /// Duration in seconds.
+    pub duration_secs: f64,
+    /// Estimated frame count (may be 0 if unknown).
+    pub frame_count: u64,
+    /// Has audio stream.
+    pub has_audio: bool,
+}
+
+/// Probe a video file for metadata.
+pub fn probe(input: &Path) -> Result<VideoInfo, FfmpegError> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_format",
+            input.to_str().unwrap_or(""),
+        ])
+        .output()
+        .map_err(FfmpegError::NotFound)?;
+
+    if !output.status.success() {
+        return Err(FfmpegError::ProbeFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| FfmpegError::ProbeFailed(e.to_string()))?;
+
+    let streams = json["streams"].as_array().ok_or_else(|| {
+        FfmpegError::InvalidMetadata("no streams found".to_string())
+    })?;
+
+    let video = streams.iter()
+        .find(|s| s["codec_type"].as_str() == Some("video"))
+        .ok_or_else(|| FfmpegError::InvalidMetadata("no video stream".to_string()))?;
+
+    let width = video["width"].as_u64()
+        .ok_or_else(|| FfmpegError::InvalidMetadata("missing width".to_string()))? as usize;
+    let height = video["height"].as_u64()
+        .ok_or_else(|| FfmpegError::InvalidMetadata("missing height".to_string()))? as usize;
+
+    // fps as rational string "30000/1001" or plain "30"
+    let fps = parse_rational(video["r_frame_rate"].as_str().unwrap_or("30/1"));
+
+    let duration_secs = json["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+
+    let frame_count = video["nb_frames"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| (duration_secs * fps).round() as u64);
+
+    let has_audio = streams.iter().any(|s| s["codec_type"].as_str() == Some("audio"));
+
+    Ok(VideoInfo { width, height, fps, duration_secs, frame_count, has_audio })
+}
+
+fn parse_rational(s: &str) -> f64 {
+    if let Some((num, den)) = s.split_once('/') {
+        let n = num.trim().parse::<f64>().unwrap_or(30.0);
+        let d = den.trim().parse::<f64>().unwrap_or(1.0);
+        if d == 0.0 { 30.0 } else { n / d }
+    } else {
+        s.parse::<f64>().unwrap_or(30.0)
+    }
+}
+
+/// A decoded video frame.
+#[derive(Debug)]
+pub struct Frame {
+    pub index: u64,
+    pub pixels: Vec<u8>, // RGB24, width * height * 3
+    pub width: usize,
+    pub height: usize,
+}
+
+/// Decode all frames from a video file.
+///
+/// Yields frames in display order. Uses NVDEC if available, falls back to software.
+pub fn decode_frames(
+    input: &Path,
+    info: &VideoInfo,
+) -> Result<impl Iterator<Item = Result<Frame, FfmpegError>>, FfmpegError> {
+    let child = spawn_decoder(input, info)?;
+    Ok(FrameReader::new(child, info.width, info.height))
+}
+
+fn spawn_decoder(input: &Path, info: &VideoInfo) -> Result<Child, FfmpegError> {
+    let input_str = input.to_str().unwrap_or("");
+    let size_str = format!("{}x{}", info.width, info.height);
+
+    // Try hardware decode first, fall back to software
+    let hw_result = Command::new("ffmpeg")
+        .args([
+            "-hwaccel", "nvdec",
+            "-i", input_str,
+            "-vf", &format!("scale={size_str}"),
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Ok(child) = hw_result {
+        return Ok(child);
+    }
+
+    // Software fallback
+    Command::new("ffmpeg")
+        .args([
+            "-i", input_str,
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(FfmpegError::NotFound)
+}
+
+struct FrameReader {
+    child: Child,
+    frame_index: u64,
+    width: usize,
+    height: usize,
+    frame_bytes: usize,
+    done: bool,
+}
+
+impl FrameReader {
+    fn new(child: Child, width: usize, height: usize) -> Self {
+        Self {
+            child,
+            frame_index: 0,
+            width,
+            height,
+            frame_bytes: width * height * 3,
+            done: false,
+        }
+    }
+}
+
+impl Iterator for FrameReader {
+    type Item = Result<Frame, FfmpegError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        let mut buf = vec![0u8; self.frame_bytes];
+        let stdout = self.child.stdout.as_mut()?;
+
+        match read_exact(stdout, &mut buf) {
+            Ok(0) | Err(_) => {
+                self.done = true;
+                return None;
+            }
+            Ok(_) => {}
+        }
+
+        let frame = Frame {
+            index: self.frame_index,
+            pixels: buf,
+            width: self.width,
+            height: self.height,
+        };
+        self.frame_index += 1;
+        Some(Ok(frame))
+    }
+}
+
+/// Read exactly `buf.len()` bytes; returns 0 on clean EOF, error on partial EOF.
+fn read_exact(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        match reader.read(&mut buf[pos..]) {
+            Ok(0) => return Ok(0), // EOF
+            Ok(n) => pos += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(pos)
+}
+
+/// Extract a single frame at a given timestamp (seconds).
+pub fn extract_frame_at(
+    input: &Path,
+    timestamp_secs: f64,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>, FfmpegError> {
+    let ts_str = format!("{timestamp_secs:.3}");
+    let scale_str = format!("scale={width}x{height}");
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-ss", &ts_str,
+            "-i", input.to_str().unwrap_or(""),
+            "-vframes", "1",
+            "-vf", &scale_str,
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(FfmpegError::NotFound)?;
+
+    let expected = width * height * 3;
+    if output.stdout.len() < expected {
+        return Err(FfmpegError::DecodeFailed(format!(
+            "expected {expected} bytes, got {} at ts={timestamp_secs:.3}",
+            output.stdout.len()
+        )));
+    }
+    Ok(output.stdout[..expected].to_vec())
+}
+
+/// Encoder for streaming frames to an output video file.
+pub struct FrameEncoder {
+    child: Child,
+    stdin: ChildStdin,
+    frame_bytes: usize,
+}
+
+impl FrameEncoder {
+    /// Spawn an encoder subprocess.
+    ///
+    /// `input_video` is used only for audio passthrough (`-i <input>` for the audio stream).
+    /// Pass `None` to skip audio.
+    pub fn new(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: f64,
+        input_for_audio: Option<&Path>,
+    ) -> Result<Self, FfmpegError> {
+        let w_s = width.to_string();
+        let h_s = height.to_string();
+        let fps_s = format!("{fps:.3}");
+        let size_s = format!("{w_s}x{h_s}");
+        let out_s = output.to_str().unwrap_or("output.mp4");
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-f", "rawvideo",
+            "-pixel_format", "rgb24",
+            "-s", &size_s,
+            "-r", &fps_s,
+            "-i", "pipe:0",
+        ]);
+
+        if let Some(audio_src) = input_for_audio {
+            cmd.args(["-i", audio_src.to_str().unwrap_or("")]);
+            cmd.args(["-map", "0:v", "-map", "1:a", "-c:a", "copy"]);
+        } else {
+            cmd.args(["-map", "0:v"]);
+        }
+
+        // Try NVENC first
+        let nvenc_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18"];
+        let sw_args = ["-c:v", "libx264", "-crf", "18", "-preset", "fast"];
+
+        // Probe whether nvenc is available
+        let nvenc_available = Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_nvenc"))
+            .unwrap_or(false);
+
+        let codec_args: &[&str] = if nvenc_available { &nvenc_args } else { &sw_args };
+        cmd.args(codec_args);
+        cmd.arg(out_s);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().map_err(FfmpegError::NotFound)?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            FfmpegError::EncodeFailed("could not open encoder stdin".to_string())
+        })?;
+
+        Ok(Self {
+            child,
+            stdin,
+            frame_bytes: width * height * 3,
+        })
+    }
+
+    /// Write one RGB24 frame to the encoder.
+    pub fn write_frame(&mut self, pixels: &[u8]) -> Result<(), FfmpegError> {
+        assert_eq!(pixels.len(), self.frame_bytes, "wrong frame size");
+        self.stdin.write_all(pixels).map_err(FfmpegError::NotFound)
+    }
+
+    /// Finalize encoding. Must be called after all frames are written.
+    pub fn finish(mut self) -> Result<(), FfmpegError> {
+        drop(self.stdin); // close stdin → signal EOF to ffmpeg
+        let status = self.child.wait().map_err(FfmpegError::NotFound)?;
+        if !status.success() {
+            return Err(FfmpegError::EncodeFailed(format!(
+                "ffmpeg encoder exited with code {:?}",
+                status.code()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rational;
+
+    #[test]
+    fn rational_parse() {
+        assert!((parse_rational("30000/1001") - 29.97).abs() < 0.01);
+        assert!((parse_rational("25/1") - 25.0).abs() < 0.001);
+        assert!((parse_rational("24") - 24.0).abs() < 0.001);
+        assert!((parse_rational("0/0") - 30.0).abs() < 0.001); // div-by-zero fallback
+    }
+}

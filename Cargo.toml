@@ -6,6 +6,7 @@ members = [
     "crates/dorea-lut",
     "crates/dorea-hsl",
     "crates/dorea-cal",
+    "crates/dorea-gpu",
     "crates/dorea-video",
 ]
 
@@ -19,6 +20,7 @@ dorea-color = { path = "crates/dorea-color" }
 dorea-lut = { path = "crates/dorea-lut" }
 dorea-hsl = { path = "crates/dorea-hsl" }
 dorea-cal = { path = "crates/dorea-cal" }
+dorea-gpu = { path = "crates/dorea-gpu" }
 dorea-video = { path = "crates/dorea-video" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"

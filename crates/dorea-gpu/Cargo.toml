@@ -1,0 +1,21 @@
+[package]
+name = "dorea-gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dorea-color = { workspace = true }
+dorea-lut = { workspace = true }
+dorea-hsl = { workspace = true }
+dorea-cal = { workspace = true }
+log.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+# cc is only used when nvcc is found
+cc = { version = "1", optional = true }
+
+[features]
+# Enabled automatically by build.rs when nvcc is found in PATH or CUDA_HOME/bin/nvcc.
+# Do NOT set manually — build.rs drives this.
+cuda = ["cc"]
