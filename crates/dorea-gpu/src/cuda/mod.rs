@@ -99,8 +99,10 @@ impl CudaGrader {
     /// Create a `CudaGrader` with pre-allocated device buffers for `max_w × max_h`.
     ///
     /// Unlike `new()`, the resolution buffers are allocated immediately rather than
-    /// on the first frame. This guarantees zero `cudaMalloc` calls even on the very
-    /// first frame processed, at the cost of upfront VRAM usage.
+    /// on the first frame. This guarantees zero `cudaMalloc` calls for
+    /// resolution-keyed buffers even on the very first frame processed, at the cost
+    /// of upfront VRAM usage. Calibration-keyed buffers are still lazily allocated
+    /// on the first `grade_frame_cuda` call (one allocation per grader lifetime).
     ///
     /// Every call to `grade_frame_cuda` on this grader must pass a frame whose
     /// dimensions exactly match `(max_w, max_h)`. Any frame that does not exactly
@@ -129,7 +131,9 @@ impl CudaGrader {
         calibration: &Calibration,
         params: &GradeParams,
     ) -> Result<Vec<f32>, GpuError> {
-        let n = width * height;
+        let n = width.checked_mul(height).ok_or_else(|| {
+            GpuError::InvalidInput("frame dimensions overflow usize".into())
+        })?;
         let dev = &self.device;
 
         // --- Input length guards (BEFORE any borrow_mut — htod_sync_copy_into panics on mismatch) ---
@@ -390,9 +394,8 @@ impl CudaGrader {
             .map_err(map_cudarc_error)?;
         }
 
-        // SAFETY: dtoh_sync_copy calls device.synchronize() — stream is idle after this download.
-        // Buffer contents are stable on device; the next grade_frame_cuda call can safely re-upload
-        // into these pre-allocated slices without data races.
+        // NOTE: dtoh_sync_copy internally calls device.synchronize(), leaving the stream idle.
+        // The pre-allocated buffers can be safely overwritten on the next grade_frame_cuda call.
         let result = dev.dtoh_sync_copy(&res_bufs.d_rgb_out).map_err(map_cudarc_error)?;
 
         Ok(result)
@@ -473,11 +476,17 @@ fn alloc_calibration_buffers(
     if n_zones == 0 {
         return Err(GpuError::InvalidInput("n_zones must be >= 1".into()));
     }
+    let lut_elems = lut_size
+        .checked_mul(lut_size)
+        .and_then(|x| x.checked_mul(lut_size))
+        .and_then(|x| x.checked_mul(3))
+        .and_then(|x| x.checked_mul(n_zones))
+        .ok_or_else(|| GpuError::InvalidInput("LUT dimensions overflow usize".into()))?;
     Ok(CalibrationBuffers {
         n_zones,
         lut_size,
         d_luts: dev
-            .alloc_zeros(n_zones * lut_size * lut_size * lut_size * 3)
+            .alloc_zeros(lut_elems)
             .map_err(map_cudarc_error)?,
         d_boundaries: dev.alloc_zeros(n_zones + 1).map_err(map_cudarc_error)?,
         d_h_offsets: dev.alloc_zeros(6).map_err(map_cudarc_error)?,
@@ -651,28 +660,36 @@ mod tests {
                 "output length for {n_zones}-zone calibration should be {expected_len}, got {}",
                 out.len()
             );
+            assert!(
+                out.iter().all(|&x| x.is_finite()),
+                "output contains non-finite values for {n_zones}-zone calibration"
+            );
         }
     }
 
-    /// `CudaGrader::with_capacity` must reject frames that exceed the pre-allocated dimensions.
-    ///
-    /// A grader created for 640×480 must return `GpuError::InvalidInput` when given
-    /// a 1280×720 frame (which exceeds both dimensions).
+    /// `CudaGrader::with_capacity` must reject frames that do not exactly match the
+    /// pre-allocated dimensions — whether oversized or undersized.
     #[test]
-    fn with_capacity_rejects_oversized_frame() {
+    fn with_capacity_rejects_non_exact_frame() {
         let grader = CudaGrader::with_capacity(640, 480)
             .expect("CudaGrader::with_capacity(640, 480) failed");
         let cal = make_calibration(5);
         let params = GradeParams::default();
-        // Frame is 1280×720 — larger than 640×480 in both dimensions.
+
+        // Oversized: 1280×720 > 640×480
         let (pixels, depth) = make_frame(1280, 720);
-
-        let result = grader.grade_frame_cuda(&pixels, &depth, 1280, 720, &cal, &params);
-
-        match result {
+        match grader.grade_frame_cuda(&pixels, &depth, 1280, 720, &cal, &params) {
             Err(GpuError::InvalidInput(_)) => { /* expected */ }
-            Ok(_) => panic!("expected GpuError::InvalidInput but got Ok"),
-            Err(e) => panic!("expected GpuError::InvalidInput but got: {e}"),
+            Ok(_) => panic!("expected InvalidInput for oversized frame, got Ok"),
+            Err(e) => panic!("expected InvalidInput for oversized frame, got: {e}"),
+        }
+
+        // Undersized: 320×240 < 640×480
+        let (pixels, depth) = make_frame(320, 240);
+        match grader.grade_frame_cuda(&pixels, &depth, 320, 240, &cal, &params) {
+            Err(GpuError::InvalidInput(_)) => { /* expected */ }
+            Ok(_) => panic!("expected InvalidInput for undersized frame, got Ok"),
+            Err(e) => panic!("expected InvalidInput for undersized frame, got: {e}"),
         }
     }
 
@@ -712,5 +729,20 @@ mod tests {
             );
         }
         assert_ne!(results[0], results[1], "two distinct frames should produce distinct outputs");
+    }
+
+    /// `grade_frames_with_capacity` with an empty frame slice must return an empty Vec.
+    #[test]
+    fn grade_frames_with_capacity_empty_batch() {
+        use crate::grade_frames_with_capacity;
+
+        let cal = make_calibration(5);
+        let params = GradeParams::default();
+        let frames: &[(&[u8], &[f32])] = &[];
+
+        let results = grade_frames_with_capacity(frames, 1280, 720, &cal, &params)
+            .expect("grade_frames_with_capacity with empty batch should succeed");
+
+        assert!(results.is_empty(), "empty input should yield empty output");
     }
 }
