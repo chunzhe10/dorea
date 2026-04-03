@@ -59,7 +59,8 @@ crates/dorea-gpu/src/cuda/kernels/clarity.cu
 ### Modified files
 
 ```
-crates/dorea-gpu/build.rs              — remove clarity PTX compilation
+crates/dorea-gpu/build.rs              — remove clarity PTX; add build_combined_lut.cu→.ptx
+                                         and combined_lut.cu→.ptx compilations
 crates/dorea-gpu/src/cuda/mod.rs       — replace 3-kernel pipeline with combined_lut call
 crates/dorea-gpu/src/cpu.rs            — remove skip_clarity, add grade_pixel_cpu (test baseline)
 crates/dorea-gpu/src/lib.rs            — update public API signatures
@@ -88,10 +89,12 @@ depth-aware ambiance → warmth → strength blend. Mirrors existing kernel logi
 
 - 1D grid: one thread per `(grid_point_index, zone)` pair, ~4.5M total
 - Thread computes `(r,g,b) = (i/(N-1), j/(N-1), k/(N-1))` from flat index
-- Calls `grade_pixel_device` at `depth = zone_center[zone]`
+- Calls `grade_pixel_device` at `depth = (zone_boundaries[zone] + zone_boundaries[zone+1]) / 2`
 - Writes `float4(r', g', b', 0.0)` to output device buffer [n_zones × N³]
 - Build time: <1ms GPU (vs ~34ms CPU rayon alternative)
 - Output stays on device — copied to `cudaArray3D` via `cudaMemcpy3D` without CPU roundtrip
+- Build buffer size: 97³ × 5 zones × 4 floats (float4) × 4 bytes = **73MB** (not 55MB — float4
+  padding required for cudaArray3D channel format; freed immediately after texture creation)
 
 ### `CombinedLut` (combined_lut.rs)
 
