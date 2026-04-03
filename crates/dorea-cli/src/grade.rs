@@ -382,19 +382,82 @@ pub fn run(args: GradeArgs) -> Result<()> {
     Ok(())
 }
 
-fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibration> {
-    use crate::calibrate::{run_calibration_from_frames, CalibrationInput};
+/// Temporary on-disk store for calibration frames.
+///
+/// Frames are written to disk as they come off the inference server so the process
+/// heap never holds more than one frame at a time. The three calibration passes
+/// (depth sampling, LUT build, HSL) each re-read from disk sequentially, letting
+/// the OS page cache manage the working set (~2 GB for ~1000 4K proxy frames).
+struct PagedCalibrationStore {
+    dir: std::path::PathBuf,
+    widths: Vec<usize>,
+    heights: Vec<usize>,
+}
 
-    let duration = info.duration_secs;
-    let interval_secs = args.keyframe_interval as f64 / info.fps.max(1.0);
-    let n_kf = ((duration / interval_secs) as usize).clamp(1, 20);
+impl PagedCalibrationStore {
+    fn new() -> Result<Self> {
+        let dir = std::env::temp_dir()
+            .join(format!("dorea_cal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create calibration temp dir {:?}", dir))?;
+        Ok(Self { dir, widths: Vec::new(), heights: Vec::new() })
+    }
+
+    fn len(&self) -> usize { self.widths.len() }
+
+    fn push(&mut self, pixels: &[u8], target: &[u8], depth: &[f32], width: usize, height: usize) -> Result<()> {
+        let i = self.widths.len();
+        std::fs::write(self.dir.join(format!("{i:04}_p.bin")), pixels)
+            .context("failed to write pixels")?;
+        std::fs::write(self.dir.join(format!("{i:04}_t.bin")), target)
+            .context("failed to write target")?;
+        let depth_bytes: Vec<u8> = depth.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(self.dir.join(format!("{i:04}_d.bin")), &depth_bytes)
+            .context("failed to write depth")?;
+        self.widths.push(width);
+        self.heights.push(height);
+        Ok(())
+    }
+
+    fn read_depth(&self, i: usize) -> Result<Vec<f32>> {
+        let bytes = std::fs::read(self.dir.join(format!("{i:04}_d.bin")))
+            .with_context(|| format!("failed to read depth {i}"))?;
+        Ok(bytes.chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
+    }
+
+    fn read_frame(&self, i: usize) -> Result<(Vec<u8>, Vec<u8>, Vec<f32>, usize, usize)> {
+        let pixels = std::fs::read(self.dir.join(format!("{i:04}_p.bin")))
+            .with_context(|| format!("failed to read pixels {i}"))?;
+        let target = std::fs::read(self.dir.join(format!("{i:04}_t.bin")))
+            .with_context(|| format!("failed to read target {i}"))?;
+        let depth = self.read_depth(i)?;
+        Ok((pixels, target, depth, self.widths[i], self.heights[i]))
+    }
+}
+
+impl Drop for PagedCalibrationStore {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibration> {
+    use dorea_cal::Calibration as _Calibration;
+    use dorea_hsl::derive::{derive_hsl_corrections, HslCorrections, QualifierCorrection};
+    use dorea_hsl::{HSL_QUALIFIERS, MIN_WEIGHT};
+    use dorea_lut::apply::apply_depth_luts;
+    use dorea_lut::build::{adaptive_zone_boundaries, compute_importance, StreamingLutBuilder, N_DEPTH_ZONES};
+
+    // Use frame-count-based duration to avoid container metadata overestimating the
+    // actual decodable range (ffprobe duration_secs can exceed the last real frame).
+    let fps = info.fps.max(1.0);
+    let safe_duration = info.frame_count.saturating_sub(1) as f64 / fps;
+    let interval_secs = args.keyframe_interval as f64 / fps;
+    let n_kf = ((safe_duration / interval_secs) as usize).max(1);
 
     log::info!("Auto-calibrating from {n_kf} keyframes...");
-
-    // Extract keyframes
-    let inf_cfg = build_inference_config(args);
-    let mut inf_server = InferenceServer::spawn(&inf_cfg)
-        .context("failed to spawn inference server for auto-calibration")?;
 
     // Calibration runs at proxy resolution so pixels, RAUNE target, and depth all match.
     // Max 1024px on the long edge, maintaining aspect ratio.
@@ -403,16 +466,21 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let kf_w = ((info.width as f64 * cal_scale) as usize).max(1);
     let kf_h = ((info.height as f64 * cal_scale) as usize).max(1);
 
-    let mut inputs: Vec<CalibrationInput> = Vec::new();
+    // --- Collect keyframes: inference → paged store (one frame in RAM at a time) ---
+    let inf_cfg = build_inference_config(args);
+    let mut inf_server = InferenceServer::spawn(&inf_cfg)
+        .context("failed to spawn inference server for auto-calibration")?;
+
+    let mut store = PagedCalibrationStore::new()
+        .context("failed to create paged calibration store")?;
 
     for i in 0..n_kf {
-        let ts = (i as f64 + 0.5) * duration / n_kf as f64;
+        let ts = (i as f64 + 0.5) * safe_duration / n_kf as f64;
         let pixels = ffmpeg::extract_frame_at(&args.input, ts, kf_w, kf_h)
             .with_context(|| format!("failed to extract keyframe at {ts:.2}s"))?;
 
-        let id = format!("kf{i:03}");
+        let id = format!("kf{i:04}");
 
-        // Run RAUNE-Net for target (at proxy resolution — output matches input size)
         let target = match inf_server.run_raune(&id, &pixels, kf_w, kf_h, kf_w) {
             Ok((t, _, _)) => t,
             Err(e) => {
@@ -421,7 +489,6 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
             }
         };
 
-        // Run Depth Anything for depth map, upscale to proxy resolution
         let (depth_proxy, dw, dh) = match inf_server.run_depth(&id, &pixels, kf_w, kf_h, 518) {
             Ok(d) => d,
             Err(e) => {
@@ -432,13 +499,113 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
 
         let depth = InferenceServer::upscale_depth(&depth_proxy, dw, dh, kf_w, kf_h);
 
-        inputs.push(CalibrationInput { pixels, target, depth, width: kf_w, height: kf_h });
+        store.push(&pixels, &target, &depth, kf_w, kf_h)
+            .with_context(|| format!("failed to page frame {i} to disk"))?;
     }
 
     let _ = inf_server.shutdown();
 
-    run_calibration_from_frames(&inputs)
-        .context("calibration failed")
+    // --- Pass 1: reservoir-sample depths → adaptive zone boundaries ---
+    // Avoids allocating all depth values (would be ~2 GB for 1000 frames).
+    const RESERVOIR_CAP: usize = 1_000_000;
+    let mut reservoir: Vec<f32> = Vec::with_capacity(RESERVOIR_CAP);
+    let mut total_seen: u64 = 0;
+    let mut rng: u64 = 0x853c49e6748fea9b_u64; // xorshift64
+
+    for i in 0..store.len() {
+        let depth = store.read_depth(i)?;
+        for &d in &depth {
+            total_seen += 1;
+            if reservoir.len() < RESERVOIR_CAP {
+                reservoir.push(d);
+            } else {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let j = (rng % total_seen) as usize;
+                if j < RESERVOIR_CAP {
+                    reservoir[j] = d;
+                }
+            }
+        }
+    }
+
+    let zone_boundaries = adaptive_zone_boundaries(&reservoir, N_DEPTH_ZONES);
+    drop(reservoir);
+
+    // --- Pass 2: stream frames → build LUT (O(LUT_SIZE³) RAM for accumulators) ---
+    let mut lut_builder = StreamingLutBuilder::new(zone_boundaries);
+    for i in 0..store.len() {
+        let (pixels_u8, target_u8, depth, w, h) = store.read_frame(i)?;
+        let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
+            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+            .collect();
+        let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
+            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+            .collect();
+        let importance = compute_importance(&depth, w, h);
+        lut_builder.add_frame(&original, &target, &depth, &importance);
+    }
+    let depth_luts = lut_builder.finish();
+
+    // --- Pass 3: stream frames → HSL corrections (LUT must be complete first) ---
+    let n_quals = HSL_QUALIFIERS.len();
+    let mut h_offset_acc    = vec![0.0_f64; n_quals];
+    let mut s_ratio_acc     = vec![0.0_f64; n_quals];
+    let mut v_offset_acc    = vec![0.0_f64; n_quals];
+    let mut active_count    = vec![0_usize;  n_quals];
+    let mut total_weight_acc = vec![0.0_f64; n_quals];
+
+    for i in 0..store.len() {
+        let (pixels_u8, target_u8, depth, _w, _h) = store.read_frame(i)?;
+        let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
+            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+            .collect();
+        let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
+            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+            .collect();
+
+        let lut_output = apply_depth_luts(&original, &depth, &depth_luts);
+        let corrs = derive_hsl_corrections(&lut_output, &target);
+
+        for (qi, corr) in corrs.0.iter().enumerate() {
+            if corr.weight >= MIN_WEIGHT {
+                let w = corr.weight as f64;
+                h_offset_acc[qi]     += corr.h_offset as f64 * w;
+                s_ratio_acc[qi]      += corr.s_ratio  as f64 * w;
+                v_offset_acc[qi]     += corr.v_offset as f64 * w;
+                active_count[qi]     += 1;
+                total_weight_acc[qi] += w;
+            }
+        }
+    }
+
+    let mut avg_corrections: Vec<QualifierCorrection> = Vec::with_capacity(n_quals);
+    for qi in 0..n_quals {
+        let qual = &HSL_QUALIFIERS[qi];
+        if active_count[qi] > 0 {
+            let tw = total_weight_acc[qi];
+            avg_corrections.push(QualifierCorrection {
+                h_center: qual.h_center,
+                h_width:  qual.h_width,
+                h_offset: (h_offset_acc[qi] / tw) as f32,
+                s_ratio:  (s_ratio_acc[qi]  / tw) as f32,
+                v_offset: (v_offset_acc[qi] / tw) as f32,
+                weight:   tw as f32,
+            });
+        } else {
+            avg_corrections.push(QualifierCorrection {
+                h_center: qual.h_center,
+                h_width:  qual.h_width,
+                h_offset: 0.0,
+                s_ratio:  1.0,
+                v_offset: 0.0,
+                weight:   0.0,
+            });
+        }
+    }
+
+    Ok(_Calibration::new(depth_luts, HslCorrections(avg_corrections), n_kf))
 }
 
 fn build_inference_config(args: &GradeArgs) -> InferenceConfig {

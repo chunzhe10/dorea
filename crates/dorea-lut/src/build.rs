@@ -227,128 +227,150 @@ pub fn adaptive_zone_boundaries(all_depths: &[f32], n_zones: usize) -> Vec<f32> 
     boundaries
 }
 
-/// Build depth-stratified LUTs from keyframe data.
+/// Streaming LUT builder — accumulates keyframe contributions one frame at a time.
 ///
-/// Returns `DepthLuts` with `N_DEPTH_ZONES` zones, σ=0 (no Gaussian smoothing), NN fill.
-pub fn build_depth_luts(keyframes: &[KeyframeData]) -> DepthLuts {
-    // I7: validate that all keyframe slices have consistent lengths.
-    for (i, kd) in keyframes.iter().enumerate() {
-        assert_eq!(
-            kd.original.len(),
-            kd.target.len(),
-            "keyframe {i}: original and target length mismatch"
-        );
-        assert_eq!(
-            kd.original.len(),
-            kd.depth.len(),
-            "keyframe {i}: original and depth length mismatch"
-        );
-        assert_eq!(
-            kd.original.len(),
-            kd.importance.len(),
-            "keyframe {i}: original and importance length mismatch"
-        );
+/// Accepts pre-computed `zone_boundaries` (e.g. from reservoir-sampled depths).
+/// Call `add_frame` for each keyframe, then `finish()` to produce the `DepthLuts`.
+/// Peak RAM = O(LUT_SIZE³ × n_zones) ≈ a few MB, regardless of frame count.
+pub struct StreamingLutBuilder {
+    zone_boundaries: Vec<f32>,
+    n_zones: usize,
+    /// Per-zone weighted RGB sums: lut_wsums[z][cell * 3 + c]
+    lut_wsums: Vec<Vec<f64>>,
+    /// Per-zone weighted counts: lut_wcounts[z][cell]
+    lut_wcounts: Vec<Vec<f64>>,
+}
+
+impl StreamingLutBuilder {
+    pub fn new(zone_boundaries: Vec<f32>) -> Self {
+        let n_zones = zone_boundaries.len().saturating_sub(1);
+        let n_cells = LUT_SIZE * LUT_SIZE * LUT_SIZE;
+        Self {
+            zone_boundaries,
+            n_zones,
+            lut_wsums: vec![vec![0.0_f64; n_cells * 3]; n_zones],
+            lut_wcounts: vec![vec![0.0_f64; n_cells]; n_zones],
+        }
     }
 
-    // Collect all depth values for adaptive boundaries
-    let all_depths: Vec<f32> = keyframes.iter().flat_map(|kd| kd.depth.iter().cloned()).collect();
-    let zone_boundaries = adaptive_zone_boundaries(&all_depths, N_DEPTH_ZONES);
+    /// Accumulate one keyframe's pixels into the LUT accumulators.
+    pub fn add_frame(
+        &mut self,
+        original: &[[f32; 3]],
+        target: &[[f32; 3]],
+        depth: &[f32],
+        importance: &[f32],
+    ) {
+        let n_px = original.len();
+        for z in 0..self.n_zones {
+            let d_lo = self.zone_boundaries[z];
+            let d_hi = self.zone_boundaries[z + 1];
+            let is_last = z == self.n_zones - 1;
+            let wsum = &mut self.lut_wsums[z];
+            let wcount = &mut self.lut_wcounts[z];
 
-    let mut luts = Vec::with_capacity(N_DEPTH_ZONES);
-
-    for z in 0..N_DEPTH_ZONES {
-        let d_lo = zone_boundaries[z];
-        let d_hi = zone_boundaries[z + 1];
-
-        // Accumulation buffers: wsum[cell*3 + c], wcount[cell]
-        let n_cells = LUT_SIZE * LUT_SIZE * LUT_SIZE;
-        let mut lut_wsum = vec![0.0_f64; n_cells * 3];
-        let mut lut_wcount = vec![0.0_f64; n_cells];
-
-        for kd in keyframes {
-            let n_px = kd.original.len();
             for i in 0..n_px {
-                let d = kd.depth[i];
-                let in_zone = if z == N_DEPTH_ZONES - 1 {
-                    d >= d_lo
-                } else {
-                    d >= d_lo && d < d_hi
-                };
+                let d = depth[i];
+                let in_zone = if is_last { d >= d_lo } else { d >= d_lo && d < d_hi };
                 if !in_zone {
                     continue;
                 }
-
-                let orig = kd.original[i];
-                let tgt = kd.target[i];
-                let w = kd.importance[i] as f64;
+                let orig = original[i];
+                let tgt = target[i];
+                let w = importance[i] as f64;
 
                 let ri = ((orig[0] * (LUT_SIZE as f32 - 1.0)).round() as usize).min(LUT_SIZE - 1);
                 let gi = ((orig[1] * (LUT_SIZE as f32 - 1.0)).round() as usize).min(LUT_SIZE - 1);
                 let bi = ((orig[2] * (LUT_SIZE as f32 - 1.0)).round() as usize).min(LUT_SIZE - 1);
 
                 let cell = ri * LUT_SIZE * LUT_SIZE + gi * LUT_SIZE + bi;
-                lut_wsum[cell * 3] += tgt[0] as f64 * w;
-                lut_wsum[cell * 3 + 1] += tgt[1] as f64 * w;
-                lut_wsum[cell * 3 + 2] += tgt[2] as f64 * w;
-                lut_wcount[cell] += w;
+                wsum[cell * 3]     += tgt[0] as f64 * w;
+                wsum[cell * 3 + 1] += tgt[1] as f64 * w;
+                wsum[cell * 3 + 2] += tgt[2] as f64 * w;
+                wcount[cell] += w;
             }
         }
+    }
 
-        // Normalize populated cells
-        let mut lut = LutGrid::new(LUT_SIZE);
-        let mut populated: Vec<[usize; 3]> = Vec::new();
-        let mut empty: Vec<[usize; 3]> = Vec::new();
+    /// Normalise, apply NN fill, and return the completed `DepthLuts`.
+    pub fn finish(self) -> DepthLuts {
+        let mut luts = Vec::with_capacity(self.n_zones);
 
-        for ri in 0..LUT_SIZE {
-            for gi in 0..LUT_SIZE {
-                for bi in 0..LUT_SIZE {
-                    let cell = ri * LUT_SIZE * LUT_SIZE + gi * LUT_SIZE + bi;
-                    let wc = lut_wcount[cell];
-                    if wc > 0.0 {
-                        lut.set(ri, gi, bi, [
-                            (lut_wsum[cell * 3] / wc) as f32,
-                            (lut_wsum[cell * 3 + 1] / wc) as f32,
-                            (lut_wsum[cell * 3 + 2] / wc) as f32,
-                        ]);
-                        populated.push([ri, gi, bi]);
-                    } else {
-                        empty.push([ri, gi, bi]);
-                    }
-                }
-            }
-        }
+        for z in 0..self.n_zones {
+            let wsum = &self.lut_wsums[z];
+            let wcount = &self.lut_wcounts[z];
 
-        // NN fill: brute-force L2 in index space (parallel per empty cell)
-        if !populated.is_empty() && !empty.is_empty() {
-            // Each empty cell search is fully independent — populated is read-only.
-            let filled: Vec<([usize; 3], [usize; 3])> = empty
-                .par_iter()
-                .map(|ec| find_nearest(ec, &populated))
-                .collect();
-            // Sequential write-back (each empty cell is distinct, no conflicts).
-            for (ec, best_pop) in filled {
-                let val = lut.get(best_pop[0], best_pop[1], best_pop[2]);
-                lut.set(ec[0], ec[1], ec[2], val);
-            }
-        } else if populated.is_empty() {
-            // Fallback: identity mapping
+            let mut lut = LutGrid::new(LUT_SIZE);
+            let mut populated: Vec<[usize; 3]> = Vec::new();
+            let mut empty: Vec<[usize; 3]> = Vec::new();
+
             for ri in 0..LUT_SIZE {
                 for gi in 0..LUT_SIZE {
                     for bi in 0..LUT_SIZE {
-                        let r = ri as f32 / (LUT_SIZE - 1) as f32;
-                        let g = gi as f32 / (LUT_SIZE - 1) as f32;
-                        let b = bi as f32 / (LUT_SIZE - 1) as f32;
-                        lut.set(ri, gi, bi, [r, g, b]);
+                        let cell = ri * LUT_SIZE * LUT_SIZE + gi * LUT_SIZE + bi;
+                        let wc = wcount[cell];
+                        if wc > 0.0 {
+                            lut.set(ri, gi, bi, [
+                                (wsum[cell * 3]     / wc) as f32,
+                                (wsum[cell * 3 + 1] / wc) as f32,
+                                (wsum[cell * 3 + 2] / wc) as f32,
+                            ]);
+                            populated.push([ri, gi, bi]);
+                        } else {
+                            empty.push([ri, gi, bi]);
+                        }
                     }
                 }
             }
+
+            if !populated.is_empty() && !empty.is_empty() {
+                let filled: Vec<([usize; 3], [usize; 3])> = empty
+                    .par_iter()
+                    .map(|ec| find_nearest(ec, &populated))
+                    .collect();
+                for (ec, best_pop) in filled {
+                    let val = lut.get(best_pop[0], best_pop[1], best_pop[2]);
+                    lut.set(ec[0], ec[1], ec[2], val);
+                }
+            } else if populated.is_empty() {
+                for ri in 0..LUT_SIZE {
+                    for gi in 0..LUT_SIZE {
+                        for bi in 0..LUT_SIZE {
+                            let r = ri as f32 / (LUT_SIZE - 1) as f32;
+                            let g = gi as f32 / (LUT_SIZE - 1) as f32;
+                            let b = bi as f32 / (LUT_SIZE - 1) as f32;
+                            lut.set(ri, gi, bi, [r, g, b]);
+                        }
+                    }
+                }
+            }
+
+            luts.push(lut);
         }
 
-        // NO Gaussian smoothing (σ=0)
-        luts.push(lut);
+        DepthLuts::new(luts, self.zone_boundaries)
+    }
+}
+
+/// Build depth-stratified LUTs from keyframe data.
+///
+/// Returns `DepthLuts` with `N_DEPTH_ZONES` zones, σ=0 (no Gaussian smoothing), NN fill.
+pub fn build_depth_luts(keyframes: &[KeyframeData]) -> DepthLuts {
+    // I7: validate that all keyframe slices have consistent lengths.
+    for (i, kd) in keyframes.iter().enumerate() {
+        assert_eq!(kd.original.len(), kd.target.len(),     "keyframe {i}: original and target length mismatch");
+        assert_eq!(kd.original.len(), kd.depth.len(),      "keyframe {i}: original and depth length mismatch");
+        assert_eq!(kd.original.len(), kd.importance.len(), "keyframe {i}: original and importance length mismatch");
     }
 
-    DepthLuts::new(luts, zone_boundaries)
+    let all_depths: Vec<f32> = keyframes.iter().flat_map(|kd| kd.depth.iter().cloned()).collect();
+    let zone_boundaries = adaptive_zone_boundaries(&all_depths, N_DEPTH_ZONES);
+
+    let mut builder = StreamingLutBuilder::new(zone_boundaries);
+    for kd in keyframes {
+        builder.add_frame(&kd.original, &kd.target, &kd.depth, &kd.importance);
+    }
+    builder.finish()
 }
 
 #[cfg(test)]
