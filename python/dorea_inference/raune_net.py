@@ -108,3 +108,28 @@ class RauneNetInference:
         out = ((out.squeeze(0) + 1.0) / 2.0).clamp(0.0, 1.0)
         result = (out.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         return result
+
+    def infer_gpu(self, img_rgb: np.ndarray, max_size: int = 1024) -> "torch.Tensor":
+        """Run RAUNE-Net, return on-device uint8 tensor (not copied to CPU).
+
+        Returns a 3D uint8 CUDA tensor (HxWx3) at inference resolution.
+        The caller must keep a reference to prevent GC.
+        """
+        import torch
+        import torchvision.transforms as transforms
+        from PIL import Image as _Image
+
+        pil = _Image.fromarray(img_rgb)
+        resized, tw, th = _resize_maintain_aspect(pil, max_size)
+
+        normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        tensor = normalize(transforms.ToTensor()(resized)).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            out = self.model(tensor)
+
+        # De-normalize: model output in [-1, 1], convert to [0, 255] uint8
+        out = ((out.squeeze(0) + 1.0) / 2.0).clamp(0.0, 1.0)
+        result = (out.permute(1, 2, 0) * 255).to(torch.uint8).contiguous()
+
+        return result  # stays on device

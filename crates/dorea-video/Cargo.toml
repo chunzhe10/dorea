@@ -11,3 +11,9 @@ serde = { workspace = true }
 serde_json = "1"
 base64 = "0.22"
 flate2 = "1"
+pyo3 = { version = "0.22", optional = true }
+numpy = { version = "0.22", optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:numpy"]

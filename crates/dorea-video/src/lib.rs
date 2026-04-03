@@ -10,5 +10,6 @@
 
 pub mod ffmpeg;
 pub mod inference;
+mod inference_subprocess;
 pub mod resize;
 pub mod scene;
