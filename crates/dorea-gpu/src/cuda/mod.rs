@@ -457,7 +457,7 @@ mod tests {
             h_offset: 0.0,
             s_ratio: 1.0,
             v_offset: 0.0,
-            weight: 0.0,
+            weight: 0.0, // weight=0 → qualifier inactive, HSL stage is pass-through in tests
         }]);
         Calibration::new(depth_luts, hsl, 1)
     }
@@ -490,6 +490,7 @@ mod tests {
 
         assert_eq!(out1.len(), out2.len(), "output length must be identical between runs");
         for (i, (a, b)) in out1.iter().zip(out2.iter()).enumerate() {
+            assert!(a.is_finite(), "output[{i}] is not finite: {a}");
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
