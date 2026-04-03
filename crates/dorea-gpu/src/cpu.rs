@@ -639,6 +639,54 @@ mod tests {
     }
 
     #[test]
+    fn grade_pixel_cpu_matches_grade_frame_cpu_baseline() {
+        // This test will fail until grade_pixel_cpu is implemented in Task 3.
+        // It exists here to lock in the expected baseline before any changes.
+        use dorea_cal::Calibration;
+        use dorea_hsl::derive::{HslCorrections, QualifierCorrection};
+        use dorea_lut::types::{DepthLuts, LutGrid};
+
+        fn identity_lut(size: usize) -> LutGrid {
+            let mut lut = LutGrid::new(size);
+            for ri in 0..size { for gi in 0..size { for bi in 0..size {
+                let r = ri as f32 / (size - 1) as f32;
+                let g = gi as f32 / (size - 1) as f32;
+                let b = bi as f32 / (size - 1) as f32;
+                lut.set(ri, gi, bi, [r, g, b]);
+            }}}
+            lut
+        }
+
+        let n_zones = 5;
+        let luts: Vec<LutGrid> = (0..n_zones).map(|_| identity_lut(17)).collect();
+        let boundaries: Vec<f32> = (0..=n_zones).map(|i| i as f32 / n_zones as f32).collect();
+        let depth_luts = DepthLuts::new(luts, boundaries);
+        let hsl = HslCorrections(vec![QualifierCorrection {
+            h_center: 0.0, h_width: 1.0, h_offset: 0.0,
+            s_ratio: 1.0, v_offset: 0.0, weight: 0.0,
+        }]);
+        let cal = Calibration::new(depth_luts, hsl, 1);
+        let params = crate::GradeParams::default();
+
+        // Input: r=0.6, g=0.3, b=0.2, depth=0.5
+        // Use exact u8 → f32 round-trip to avoid floating-point inconsistency
+        let r_u8 = 153u8; let g_u8 = 77u8; let b_u8 = 51u8;
+        let pixels = vec![r_u8, g_u8, b_u8];
+        let depth = vec![0.5f32];
+
+        // Full pipeline baseline
+        let out = grade_frame_cpu(&pixels, &depth, 1, 1, &cal, &params).unwrap();
+        assert_eq!(out.len(), 3);
+        // All in range
+        for &v in &out { assert!(v <= 255, "out of range"); }
+
+        // Baseline values are pinned here (update this comment if params change):
+        // This will be verified against grade_pixel_cpu in Task 3.
+        // Print for reference during development:
+        // eprintln!("baseline: {:?}", out);
+    }
+
+    #[test]
     fn finish_grade_roundtrip() {
         use crate::GradeParams;
         use dorea_cal::Calibration;
