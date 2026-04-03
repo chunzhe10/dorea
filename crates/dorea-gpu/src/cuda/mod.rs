@@ -76,7 +76,19 @@ impl CudaGrader {
         width: usize,
         height: usize,
     ) -> Result<Vec<u8>, GpuError> {
-        let n = width * height;
+        let n = width.checked_mul(height).ok_or_else(|| {
+            GpuError::InvalidInput("frame dimensions overflow usize".into())
+        })?;
+        if pixels.len() != n * 3 {
+            return Err(GpuError::InvalidInput(format!(
+                "pixels len {} != width*height*3 {}", pixels.len(), n * 3
+            )));
+        }
+        if depth.len() != n {
+            return Err(GpuError::InvalidInput(format!(
+                "depth len {} != width*height {}", depth.len(), n
+            )));
+        }
         let dev = &self.device;
 
         // Upload inputs
