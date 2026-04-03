@@ -124,6 +124,40 @@ pub fn grade_frame(
     }
 }
 
+/// Grade multiple frames using a `CudaGrader` pre-allocated for `(width, height)`.
+///
+/// Creates a `CudaGrader::with_capacity(width, height)` once, then processes
+/// all frames in sequence. All frames must have the same `(width, height)`.
+///
+/// Returns a `Vec<Vec<u8>>` of graded sRGB u8 frames in the same order as input.
+/// Returns `GpuError::InvalidInput` if any frame's pixels or depth slice has wrong length.
+#[cfg(feature = "cuda")]
+pub fn grade_frames_with_capacity(
+    frames: &[(&[u8], &[f32])],   // (pixels, depth) per frame
+    width: usize,
+    height: usize,
+    calibration: &Calibration,
+    params: &GradeParams,
+) -> Result<Vec<Vec<u8>>, GpuError> {
+    let grader = cuda::CudaGrader::with_capacity(width, height)?;
+    frames
+        .iter()
+        .map(|(pixels, depth)| {
+            let mut rgb_f32 = grader.grade_frame_cuda(pixels, depth, width, height, calibration, params)?;
+            Ok(cpu::finish_grade(
+                &mut rgb_f32,
+                pixels,
+                depth,
+                width,
+                height,
+                params,
+                calibration,
+                true,
+            ))
+        })
+        .collect()
+}
+
 /// Grade a single frame reusing an existing `CudaGrader`.
 ///
 /// Avoids repeated PTX loading when processing multiple frames. The caller

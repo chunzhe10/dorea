@@ -45,6 +45,7 @@ pub struct CudaGrader {
     device: Arc<CudaDevice>,
     res_bufs: RefCell<Option<ResolutionBuffers>>,
     cal_bufs: RefCell<Option<CalibrationBuffers>>,
+    capacity: Option<(usize, usize)>,   // Some((max_w, max_h)) if with_capacity
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
@@ -90,8 +91,28 @@ impl CudaGrader {
             device,
             res_bufs: RefCell::new(None),
             cal_bufs: RefCell::new(None),
+            capacity: None,
             _not_send: std::marker::PhantomData,
         })
+    }
+
+    /// Create a `CudaGrader` with pre-allocated device buffers for `max_w × max_h`.
+    ///
+    /// Unlike `new()`, the resolution buffers are allocated immediately rather than
+    /// on the first frame. This guarantees zero `cudaMalloc` calls even on the very
+    /// first frame processed, at the cost of upfront VRAM usage.
+    ///
+    /// `grade_frame_cuda` called with a frame larger than `(max_w, max_h)` will
+    /// return `GpuError::InvalidInput`.
+    pub fn with_capacity(max_w: usize, max_h: usize) -> Result<Self, GpuError> {
+        let mut grader = Self::new()?;
+        // Pre-allocate ResolutionBuffers immediately.
+        {
+            let mut guard = grader.res_bufs.borrow_mut();
+            *guard = Some(alloc_resolution_buffers(&grader.device, max_w, max_h)?);
+        }
+        grader.capacity = Some((max_w, max_h));
+        Ok(grader)
     }
 
     /// Run the GPU grading pipeline: LUT apply -> HSL correct -> clarity.
@@ -120,6 +141,15 @@ impl CudaGrader {
             return Err(GpuError::InvalidInput(format!(
                 "depth len {} != width*height {}", depth.len(), n
             )));
+        }
+
+        // If constructed with_capacity, reject frames that exceed the pre-allocated size.
+        if let Some((cap_w, cap_h)) = self.capacity {
+            if width > cap_w || height > cap_h {
+                return Err(GpuError::InvalidInput(format!(
+                    "frame {}×{} exceeds with_capacity {}×{}", width, height, cap_w, cap_h
+                )));
+            }
         }
 
         // --- Calibration shape ---
@@ -618,6 +648,62 @@ mod tests {
                 expected_len,
                 "output length for {n_zones}-zone calibration should be {expected_len}, got {}",
                 out.len()
+            );
+        }
+    }
+
+    /// `CudaGrader::with_capacity` must reject frames that exceed the pre-allocated dimensions.
+    ///
+    /// A grader created for 640×480 must return `GpuError::InvalidInput` when given
+    /// a 1280×720 frame (which exceeds both dimensions).
+    #[test]
+    fn with_capacity_rejects_oversized_frame() {
+        let grader = CudaGrader::with_capacity(640, 480)
+            .expect("CudaGrader::with_capacity(640, 480) failed");
+        let cal = make_calibration(5);
+        let params = GradeParams::default();
+        // Frame is 1280×720 — larger than 640×480 in both dimensions.
+        let (pixels, depth) = make_frame(1280, 720);
+
+        let result = grader.grade_frame_cuda(&pixels, &depth, 1280, 720, &cal, &params);
+
+        match result {
+            Err(GpuError::InvalidInput(_)) => { /* expected */ }
+            Ok(_) => panic!("expected GpuError::InvalidInput but got Ok"),
+            Err(e) => panic!("expected GpuError::InvalidInput but got: {e}"),
+        }
+    }
+
+    /// `grade_frames_with_capacity` must process a batch of frames and return correctly-sized output.
+    ///
+    /// Two 1280×720 frames processed in a single call must each produce `1280*720*3` bytes.
+    #[test]
+    fn grade_frames_with_capacity_batches_correctly() {
+        use crate::grade_frames_with_capacity;
+
+        let cal = make_calibration(5);
+        let params = GradeParams::default();
+        let (w, h) = (1280, 720);
+
+        let (pixels_a, depth_a) = make_frame(w, h);
+        let (pixels_b, depth_b) = make_frame(w, h);
+
+        let frames: &[(&[u8], &[f32])] = &[
+            (pixels_a.as_slice(), depth_a.as_slice()),
+            (pixels_b.as_slice(), depth_b.as_slice()),
+        ];
+
+        let results = grade_frames_with_capacity(frames, w, h, &cal, &params)
+            .expect("grade_frames_with_capacity failed");
+
+        assert_eq!(results.len(), 2, "expected 2 output frames");
+        let expected_len = w * h * 3;
+        for (i, frame) in results.iter().enumerate() {
+            assert_eq!(
+                frame.len(),
+                expected_len,
+                "frame {i} output length should be {expected_len}, got {}",
+                frame.len()
             );
         }
     }
