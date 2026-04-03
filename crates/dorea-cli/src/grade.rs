@@ -303,6 +303,11 @@ pub fn run(args: GradeArgs) -> Result<()> {
     }
     log::info!("Batch depth inference complete ({} keyframes)", keyframes.len());
 
+    // Shut down inference server before pass 2 — all depths are cached in keyframe_depths.
+    // Releasing Depth Anything V2 VRAM (~1.5 GB) here avoids contention with NVENC input
+    // buffer allocation on RTX 3060 (6 GB VRAM).
+    let _ = inf_server.shutdown();
+
     // Ordered list of (frame_index, scene_cut_before) for pass-2 lerp lookup.
     let kf_index_list: Vec<(u64, bool)> = keyframes.iter()
         .map(|kf| (kf.frame_index, kf.scene_cut_before))
@@ -375,7 +380,6 @@ pub fn run(args: GradeArgs) -> Result<()> {
         }
     }
 
-    let _ = inf_server.shutdown();
     encoder.finish().context("ffmpeg encoder failed to finalize")?;
 
     if info.frame_count > 0 && frame_count < info.frame_count {
