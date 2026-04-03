@@ -14,6 +14,13 @@ thiserror.workspace = true
 
 cudarc = { version = "0.12", features = ["driver", "nvrtc", "dynamic-linking", "cuda-12040"] }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "grade_bench"
+harness = false
+
 [features]
 # Declared so Cargo recognises `#[cfg(feature = "cuda")]` as a valid condition.
 # Activation is driven by build.rs (nvcc detection), NOT by Cargo feature flags.
