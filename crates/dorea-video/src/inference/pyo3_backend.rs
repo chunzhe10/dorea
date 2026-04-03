@@ -97,6 +97,8 @@ impl Drop for DepthTensorGuard {
 /// This struct is `!Send + !Sync` because Python's GIL requires single-threaded
 /// access patterns. All calls must happen on the thread that created the server.
 pub struct InferenceServer {
+    /// Cached bridge module — avoids re-importing on every inference call.
+    bridge: Py<PyModule>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -153,6 +155,7 @@ impl InferenceServer {
             }
 
             Ok(Self {
+                bridge: bridge.unbind(),
                 _not_send: PhantomData,
             })
         })
@@ -171,8 +174,7 @@ impl InferenceServer {
         max_size: usize,
     ) -> Result<(Vec<f32>, usize, usize), InferenceError> {
         Python::with_gil(|py| {
-            let bridge = py.import_bound("dorea_inference.bridge")
-                .map_err(|e| InferenceError::Ipc(format!("import bridge: {e}")))?;
+            let bridge = self.bridge.bind(py);
 
             // Create numpy array from raw RGB bytes.
             let np_flat = numpy::PyArray1::from_slice_bound(py, image_rgb);
@@ -217,8 +219,7 @@ impl InferenceServer {
         max_size: usize,
     ) -> Result<(Vec<u8>, usize, usize), InferenceError> {
         Python::with_gil(|py| {
-            let bridge = py.import_bound("dorea_inference.bridge")
-                .map_err(|e| InferenceError::Ipc(format!("import bridge: {e}")))?;
+            let bridge = self.bridge.bind(py);
 
             // Create numpy array from raw RGB bytes.
             let np_flat = numpy::PyArray1::from_slice_bound(py, image_rgb);
@@ -263,8 +264,7 @@ impl InferenceServer {
         max_size: usize,
     ) -> Result<DepthTensorGuard, InferenceError> {
         Python::with_gil(|py| {
-            let bridge = py.import_bound("dorea_inference.bridge")
-                .map_err(|e| InferenceError::Ipc(format!("import bridge: {e}")))?;
+            let bridge = self.bridge.bind(py);
 
             let np_flat = numpy::PyArray1::from_slice_bound(py, image_rgb);
             let np_reshaped = np_flat.call_method1("reshape", ((height, width, 3),))
@@ -337,8 +337,7 @@ impl InferenceServer {
     /// Query free VRAM in bytes (calls Python bridge.vram_free_bytes()).
     pub fn vram_free_bytes(&self) -> Result<usize, InferenceError> {
         Python::with_gil(|py| {
-            let bridge = py.import_bound("dorea_inference.bridge")
-                .map_err(|e| InferenceError::Ipc(format!("import bridge: {e}")))?;
+            let bridge = self.bridge.bind(py);
             let result = bridge.call_method0("vram_free_bytes")
                 .map_err(|e| InferenceError::Ipc(format!("vram_free_bytes: {e}")))?;
             let bytes: usize = result.extract()
@@ -350,8 +349,7 @@ impl InferenceServer {
     /// Graceful shutdown — unload Python models and release VRAM.
     pub fn shutdown(self) -> Result<(), InferenceError> {
         Python::with_gil(|py| {
-            let bridge = py.import_bound("dorea_inference.bridge")
-                .map_err(|e| InferenceError::InitFailed(format!("bridge import: {e}")))?;
+            let bridge = self.bridge.bind(py);
             bridge.call_method0("unload_models")
                 .map_err(|e| InferenceError::InitFailed(format!("unload_models: {e}")))?;
             Ok(())
