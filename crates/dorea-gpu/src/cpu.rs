@@ -244,6 +244,107 @@ pub(crate) fn finish_grade(
     rgb_f32.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect()
 }
 
+/// Grade a single pixel through the full CPU pipeline.
+///
+/// Equivalent to running `grade_frame_cpu` on a 1×1 frame with the given pixel,
+/// but without heap allocation. Used as a CPU oracle for combined LUT accuracy tests,
+/// and mirrors the logic in `grade_pixel_device` (grade_pixel.cuh).
+///
+/// Returns graded f32 RGB [0,1] (caller converts to u8 as needed).
+pub fn grade_pixel_cpu(
+    r: f32, g: f32, b: f32,
+    depth: f32,
+    calibration: &Calibration,
+    params: &GradeParams,
+) -> [f32; 3] {
+    use dorea_lut::apply::apply_depth_luts;
+    use dorea_hsl::apply::apply_hsl_corrections;
+
+    // 1. Depth-stratified LUT apply
+    let lut_out = apply_depth_luts(&[[r, g, b]], &[depth], &calibration.depth_luts);
+    let [r1, g1, b1] = lut_out[0];
+
+    // 2. HSL qualifier corrections
+    let hsl_out = apply_hsl_corrections(&[[r1, g1, b1]], &calibration.hsl_corrections);
+    let [r2, g2, b2] = hsl_out[0];
+
+    // 3. Fused ambiance + warmth (single LAB roundtrip)
+    let mut px = [r2, g2, b2];
+    let warmth_factor = 1.0 + (params.warmth - 1.0) * 0.3;
+    let d = depth;
+
+    let (mut l_norm, mut a_ab, mut b_ab) = {
+        let (l, a, b_l) = dorea_color::lab::srgb_to_lab(px[0], px[1], px[2]);
+        (l / 100.0, a, b_l)
+    };
+
+    // Shadow lift
+    let lift_amount = 0.2 + 0.15 * d;
+    let toe = 0.15_f32;
+    let shadow_mask = ((toe - l_norm) / toe).clamp(0.0, 1.0);
+    l_norm += shadow_mask * lift_amount * toe;
+
+    // S-curve contrast
+    let contrast_strength = (0.3 + 0.3 * d) * params.contrast;
+    let slope = 4.0 + 4.0 * contrast_strength;
+    let s_curve = 1.0 / (1.0 + (-(l_norm - 0.5) * slope).exp());
+    l_norm += (s_curve - l_norm) * contrast_strength;
+
+    // Highlight compress
+    let compress = 0.4 + 0.2 * (1.0 - d);
+    let knee_h = 0.88_f32;
+    if l_norm > knee_h {
+        let over = l_norm - knee_h;
+        let headroom = 1.0 - knee_h;
+        l_norm = knee_h + headroom * ((over / headroom * (1.0 + compress)).tanh());
+    }
+
+    // Warmth (LAB a*/b* push)
+    let lum_weight = 4.0 * l_norm * (1.0 - l_norm);
+    a_ab += (1.0 + 5.0 * d) * lum_weight;
+    b_ab += 4.0 * d * lum_weight;
+
+    // Vibrance
+    let vibrance = 0.4 + 0.5 * d;
+    let chroma = (a_ab * a_ab + b_ab * b_ab + 1e-8).sqrt();
+    let chroma_norm = (chroma / 40.0).clamp(0.0, 1.0);
+    let boost = vibrance * (1.0 - chroma_norm) * (l_norm / 0.25).clamp(0.0, 1.0);
+    a_ab *= 1.0 + boost;
+    b_ab *= 1.0 + boost;
+
+    // User warmth scaling
+    if (warmth_factor - 1.0).abs() > 1e-4 {
+        a_ab *= warmth_factor;
+        b_ab *= warmth_factor;
+    }
+
+    // LAB → RGB
+    let l_out = (l_norm * 100.0).clamp(0.0, 100.0);
+    let a_out = a_ab.clamp(-128.0, 127.0);
+    let b_out_clamped = b_ab.clamp(-128.0, 127.0);
+    let (ro, go, bo) = dorea_color::lab::lab_to_srgb(l_out, a_out, b_out_clamped);
+
+    // Final highlight knee
+    let knee = 0.92_f32;
+    let apply_knee = |v: f32| -> f32 {
+        if v > knee { let over = v - knee; let room = 1.0 - knee; knee + room * ((over / room).tanh()) } else { v }
+    };
+
+    px[0] = apply_knee(ro).clamp(0.0, 1.0);
+    px[1] = apply_knee(go).clamp(0.0, 1.0);
+    px[2] = apply_knee(bo).clamp(0.0, 1.0);
+
+    // 4. Strength blend with original input
+    let strength = params.strength;
+    if strength < 1.0 - 1e-4 {
+        px[0] = r * (1.0 - strength) + px[0] * strength;
+        px[1] = g * (1.0 - strength) + px[1] * strength;
+        px[2] = b * (1.0 - strength) + px[2] * strength;
+    }
+
+    px
+}
+
 /// Full CPU grading pipeline: LUT apply → HSL correct → depth_aware_ambiance → user params.
 pub fn grade_frame_cpu(
     pixels: &[u8],
@@ -470,6 +571,57 @@ mod tests {
         // This will be verified against grade_pixel_cpu in Task 3.
         // Print for reference during development:
         // eprintln!("baseline: {:?}", out);
+    }
+
+    #[test]
+    fn grade_pixel_cpu_matches_grade_frame_cpu() {
+        use dorea_cal::Calibration;
+        use dorea_hsl::derive::{HslCorrections, QualifierCorrection};
+        use dorea_lut::types::{DepthLuts, LutGrid};
+
+        fn identity_lut(size: usize) -> LutGrid {
+            let mut lut = LutGrid::new(size);
+            for ri in 0..size { for gi in 0..size { for bi in 0..size {
+                let r = ri as f32 / (size - 1) as f32;
+                let g = gi as f32 / (size - 1) as f32;
+                let b = bi as f32 / (size - 1) as f32;
+                lut.set(ri, gi, bi, [r, g, b]);
+            }}}
+            lut
+        }
+
+        let n_zones = 5;
+        let luts: Vec<LutGrid> = (0..n_zones).map(|_| identity_lut(17)).collect();
+        let boundaries: Vec<f32> = (0..=n_zones).map(|i| i as f32 / n_zones as f32).collect();
+        let cal = Calibration::new(
+            DepthLuts::new(luts, boundaries),
+            HslCorrections(vec![QualifierCorrection {
+                h_center: 0.0, h_width: 1.0, h_offset: 0.0,
+                s_ratio: 1.0, v_offset: 0.0, weight: 0.0,
+            }]),
+            1,
+        );
+        let params = crate::GradeParams::default();
+
+        let r_u8 = 153u8; let g_u8 = 77u8; let b_u8 = 51u8;
+        let pixels = vec![r_u8, g_u8, b_u8];
+        let depth_val = 0.5f32;
+        let depth = vec![depth_val];
+
+        // Full pipeline
+        let frame_out = grade_frame_cpu(&pixels, &depth, 1, 1, &cal, &params).unwrap();
+
+        // Single-pixel path (uses same u8-rounded inputs)
+        let r_f32 = r_u8 as f32 / 255.0;
+        let g_f32 = g_u8 as f32 / 255.0;
+        let b_f32 = b_u8 as f32 / 255.0;
+        let px_out = grade_pixel_cpu(r_f32, g_f32, b_f32, depth_val, &cal, &params);
+        let r_out = (px_out[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+        let g_out = (px_out[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+        let b_out = (px_out[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+
+        assert_eq!([r_out, g_out, b_out], [frame_out[0], frame_out[1], frame_out[2]],
+            "grade_pixel_cpu must match grade_frame_cpu to within 1/255 rounding");
     }
 
     #[test]
