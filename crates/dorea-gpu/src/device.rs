@@ -78,10 +78,9 @@ pub fn per_frame_vram_bytes(width: usize, height: usize) -> usize {
     let lut_budget = 5 * 33 * 33 * 33 * 3 * 4;  // 5 zones × 33³ × 3ch × 4 bytes ≈ 22 MB
     let proxy_f32 = proxy_n * 4; // one proxy L plane
 
-    // Peak during LUT stage: d_rgb_in + d_depth + d_luts + d_rgb_after_lut
-    // Peak during clarity: d_rgb_after_hsl + d_proxy_l + d_blur_a + d_blur_b + d_rgb_out
-    // Conservative: 3 RGB planes + depth + LUT budget + 3 proxy planes
-    3 * rgb_f32 + depth_f32 + lut_budget + 3 * proxy_f32
+    // With pre-allocated buffers: d_rgb_in + d_rgb_after_lut + d_rgb_after_hsl + d_rgb_out held simultaneously.
+    // Conservative: 4 RGB planes + depth + LUT budget + 3 proxy planes
+    4 * rgb_f32 + depth_f32 + lut_budget + 3 * proxy_f32
 }
 
 /// Verify that the CUDA context is healthy by performing a tiny allocation.
@@ -125,7 +124,7 @@ mod tests {
             let depth_f32 = n * 4;
             let lut_budget = 5 * 33 * 33 * 33 * 3 * 4;
             let proxy_f32 = proxy_n * 4;
-            let expected = 3 * rgb_f32 + depth_f32 + lut_budget + 3 * proxy_f32;
+            let expected = 4 * rgb_f32 + depth_f32 + lut_budget + 3 * proxy_f32;
             assert_eq!(bytes, expected, "per_frame_vram_bytes mismatch");
         }
     }
