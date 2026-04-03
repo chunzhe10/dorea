@@ -139,6 +139,9 @@ pub fn grade_frames_with_capacity(
     calibration: &Calibration,
     params: &GradeParams,
 ) -> Result<Vec<Vec<u8>>, GpuError> {
+    if frames.is_empty() {
+        return Ok(vec![]);
+    }
     let grader = cuda::CudaGrader::with_capacity(width, height)?;
     frames
         .iter()

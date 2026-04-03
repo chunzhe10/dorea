@@ -102,8 +102,9 @@ impl CudaGrader {
     /// on the first frame. This guarantees zero `cudaMalloc` calls even on the very
     /// first frame processed, at the cost of upfront VRAM usage.
     ///
-    /// `grade_frame_cuda` called with a frame larger than `(max_w, max_h)` will
-    /// return `GpuError::InvalidInput`.
+    /// Every call to `grade_frame_cuda` on this grader must pass a frame whose
+    /// dimensions exactly match `(max_w, max_h)`. Any frame that does not exactly
+    /// match — whether smaller or larger — will return `GpuError::InvalidInput`.
     pub fn with_capacity(max_w: usize, max_h: usize) -> Result<Self, GpuError> {
         let mut grader = Self::new()?;
         // Pre-allocate ResolutionBuffers immediately.
@@ -143,11 +144,12 @@ impl CudaGrader {
             )));
         }
 
-        // If constructed with_capacity, reject frames that exceed the pre-allocated size.
+        // If constructed with_capacity, reject any frame that doesn't exactly match the
+        // pre-allocated size — ensuring the zero-cudaMalloc guarantee holds.
         if let Some((cap_w, cap_h)) = self.capacity {
-            if width > cap_w || height > cap_h {
+            if width != cap_w || height != cap_h {
                 return Err(GpuError::InvalidInput(format!(
-                    "frame {}×{} exceeds with_capacity {}×{}", width, height, cap_w, cap_h
+                    "frame {}×{} does not match with_capacity {}×{}", width, height, cap_w, cap_h
                 )));
             }
         }
@@ -685,8 +687,11 @@ mod tests {
         let params = GradeParams::default();
         let (w, h) = (1280, 720);
 
-        let (pixels_a, depth_a) = make_frame(w, h);
-        let (pixels_b, depth_b) = make_frame(w, h);
+        let n = w * h;
+        let pixels_a: Vec<u8> = (0..n * 3).map(|i| ((i * 7 + 128) % 256) as u8).collect();
+        let depth_a: Vec<f32> = (0..n).map(|i| (i as f32) / n as f32 * 0.8 + 0.1).collect();
+        let pixels_b: Vec<u8> = (0..n * 3).map(|i| ((i * 13 + 64) % 256) as u8).collect();
+        let depth_b: Vec<f32> = (0..n).map(|i| (i as f32) / n as f32 * 0.5 + 0.3).collect();
 
         let frames: &[(&[u8], &[f32])] = &[
             (pixels_a.as_slice(), depth_a.as_slice()),
@@ -706,5 +711,6 @@ mod tests {
                 frame.len()
             );
         }
+        assert_ne!(results[0], results[1], "two distinct frames should produce distinct outputs");
     }
 }
