@@ -46,6 +46,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=PATH");
 
+    // Tell rustc that "cuda" is a valid feature value (suppresses unexpected_cfgs warning)
+    println!("cargo:rustc-check-cfg=cfg(feature, values(\"cuda\"))");
+
     if nvcc_available() {
         println!("cargo:warning=Found nvcc — enabling CUDA grader reuse in dorea-cli");
         println!("cargo:rustc-cfg=feature=\"cuda\"");
