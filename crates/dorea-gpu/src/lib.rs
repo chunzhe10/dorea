@@ -98,19 +98,19 @@ pub fn grade_frame(
                     }
                     Err(e) => {
                         log::warn!("CUDA grading failed: {e} — falling back to CPU");
-                        return Ok(cpu::grade_frame_cpu(
+                        return cpu::grade_frame_cpu(
                             pixels, depth, width, height, calibration, params,
                         )
-                        .map_err(|e| GpuError::CudaFail(e))?);
+                        .map_err(GpuError::CudaFail);
                     }
                 }
             }
             Err(GpuError::ModuleLoad(msg)) => {
                 log::error!("CUDA module load failed: {msg} — using CPU for all frames");
-                return Ok(cpu::grade_frame_cpu(
+                return cpu::grade_frame_cpu(
                     pixels, depth, width, height, calibration, params,
                 )
-                .map_err(|e| GpuError::CudaFail(e))?);
+                .map_err(GpuError::CudaFail);
             }
             Err(e) => return Err(e),
         }

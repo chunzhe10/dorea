@@ -402,7 +402,7 @@ fn map_cudarc_error(e: cudarc::driver::result::DriverError) -> GpuError {
 /// Integer ceiling division.
 #[cfg(feature = "cuda")]
 fn div_ceil(a: u32, b: u32) -> u32 {
-    (a + b - 1) / b
+    a.div_ceil(b)
 }
 
 /// Compute proxy dimensions: scale so the long edge <= max_size.
