@@ -107,3 +107,34 @@ class DepthAnythingInference:
             depth = ((depth - d_min) / (d_max - d_min)).astype(np.float32)
 
         return depth
+
+    def infer_gpu(self, img_rgb: np.ndarray, max_size: int = 518) -> "torch.Tensor":
+        """Run depth estimation, return on-device f32 tensor (not copied to CPU).
+
+        Returns a 2D float32 CUDA tensor normalized to [0, 1] at inference resolution.
+        The caller must keep a reference to prevent GC.
+        """
+        import torch
+        from PIL import Image as _Image
+
+        pil = _Image.fromarray(img_rgb)
+        capped = _resize_for_depth(pil, max_size)
+
+        # Direct tensor construction — bypass AutoImageProcessor
+        arr = np.array(capped).astype(np.float32) / 255.0
+        arr = (arr - self._MEAN) / self._STD
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(pixel_values=tensor)
+
+        depth = outputs.predicted_depth.squeeze(0)  # stays on device
+
+        d_min = float(depth.min())
+        d_max = float(depth.max())
+        if d_max - d_min < 1e-6:
+            depth = torch.zeros_like(depth)
+        else:
+            depth = (depth - d_min) / (d_max - d_min)
+
+        return depth.to(torch.float32).contiguous()
