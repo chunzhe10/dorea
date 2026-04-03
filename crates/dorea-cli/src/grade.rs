@@ -12,10 +12,6 @@ use dorea_video::inference::{InferenceConfig, InferenceServer};
 
 #[cfg(feature = "cuda")]
 use dorea_gpu::cuda::CudaGrader;
-#[cfg(feature = "cuda")]
-use dorea_gpu::batcher::AdaptiveBatcher;
-#[cfg(feature = "cuda")]
-use dorea_gpu::GpuError;
 
 #[derive(Args, Debug)]
 pub struct GradeArgs {
@@ -264,9 +260,6 @@ pub fn run(args: GradeArgs) -> Result<()> {
             None
         }
     };
-    #[cfg(feature = "cuda")]
-    let mut batcher = AdaptiveBatcher::fixed(args.depth_max_interval);
-
     // Decode and grade frames
     let frames = ffmpeg::decode_frames(&args.input, &info)
         .context("failed to spawn ffmpeg decoder")?;
@@ -342,27 +335,10 @@ pub fn run(args: GradeArgs) -> Result<()> {
             };
 
             #[cfg(feature = "cuda")]
-            let graded = {
-                match grade_with_grader(
-                    cuda_grader.as_ref(),
-                    &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-                ) {
-                    Ok(pixels) => {
-                        batcher.report_success();
-                        pixels
-                    }
-                    Err(GpuError::Oom(ref msg)) => {
-                        let at_min = batcher.report_oom();
-                        log::warn!("CUDA OOM on frame {} ({}){} — falling back to CPU",
-                            frame.index, msg,
-                            if at_min { ", already at minimum batch" } else { "" });
-                        dorea_gpu::cpu::grade_frame_cpu(
-                            &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-                        ).map_err(|e| anyhow::anyhow!("CPU fallback failed for frame {}: {e}", frame.index))?
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index)),
-                }
-            };
+            let graded = grade_with_grader(
+                cuda_grader.as_ref(),
+                &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
+            ).map_err(|e| anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index))?;
             #[cfg(not(feature = "cuda"))]
             let graded = grade_frame(
                 &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
