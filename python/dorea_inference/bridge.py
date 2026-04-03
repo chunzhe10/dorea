@@ -100,6 +100,17 @@ def run_raune_cpu(frame_rgb: np.ndarray, max_size: int = 1024) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Model lifecycle
+# ---------------------------------------------------------------------------
+
+def unload_models() -> None:
+    """Release model references so they can be garbage-collected."""
+    global _depth_model, _raune_model
+    _depth_model = None
+    _raune_model = None
+
+
+# ---------------------------------------------------------------------------
 # VRAM query (called by Rust for adaptive batching)
 # ---------------------------------------------------------------------------
 

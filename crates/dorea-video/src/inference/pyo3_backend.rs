@@ -10,22 +10,15 @@ use std::time::Duration;
 use thiserror::Error;
 
 use pyo3::prelude::*;
-use pyo3::conversion::ToPyObject;
 use pyo3::types::PyModule;
 
 /// Errors from the PyO3 inference backend.
 #[derive(Debug, Error)]
 pub enum InferenceError {
-    #[error("failed to spawn inference server: {0}")]
-    SpawnFailed(#[from] std::io::Error),
     #[error("IPC error: {0}")]
     Ipc(String),
     #[error("inference server error: {0}")]
     ServerError(String),
-    #[error("timeout waiting for inference server")]
-    Timeout,
-    #[error("PNG encode/decode error: {0}")]
-    ImageError(String),
     #[error("CUDA OOM during inference: {0}")]
     Oom(String),
     #[error("PyO3 initialization failed: {0}")]
@@ -68,7 +61,7 @@ impl Default for InferenceConfig {
 /// Guard that prevents Python's GC from reclaiming a GPU tensor while Rust
 /// holds the device pointer. Drop this guard when Rust is done with the pointer.
 pub struct DepthTensorGuard {
-    py_guard: Py<PyAny>,
+    pub(crate) py_guard: Py<PyAny>,
     /// Raw CUDA device pointer to the tensor data.
     pub data_ptr: usize,
     /// Number of elements in the tensor.
@@ -77,13 +70,24 @@ pub struct DepthTensorGuard {
     pub width: usize,
     /// Height of the depth map.
     pub height: usize,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl DepthTensorGuard {
-    /// Explicitly release the underlying Python TensorGuard, freeing the GPU tensor.
+    /// Explicitly release the underlying Python TensorGuard, freeing the GPU tensor early.
+    /// Dropping the guard also calls release automatically via the `Drop` impl.
     pub fn release(self) {
+        // Drop triggers the Drop impl which calls release().
+        drop(self);
+    }
+}
+
+impl Drop for DepthTensorGuard {
+    fn drop(&mut self) {
         Python::with_gil(|py| {
-            let _ = self.py_guard.call_method0(py, "release");
+            if let Err(e) = self.py_guard.call_method0(py, "release") {
+                log::warn!("TensorGuard.release() failed during drop: {e}");
+            }
         });
     }
 }
@@ -115,8 +119,15 @@ impl InferenceServer {
                 let path = sys.getattr("path")
                     .map_err(|e| InferenceError::InitFailed(format!("sys.path: {e}")))?;
                 let p_str = p.to_str().unwrap_or("");
-                path.call_method1("insert", (0, p_str))
-                    .map_err(|e| InferenceError::InitFailed(format!("sys.path.insert: {e}")))?;
+                let already_present = path
+                    .call_method1("__contains__", (p_str,))
+                    .map_err(|e| InferenceError::InitFailed(format!("sys.path.__contains__: {e}")))?
+                    .is_truthy()
+                    .map_err(|e| InferenceError::InitFailed(format!("sys.path.__contains__ truthy: {e}")))?;
+                if !already_present {
+                    path.call_method1("insert", (0, p_str))
+                        .map_err(|e| InferenceError::InitFailed(format!("sys.path.insert: {e}")))?;
+                }
             } else {
                 log::debug!(
                     "Could not derive python/ dir from binary path; \
@@ -152,7 +163,7 @@ impl InferenceServer {
     /// `image_rgb`: HxWx3 u8 array flattened row-major.
     /// Returns `(depth_f32, out_width, out_height)` at inference resolution.
     pub fn run_depth(
-        &mut self,
+        &self,
         _id: &str,
         image_rgb: &[u8],
         width: usize,
@@ -198,7 +209,7 @@ impl InferenceServer {
     /// `image_rgb`: HxWx3 u8 array flattened row-major.
     /// Returns the enhanced image as `(rgb_u8, out_width, out_height)`.
     pub fn run_raune(
-        &mut self,
+        &self,
         _id: &str,
         image_rgb: &[u8],
         width: usize,
@@ -244,7 +255,7 @@ impl InferenceServer {
     /// The tensor stays on the GPU until the guard is released or dropped,
     /// enabling zero-copy sharing with CUDA kernels.
     pub fn run_depth_gpu(
-        &mut self,
+        &self,
         _id: &str,
         image_rgb: &[u8],
         width: usize,
@@ -284,6 +295,7 @@ impl InferenceServer {
                 numel,
                 width: guard_width,
                 height: guard_height,
+                _not_send: std::marker::PhantomData,
             })
         })
     }
@@ -335,9 +347,15 @@ impl InferenceServer {
         })
     }
 
-    /// Graceful shutdown — no subprocess to kill, just return Ok.
+    /// Graceful shutdown — unload Python models and release VRAM.
     pub fn shutdown(self) -> Result<(), InferenceError> {
-        Ok(())
+        Python::with_gil(|py| {
+            let bridge = py.import_bound("dorea_inference.bridge")
+                .map_err(|e| InferenceError::InitFailed(format!("bridge import: {e}")))?;
+            bridge.call_method0("unload_models")
+                .map_err(|e| InferenceError::InitFailed(format!("unload_models: {e}")))?;
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -363,7 +381,7 @@ impl InferenceServer {
         device: &str,
     ) -> Result<(), InferenceError> {
         let py_model_path = match model_path {
-            Some(p) => p.to_object(py),
+            Some(p) => p.into_py(py),
             None => py.None(),
         };
         bridge.call_method1("load_depth_model", (py_model_path, device))
@@ -380,11 +398,11 @@ impl InferenceServer {
         models_dir: Option<&str>,
     ) -> Result<(), InferenceError> {
         let py_weights = match weights_path {
-            Some(p) => p.to_object(py),
+            Some(p) => p.into_py(py),
             None => py.None(),
         };
         let py_models_dir = match models_dir {
-            Some(p) => p.to_object(py),
+            Some(p) => p.into_py(py),
             None => py.None(),
         };
         bridge.call_method1("load_raune_model", (py_weights, device, py_models_dir))
@@ -416,5 +434,30 @@ impl InferenceServer {
         }
 
         InferenceError::ServerError(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upscale_depth_identity() {
+        let src = vec![0.1f32, 0.2, 0.3, 0.4];
+        let out = InferenceServer::upscale_depth(&src, 2, 2, 2, 2);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn upscale_depth_bilinear() {
+        let src = vec![0.0f32, 1.0, 0.0, 0.0];
+        let out = InferenceServer::upscale_depth(&src, 2, 2, 4, 4);
+        assert_eq!(out.len(), 16);
+        assert!(out[0] >= 0.0 && out[0] <= 1.0,
+                "output should be in [0,1], got {}", out[0]);
+        // Top-left of output should be close to top-left of input (0.0)
+        assert!(out[0] < 0.01, "expected ~0.0, got {}", out[0]);
+        // Top-right of output should be close to top-right of input (1.0)
+        assert!(out[3] > 0.9, "expected ~1.0, got {}", out[3]);
     }
 }
