@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Eliminate per-frame `cudaMalloc` overhead in `CudaGrader::grade_frame_cuda` by pre-allocating device buffers keyed by resolution and calibration shape, reusing them across frames.
+**Goal:** Eliminate per-frame `cudaMalloc` overhead in `CudaGrader::grade_frame_cuda` by pre-allocating device buffers keyed by resolution and calibration shape, reusing them across frames. Also add `CudaGrader::with_capacity(max_w, max_h)` for callers that know the maximum resolution upfront, enabling zero reallocation ever.
 
 **Architecture:** `CudaGrader` gains two `RefCell<Option<...>>` fields — `ResolutionBuffers` (8 slices, keyed by width×height) and `CalibrationBuffers` (6 slices, keyed by n_zones×lut_size). On each frame call, if the key matches the cached buffers they are reused via `htod_sync_copy_into` (copy only, no allocation); otherwise they are dropped and reallocated. Zero `cudaMalloc` calls per frame in steady state.
 
@@ -16,7 +16,8 @@
 
 | File | Change |
 |------|--------|
-| `crates/dorea-gpu/src/cuda/mod.rs` | All changes live here. Add structs, update `CudaGrader`, refactor `grade_frame_cuda`. |
+| `crates/dorea-gpu/src/cuda/mod.rs` | All changes live here. Add structs, update `CudaGrader`, refactor `grade_frame_cuda`, add `with_capacity`. |
+| `crates/dorea-gpu/src/lib.rs` | Expose `grade_frame_with_capacity` public wrapper for the new constructor. |
 
 No other files change.
 
@@ -820,7 +821,198 @@ git commit -m "fix(dorea-gpu): per_frame_vram_bytes accounts for 4 RGB planes af
 
 ---
 
-### Task 6: Run the benchmark and record the improvement
+### Task 6: Add `CudaGrader::with_capacity(max_w, max_h)` — zero reallocation ever
+
+**Files:**
+- Modify: `crates/dorea-gpu/src/cuda/mod.rs`
+- Modify: `crates/dorea-gpu/src/lib.rs`
+
+When the caller knows all frames will be at a fixed resolution (e.g. a pure-4K batch), this constructor pre-allocates `ResolutionBuffers` immediately so the very first frame also pays zero cudaMalloc cost. Frames larger than `(max_w, max_h)` return `GpuError::InvalidInput`.
+
+- [ ] **Step 1: Add `with_capacity` to `CudaGrader` in `cuda/mod.rs`**
+
+  Add the following method to the `impl CudaGrader` block, directly after `CudaGrader::new()`:
+
+```rust
+/// Create a `CudaGrader` with device buffers pre-allocated for `(max_w, max_h)`.
+///
+/// Use this when all frames in a session share one known resolution.
+/// The very first `grade_frame_cuda` call pays zero `cudaMalloc` cost.
+///
+/// Frames larger than `(max_w, max_h)` return `GpuError::InvalidInput`.
+pub fn with_capacity(max_w: usize, max_h: usize) -> Result<Self, GpuError> {
+    let device = CudaDevice::new(0).map_err(|e| {
+        GpuError::ModuleLoad(format!("CudaDevice::new(0) failed: {e}"))
+    })?;
+
+    device
+        .load_ptx(Ptx::from_src(LUT_APPLY_PTX), "lut_apply", &["lut_apply_kernel"])
+        .map_err(|e| GpuError::ModuleLoad(format!("load lut_apply PTX: {e}")))?;
+
+    device
+        .load_ptx(Ptx::from_src(HSL_CORRECT_PTX), "hsl_correct", &["hsl_correct_kernel"])
+        .map_err(|e| GpuError::ModuleLoad(format!("load hsl_correct PTX: {e}")))?;
+
+    device
+        .load_ptx(
+            Ptx::from_src(CLARITY_PTX),
+            "clarity",
+            &[
+                "clarity_extract_L_proxy",
+                "clarity_box_blur_rows",
+                "clarity_box_blur_cols",
+                "clarity_apply_kernel",
+            ],
+        )
+        .map_err(|e| GpuError::ModuleLoad(format!("load clarity PTX: {e}")))?;
+
+    let res_bufs = RefCell::new(Some(alloc_resolution_buffers(&device, max_w, max_h)?));
+
+    Ok(Self {
+        device,
+        res_bufs,
+        cal_bufs: RefCell::new(None),
+        _not_send: std::marker::PhantomData,
+    })
+}
+```
+
+- [ ] **Step 2: Add an oversized-frame guard at the top of `grade_frame_cuda`**
+
+  In the existing input-guard block (just after the `depth.len() != n` check), add:
+
+```rust
+// If buffers were pre-allocated with a fixed capacity, reject larger frames.
+{
+    let slot = self.res_bufs.borrow();
+    if let Some(ref b) = *slot {
+        if width > b.width || height > b.height {
+            return Err(GpuError::InvalidInput(format!(
+                "frame {}×{} exceeds pre-allocated capacity {}×{}",
+                width, height, b.width, b.height
+            )));
+        }
+    }
+}
+```
+
+  Note: this check is only relevant for `with_capacity`-constructed graders. For `new()`-constructed graders the slot starts as `None` so the check is a no-op on first call, and `res_bufs` will be (re-)allocated for the actual frame size.
+
+- [ ] **Step 3: Add a `grade_frame_with_capacity` public wrapper in `lib.rs`**
+
+  In `crates/dorea-gpu/src/lib.rs`, add after `grade_frame_with_grader`:
+
+```rust
+/// Grade a batch of frames at a known fixed resolution, with zero per-frame `cudaMalloc`.
+///
+/// Constructs a `CudaGrader` pre-allocated for `(width, height)` and grades all frames.
+/// Use this when all frames share one resolution; prefer `grade_frame_with_grader` for
+/// mixed-resolution sessions.
+///
+/// Each element of `frames` is `(pixels: &[u8], depth: &[f32])`.
+/// Returns a `Vec<Vec<u8>>` of graded frames in the same order.
+#[cfg(feature = "cuda")]
+pub fn grade_frames_with_capacity(
+    frames: &[(&[u8], &[f32])],
+    width: usize,
+    height: usize,
+    calibration: &Calibration,
+    params: &GradeParams,
+) -> Result<Vec<Vec<u8>>, GpuError> {
+    let grader = cuda::CudaGrader::with_capacity(width, height)?;
+    frames
+        .iter()
+        .map(|(pixels, depth)| {
+            grade_frame_with_grader(&grader, pixels, depth, width, height, calibration, params)
+        })
+        .collect()
+}
+```
+
+- [ ] **Step 4: Verify it compiles**
+
+```bash
+cd /workspaces/dorea-workspace/repos/dorea
+cargo check -p dorea-gpu 2>&1 | tail -20
+```
+
+Expected: no errors.
+
+- [ ] **Step 5: Add a test for `with_capacity`**
+
+  In the `#[cfg(all(test, feature = "cuda"))] mod tests` block added in Task 1, add:
+
+```rust
+/// with_capacity pre-allocates at construction; first frame costs zero cudaMalloc.
+/// Frames within capacity succeed; frames exceeding capacity return InvalidInput.
+#[test]
+fn with_capacity_rejects_oversized_frame() {
+    let (max_w, max_h) = (64, 36);
+    let grader = CudaGrader::with_capacity(max_w, max_h)
+        .expect("with_capacity failed — no GPU?");
+    let cal = make_calibration(3, 17);
+    let params = crate::GradeParams::default();
+
+    // Frame at capacity → OK
+    let pixels = make_pixels(max_w, max_h);
+    let depth = make_depth(max_w, max_h);
+    let out = grader
+        .grade_frame_cuda(&pixels, &depth, max_w, max_h, &cal, &params)
+        .expect("frame at capacity should succeed");
+    assert_eq!(out.len(), max_w * max_h * 3);
+
+    // Frame larger than capacity → InvalidInput
+    let big_pixels = make_pixels(128, 72);
+    let big_depth = make_depth(128, 72);
+    let err = grader
+        .grade_frame_cuda(&big_pixels, &big_depth, 128, 72, &cal, &params)
+        .expect_err("oversized frame must return Err");
+    assert!(
+        matches!(err, crate::GpuError::InvalidInput(_)),
+        "expected InvalidInput, got {err:?}"
+    );
+}
+
+/// grade_frames_with_capacity batches multiple same-resolution frames.
+#[test]
+fn grade_frames_with_capacity_batches_correctly() {
+    let (w, h) = (64, 36);
+    let cal = make_calibration(3, 17);
+    let params = crate::GradeParams::default();
+    let pixels = make_pixels(w, h);
+    let depth = make_depth(w, h);
+
+    let frames: Vec<(&[u8], &[f32])> = vec![(&pixels, &depth); 3];
+    let results = crate::grade_frames_with_capacity(&frames, w, h, &cal, &params)
+        .expect("batch grading failed");
+
+    assert_eq!(results.len(), 3);
+    for r in &results {
+        assert_eq!(r.len(), w * h * 3);
+        assert_eq!(r, &results[0], "all identical inputs must produce identical outputs");
+    }
+}
+```
+
+- [ ] **Step 6: Run the tests**
+
+```bash
+cd /workspaces/dorea-workspace/repos/dorea
+cargo test -p dorea-gpu --features cuda -- cuda::tests 2>&1 | tail -20
+```
+
+Expected: `with_capacity_rejects_oversized_frame` and `grade_frames_with_capacity_batches_correctly` PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/dorea-gpu/src/cuda/mod.rs crates/dorea-gpu/src/lib.rs
+git commit -m "feat(dorea-gpu): add CudaGrader::with_capacity for zero-reallocation fixed-resolution sessions"
+```
+
+---
+
+### Task 8: Run the benchmark and record the improvement
 
 **Files:**
 - No code changes — benchmark run only.
@@ -879,7 +1071,11 @@ Expected: `grading/with_grader/1080p` shows at least **80% reduction** from the 
 - ✅ Resolution-switch regression test → Task 1
 - ✅ Calibration-switch regression test → Task 1
 - ✅ `per_frame_vram_bytes` updated to 4 RGB planes → Task 5
-- ✅ Benchmark validation with ≥80% gate → Task 6
+- ✅ `CudaGrader::with_capacity(max_w, max_h)` for zero-reallocation sessions → Task 6
+- ✅ `grade_frames_with_capacity` public batch wrapper → Task 6
+- ✅ Oversized-frame guard in `grade_frame_cuda` → Task 6
+- ✅ Tests for `with_capacity` and `grade_frames_with_capacity` → Task 6
+- ✅ Benchmark validation with ≥80% gate → Task 8
 
 **Placeholder scan:** None found.
 
