@@ -122,7 +122,7 @@ impl CombinedLut {
             let lut_size_i32 = lut_size as i32;
             let n_zones_i32  = n_zones as i32;
             let total_i32    = total_threads as i32;
-            let mut args: [*mut std::ffi::c_void; 14] = unsafe { [
+            let mut args: [*mut std::ffi::c_void; 14] = [
                 (&d_build)   .as_kernel_param(),
                 (&d_luts)    .as_kernel_param(),
                 (&d_boundaries).as_kernel_param(),
@@ -137,7 +137,7 @@ impl CombinedLut {
                 lut_size_i32.as_kernel_param(),
                 n_zones_i32 .as_kernel_param(),
                 total_i32   .as_kernel_param(),
-            ] };
+            ];
             unsafe {
                 func.launch(cfg, &mut args[..])
             }.map_err(map_cudarc_error)?;
@@ -151,7 +151,7 @@ impl CombinedLut {
         let mut textures: Vec<CUtexObject> = Vec::with_capacity(n_zones);
 
         // Raw device pointer to the build buffer
-        let build_base: CUdeviceptr = unsafe { *d_build.device_ptr() };
+        let build_base: CUdeviceptr = *d_build.device_ptr();
         // Bytes per zone: N*N*N float4 = N*N*N * 4 * sizeof(f32)
         let zone_bytes = (n * n * n * 4 * std::mem::size_of::<f32>()) as u64;
         // Width in bytes for one row: N texels × float4 = N × 16 bytes
@@ -205,7 +205,7 @@ impl CombinedLut {
             // --- Create texture object (unnormalized coords, linear filter) ---
             let mut res_desc: CUDA_RESOURCE_DESC = unsafe { std::mem::zeroed() };
             res_desc.resType = CUresourcetype_enum::CU_RESOURCE_TYPE_ARRAY;
-            unsafe { res_desc.res.array.hArray = arr; }
+            res_desc.res.array.hArray = arr;
 
             let mut tex_desc: CUDA_TEXTURE_DESC = unsafe { std::mem::zeroed() };
             tex_desc.addressMode[0] = CUaddress_mode_enum::CU_TR_ADDRESS_MODE_CLAMP;
