@@ -19,6 +19,7 @@ image = "0.25"
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
+memmap2 = "0.9"
 
 [features]
 # Mirrors dorea-gpu: activated by build.rs (nvcc detection), not manually.
