@@ -10,6 +10,8 @@
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
+use std::cell::RefCell;
+#[cfg(feature = "cuda")]
 use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
 #[cfg(feature = "cuda")]
 use cudarc::nvrtc::Ptx;
@@ -41,6 +43,8 @@ const PROXY_MAX_SIZE: usize = 518;
 #[cfg(feature = "cuda")]
 pub struct CudaGrader {
     device: Arc<CudaDevice>,
+    res_bufs: RefCell<Option<ResolutionBuffers>>,
+    cal_bufs: RefCell<Option<CalibrationBuffers>>,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
@@ -84,6 +88,8 @@ impl CudaGrader {
 
         Ok(Self {
             device,
+            res_bufs: RefCell::new(None),
+            cal_bufs: RefCell::new(None),
             _not_send: std::marker::PhantomData,
         })
     }
