@@ -100,37 +100,37 @@ fn frame_mse(a: &[u8], b: &[u8]) -> f32 {
     (sum_sq / (n * 255.0 * 255.0)) as f32
 }
 
-/// Linearly interpolate between two graded u8 frames.
-fn lerp_graded(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
+/// Linearly interpolate between two f32 depth maps.
+fn lerp_depth(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
     let t = t.clamp(0.0, 1.0);
     a.iter().zip(b.iter())
-        .map(|(&va, &vb)| {
-            let v = va as f32 + (vb as f32 - va as f32) * t;
-            v.round().clamp(0.0, 255.0) as u8
-        })
+        .map(|(&va, &vb)| va + (vb - va) * t)
         .collect()
 }
 
-/// A buffered frame waiting to be output once the next keyframe is graded.
+/// A buffered frame waiting to be output once the next keyframe depth is available.
 struct BufferedFrame {
     index: u64,
+    pixels: Vec<u8>,
     width: usize,
     height: usize,
 }
 
-/// Write all buffered frames by interpolating between bracketing keyframe graded outputs.
+/// Flush buffered frames by interpolating depth between keyframes, then grading each
+/// frame's actual source pixels. Eliminates ghosting from pixel-wise RGB blending.
 ///
-/// When `graded_after` is `None`, all buffered frames get the `graded_before` output
-/// directly (no interpolation). Used for scene cuts and end-of-video.
-fn flush_buffer_graded(
+/// When `depth_after` is `None` (scene cuts / end-of-video), uses `depth_before` directly.
+fn flush_buffer_with_depth(
     buffer: &mut Vec<BufferedFrame>,
-    graded_before: &Option<Vec<u8>>,
-    graded_after: Option<&Vec<u8>>,
+    depth_before: &Option<Vec<f32>>,
+    depth_after: Option<&Vec<f32>>,
+    calibration: &Calibration,
+    params: &GradeParams,
     encoder: &mut FrameEncoder,
     frame_count: &mut u64,
     info: &ffmpeg::VideoInfo,
 ) -> Result<()> {
-    let Some(before) = graded_before else {
+    let Some(before) = depth_before else {
         buffer.clear();
         return Ok(());
     };
@@ -139,22 +139,19 @@ fn flush_buffer_graded(
     let interval = (n_buffered + 1) as f32;
 
     for (buf_idx, bf) in buffer.drain(..).enumerate() {
-        let output = if let Some(after) = graded_after {
+        // Interpolate depth, then grade the actual source frame
+        let depth = if let Some(after) = depth_after {
             let t = (buf_idx + 1) as f32 / interval;
-            lerp_graded(before, after, t)
+            lerp_depth(before, after, t)
         } else {
             before.clone()
         };
 
-        let expected = bf.width * bf.height * 3;
-        if output.len() != expected {
-            return Err(anyhow::anyhow!(
-                "Interpolated frame size mismatch at frame {}: got {}, expected {}",
-                bf.index, output.len(), expected
-            ));
-        }
+        let graded = grade_frame(
+            &bf.pixels, &depth, bf.width, bf.height, calibration, params,
+        ).map_err(|e| anyhow::anyhow!("Grading failed for buffered frame {}: {e}", bf.index))?;
 
-        encoder.write_frame(&output).context("encoder write failed")?;
+        encoder.write_frame(&graded).context("encoder write failed")?;
         *frame_count += 1;
 
         if *frame_count % 100 == 0 {
@@ -230,7 +227,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
 
     // Temporal interpolation state
     let mut last_keyframe_proxy: Option<Vec<u8>> = None;
-    let mut last_keyframe_graded: Option<Vec<u8>> = None;
+    let mut last_keyframe_depth: Option<Vec<f32>> = None;
     let mut frame_buffer: Vec<BufferedFrame> = Vec::new();
     let mut frames_since_keyframe = 0usize;
     let max_buffer = (args.depth_max_interval as f32 * 1.5) as usize;
@@ -263,9 +260,10 @@ pub fn run(args: GradeArgs) -> Result<()> {
 
             if is_scene_cut {
                 log::info!("Scene cut at frame {} (MSE={:.6}) — flushing buffer", frame.index, mse);
-                // Flush buffer using last keyframe graded output (no forward interp across cuts)
-                flush_buffer_graded(
-                    &mut frame_buffer, &last_keyframe_graded, None,
+                // Flush buffer using last keyframe depth (no forward interp across cuts)
+                flush_buffer_with_depth(
+                    &mut frame_buffer, &last_keyframe_depth, None,
+                    &calibration, &params,
                     &mut encoder, &mut frame_count, &info,
                 )?;
                 frames_since_keyframe = 0;
@@ -296,10 +294,11 @@ pub fn run(args: GradeArgs) -> Result<()> {
                 &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
             ).map_err(|e| anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index))?;
 
-            // Flush any buffered frames — interpolate between previous and this keyframe's graded output
+            // Flush any buffered frames — interpolate depth between previous and this keyframe
             if !frame_buffer.is_empty() {
-                flush_buffer_graded(
-                    &mut frame_buffer, &last_keyframe_graded, Some(&graded),
+                flush_buffer_with_depth(
+                    &mut frame_buffer, &last_keyframe_depth, Some(&depth),
+                    &calibration, &params,
                     &mut encoder, &mut frame_count, &info,
                 )?;
             }
@@ -315,12 +314,13 @@ pub fn run(args: GradeArgs) -> Result<()> {
 
             // Update keyframe state
             last_keyframe_proxy = Some(proxy_pixels);
-            last_keyframe_graded = Some(graded);
+            last_keyframe_depth = Some(depth);
             frames_since_keyframe = 0;
         } else {
-            // Buffer this frame — will be interpolated when next keyframe is graded
+            // Buffer this frame's pixels — will be graded with interpolated depth
             frame_buffer.push(BufferedFrame {
                 index: frame.index,
+                pixels: frame.pixels,
                 width: frame.width,
                 height: frame.height,
             });
@@ -328,10 +328,11 @@ pub fn run(args: GradeArgs) -> Result<()> {
         }
     }
 
-    // Flush any remaining buffered frames (end of video — use last keyframe, no interpolation)
+    // Flush any remaining buffered frames (end of video — use last keyframe depth)
     if !frame_buffer.is_empty() {
-        flush_buffer_graded(
-            &mut frame_buffer, &last_keyframe_graded, None,
+        flush_buffer_with_depth(
+            &mut frame_buffer, &last_keyframe_depth, None,
+            &calibration, &params,
             &mut encoder, &mut frame_count, &info,
         )?;
     }
@@ -449,34 +450,38 @@ mod tests {
     }
 
     #[test]
-    fn lerp_graded_at_zero() {
-        let a: Vec<u8> = vec![10, 20, 30];
-        let b: Vec<u8> = vec![110, 120, 130];
-        assert_eq!(lerp_graded(&a, &b, 0.0), vec![10, 20, 30]);
+    fn lerp_depth_at_zero() {
+        let a: Vec<f32> = vec![0.1, 0.2, 0.3];
+        let b: Vec<f32> = vec![0.5, 0.6, 0.7];
+        let result = lerp_depth(&a, &b, 0.0);
+        assert_eq!(result, vec![0.1, 0.2, 0.3]);
     }
 
     #[test]
-    fn lerp_graded_at_one() {
-        let a: Vec<u8> = vec![10, 20, 30];
-        let b: Vec<u8> = vec![110, 120, 130];
-        assert_eq!(lerp_graded(&a, &b, 1.0), vec![110, 120, 130]);
+    fn lerp_depth_at_one() {
+        let a: Vec<f32> = vec![0.1, 0.2, 0.3];
+        let b: Vec<f32> = vec![0.5, 0.6, 0.7];
+        let result = lerp_depth(&a, &b, 1.0);
+        assert_eq!(result, vec![0.5, 0.6, 0.7]);
     }
 
     #[test]
-    fn lerp_graded_at_half() {
-        let a: Vec<u8> = vec![0, 100, 200];
-        let b: Vec<u8> = vec![100, 200, 250];
-        let result = lerp_graded(&a, &b, 0.5);
-        assert_eq!(result, vec![50, 150, 225]);
+    fn lerp_depth_at_half() {
+        let a: Vec<f32> = vec![0.0, 0.4, 0.8];
+        let b: Vec<f32> = vec![1.0, 0.8, 0.6];
+        let result = lerp_depth(&a, &b, 0.5);
+        for (r, e) in result.iter().zip([0.5f32, 0.6, 0.7].iter()) {
+            assert!((r - e).abs() < 1e-6, "expected {e}, got {r}");
+        }
     }
 
     #[test]
-    fn lerp_graded_clamps_t() {
-        let a: Vec<u8> = vec![10, 20];
-        let b: Vec<u8> = vec![110, 120];
+    fn lerp_depth_clamps_t() {
+        let a: Vec<f32> = vec![0.1, 0.2];
+        let b: Vec<f32> = vec![0.9, 0.8];
         // t > 1 should clamp to 1
-        assert_eq!(lerp_graded(&a, &b, 2.0), vec![110, 120]);
+        assert_eq!(lerp_depth(&a, &b, 2.0), vec![0.9, 0.8]);
         // t < 0 should clamp to 0
-        assert_eq!(lerp_graded(&a, &b, -1.0), vec![10, 20]);
+        assert_eq!(lerp_depth(&a, &b, -1.0), vec![0.1, 0.2]);
     }
 }
