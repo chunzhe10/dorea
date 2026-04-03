@@ -63,26 +63,14 @@ pub fn per_frame_vram_bytes(width: usize, height: usize) -> usize {
     rgb_f32 * 2 + depth_f32
 }
 
-/// Verify that the CUDA context is healthy by querying the free device memory.
+/// Verify that the CUDA context is healthy by performing a tiny allocation.
 ///
 /// Call this after OOM recovery before retrying. If it fails, the context
 /// is likely wedged — skip to CPU fallback.
-///
-/// Uses the raw CUDA driver API (cudaMemGetInfo) — no cudarc dependency needed.
 #[cfg(feature = "cuda")]
-pub fn verify_cuda_context() -> Result<(), crate::GpuError> {
-    extern "C" {
-        /// cudaMemGetInfo(size_t *free, size_t *total) → cudaError_t
-        fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
-    }
-    let mut free: usize = 0;
-    let mut total: usize = 0;
-    let status = unsafe { cudaMemGetInfo(&mut free, &mut total) };
-    if status != 0 {
-        return Err(crate::GpuError::CudaFail(
-            format!("context health check failed: cudaMemGetInfo returned {status}")
-        ));
-    }
+pub fn verify_cuda_context(device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> Result<(), crate::GpuError> {
+    let _probe = device.alloc_zeros::<f32>(1)
+        .map_err(|e| crate::GpuError::CudaFail(format!("context health check failed: {e}")))?;
     Ok(())
 }
 

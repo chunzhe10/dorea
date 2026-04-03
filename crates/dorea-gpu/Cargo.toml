@@ -12,9 +12,10 @@ log.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 
-cudarc = { version = "0.12", features = ["driver"], optional = true }
+cudarc = { version = "0.12", features = ["driver", "nvrtc", "dynamic-linking", "cuda-version-from-build-system"] }
 
 [features]
+# Declared so Cargo recognises `#[cfg(feature = "cuda")]` as a valid condition.
 # Activation is driven by build.rs (nvcc detection), NOT by Cargo feature flags.
 # Do NOT pass --features cuda manually; build.rs handles it.
-cuda = ["dep:cudarc"]
+cuda = []
