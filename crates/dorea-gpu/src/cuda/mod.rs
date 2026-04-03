@@ -355,6 +355,7 @@ mod tests {
         let max_diff = gpu_out.iter().zip(cpu_out.iter())
             .map(|(&g, &c)| (g as i32 - c as i32).unsigned_abs())
             .max().unwrap_or(0);
+        eprintln!("Non-trivial GPU/CPU diff — max: {max_diff}/255");
         // 4/255 tolerance (not 2) for nonlinear LUT + active HSL: the GPU hardware
         // trilinear interpolation of the baked pipeline introduces ~4/255 quantization
         // error in regions of high curvature (gamma LUT + LAB + HSL combined).
@@ -407,6 +408,22 @@ mod tests {
                 .expect(&format!("grade_frame_cuda failed for n_zones={n_zones}"));
             assert_eq!(gpu_out.len(), 8 * 8 * 3,
                 "n_zones={n_zones}: output length mismatch");
+            let cpu_out = crate::cpu::grade_frame_cpu(&pixels, &depth, 8, 8, &cal, &params)
+                .expect(&format!("grade_frame_cpu failed for n_zones={n_zones}"));
+            let max_diff = gpu_out.iter().zip(cpu_out.iter())
+                .map(|(&g, &c)| (g as i32 - c as i32).unsigned_abs())
+                .max().unwrap_or(0);
+            eprintln!("n_zones={n_zones}: GPU/CPU max diff {max_diff}/255");
+            // Tolerance scales with zone count:
+            //   n_zones=1 → up to 11/255: single zone baked at depth=0.5; the
+            //     depth-dependent ambiance/contrast in grade_pixel.cuh produces high
+            //     error for pixels far from zone centre. Acceptable — real deployments
+            //     always use ≥5 zones.
+            //   n_zones=3 → up to 3/255: zone centres at 0.17/0.50/0.83, moderate.
+            //   n_zones=8 → ≤2/255: fine-grained zones, tight accuracy.
+            let tol = if n_zones == 1 { 12 } else if n_zones <= 3 { 4 } else { 2 };
+            assert!(max_diff <= tol,
+                "n_zones={n_zones}: GPU/CPU max diff {max_diff}/255 exceeds {tol}/255");
         }
     }
 }

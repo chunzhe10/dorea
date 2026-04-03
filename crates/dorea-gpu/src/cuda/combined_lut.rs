@@ -195,6 +195,9 @@ impl CombinedLut {
             unsafe {
                 let rc = sys::lib().cuMemcpy3D_v2(&cpy);
                 if rc != cudaError_enum::CUDA_SUCCESS {
+                    // arr was pushed; destroy it along with all previously created resources.
+                    for &tex in &textures { let _ = sys::lib().cuTexObjectDestroy(tex); }
+                    for &a in &arrays    { let _ = sys::lib().cuArrayDestroy(a); }
                     return Err(GpuError::CudaFail(format!("cuMemcpy3D zone {zone}: {rc:?}")));
                 }
             }
@@ -215,6 +218,9 @@ impl CombinedLut {
             unsafe {
                 let rc = sys::lib().cuTexObjectCreate(&mut tex, &res_desc, &tex_desc, std::ptr::null());
                 if rc != cudaError_enum::CUDA_SUCCESS {
+                    // arr was pushed; destroy it and all previously created resources.
+                    for &tex in &textures { let _ = sys::lib().cuTexObjectDestroy(tex); }
+                    for &a in &arrays    { let _ = sys::lib().cuArrayDestroy(a); }
                     return Err(GpuError::CudaFail(format!("cuTexObjectCreate zone {zone}: {rc:?}")));
                 }
             }
