@@ -10,6 +10,9 @@ use dorea_gpu::{grade_frame, GradeParams};
 use dorea_video::ffmpeg::{self, FrameEncoder};
 use dorea_video::inference::{InferenceConfig, InferenceServer};
 
+#[cfg(feature = "cuda")]
+use dorea_gpu::cuda::CudaGrader;
+
 #[derive(Args, Debug)]
 pub struct GradeArgs {
     /// Input video file (MP4/MOV/MKV)
@@ -162,6 +165,27 @@ fn flush_buffer_with_depth(
     Ok(())
 }
 
+/// Grade a single frame, reusing a pre-initialized CudaGrader when available.
+///
+/// Falls back to `grade_frame()` (which creates its own CudaGrader per-call) when the
+/// grader is `None` (e.g. CUDA init failed at startup).
+#[cfg(feature = "cuda")]
+fn grade_with_grader(
+    grader: Option<&CudaGrader>,
+    pixels: &[u8],
+    depth: &[f32],
+    width: usize,
+    height: usize,
+    calibration: &Calibration,
+    params: &GradeParams,
+) -> Result<Vec<u8>, dorea_gpu::GpuError> {
+    if let Some(g) = grader {
+        dorea_gpu::grade_frame_with_grader(g, pixels, depth, width, height, calibration, params)
+    } else {
+        grade_frame(pixels, depth, width, height, calibration, params)
+    }
+}
+
 pub fn run(args: GradeArgs) -> Result<()> {
     if args.cpu_only {
         anyhow::bail!(
@@ -216,6 +240,19 @@ pub fn run(args: GradeArgs) -> Result<()> {
     };
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
         .context("failed to spawn inference server — check --python and --depth-model")?;
+
+    // Initialize CUDA grader (loads PTX once, reuses across all frames)
+    #[cfg(feature = "cuda")]
+    let cuda_grader = match CudaGrader::new() {
+        Ok(g) => {
+            log::info!("CUDA grader initialized (cudarc + PTX modules loaded)");
+            Some(g)
+        }
+        Err(e) => {
+            log::warn!("CUDA grader init failed: {e} — will use per-frame fallback");
+            None
+        }
+    };
 
     // Decode and grade frames
     let frames = ffmpeg::decode_frames(&args.input, &info)
@@ -290,6 +327,12 @@ pub fn run(args: GradeArgs) -> Result<()> {
                 InferenceServer::upscale_depth(&depth_proxy, dw, dh, frame.width, frame.height)
             };
 
+            #[cfg(feature = "cuda")]
+            let graded = grade_with_grader(
+                cuda_grader.as_ref(),
+                &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
+            ).map_err(|e| anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index))?;
+            #[cfg(not(feature = "cuda"))]
             let graded = grade_frame(
                 &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
             ).map_err(|e| anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index))?;
