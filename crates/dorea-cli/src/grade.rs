@@ -12,6 +12,10 @@ use dorea_video::inference::{InferenceConfig, InferenceServer};
 
 #[cfg(feature = "cuda")]
 use dorea_gpu::cuda::CudaGrader;
+#[cfg(feature = "cuda")]
+use dorea_gpu::batcher::AdaptiveBatcher;
+#[cfg(feature = "cuda")]
+use dorea_gpu::GpuError;
 
 #[derive(Args, Debug)]
 pub struct GradeArgs {
@@ -132,6 +136,7 @@ fn flush_buffer_with_depth(
     encoder: &mut FrameEncoder,
     frame_count: &mut u64,
     info: &ffmpeg::VideoInfo,
+    #[cfg(feature = "cuda")] cuda_grader: Option<&CudaGrader>,
 ) -> Result<()> {
     let Some(before) = depth_before else {
         buffer.clear();
@@ -150,6 +155,12 @@ fn flush_buffer_with_depth(
             before.clone()
         };
 
+        #[cfg(feature = "cuda")]
+        let graded = grade_with_grader(
+            cuda_grader,
+            &bf.pixels, &depth, bf.width, bf.height, calibration, params,
+        ).map_err(|e| anyhow::anyhow!("Grading failed for buffered frame {}: {e}", bf.index))?;
+        #[cfg(not(feature = "cuda"))]
         let graded = grade_frame(
             &bf.pixels, &depth, bf.width, bf.height, calibration, params,
         ).map_err(|e| anyhow::anyhow!("Grading failed for buffered frame {}: {e}", bf.index))?;
@@ -253,6 +264,8 @@ pub fn run(args: GradeArgs) -> Result<()> {
             None
         }
     };
+    #[cfg(feature = "cuda")]
+    let mut batcher = AdaptiveBatcher::fixed(args.depth_max_interval);
 
     // Decode and grade frames
     let frames = ffmpeg::decode_frames(&args.input, &info)
@@ -302,6 +315,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
                     &mut frame_buffer, &last_keyframe_depth, None,
                     &calibration, &params,
                     &mut encoder, &mut frame_count, &info,
+                    #[cfg(feature = "cuda")] cuda_grader.as_ref(),
                 )?;
                 frames_since_keyframe = 0;
             }
@@ -328,10 +342,27 @@ pub fn run(args: GradeArgs) -> Result<()> {
             };
 
             #[cfg(feature = "cuda")]
-            let graded = grade_with_grader(
-                cuda_grader.as_ref(),
-                &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-            ).map_err(|e| anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index))?;
+            let graded = {
+                match grade_with_grader(
+                    cuda_grader.as_ref(),
+                    &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
+                ) {
+                    Ok(pixels) => {
+                        batcher.report_success();
+                        pixels
+                    }
+                    Err(GpuError::Oom(ref msg)) => {
+                        let at_min = batcher.report_oom();
+                        log::warn!("CUDA OOM on frame {} ({}){} — falling back to CPU",
+                            frame.index, msg,
+                            if at_min { ", already at minimum batch" } else { "" });
+                        dorea_gpu::cpu::grade_frame_cpu(
+                            &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
+                        ).map_err(|e| anyhow::anyhow!("CPU fallback failed for frame {}: {e}", frame.index))?
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index)),
+                }
+            };
             #[cfg(not(feature = "cuda"))]
             let graded = grade_frame(
                 &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
@@ -343,6 +374,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
                     &mut frame_buffer, &last_keyframe_depth, Some(&depth),
                     &calibration, &params,
                     &mut encoder, &mut frame_count, &info,
+                    #[cfg(feature = "cuda")] cuda_grader.as_ref(),
                 )?;
             }
 
@@ -377,6 +409,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
             &mut frame_buffer, &last_keyframe_depth, None,
             &calibration, &params,
             &mut encoder, &mut frame_count, &info,
+            #[cfg(feature = "cuda")] cuda_grader.as_ref(),
         )?;
     }
 
