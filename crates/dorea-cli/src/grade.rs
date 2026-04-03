@@ -260,9 +260,9 @@ pub fn run(args: GradeArgs) -> Result<()> {
     // -----------------------------------------------------------------------
     // Batch depth inference
     // -----------------------------------------------------------------------
-    let batch_items: Vec<DepthBatchItem> = keyframes.iter().enumerate().map(|(i, kf)| {
+    let batch_items: Vec<DepthBatchItem> = keyframes.iter().map(|kf| {
         DepthBatchItem {
-            id: format!("kf_{i:06}"),
+            id: format!("kf_f{}", kf.frame_index),
             pixels: kf.proxy_pixels.clone(),
             width: proxy_w,
             height: proxy_h,
@@ -275,13 +275,24 @@ pub fn run(args: GradeArgs) -> Result<()> {
         .chunks(DEPTH_BATCH_SIZE)
         .zip(batch_items.chunks(DEPTH_BATCH_SIZE))
     {
-        let results = inf_server.run_depth_batch(chunk_items)
+        let mut results = inf_server.run_depth_batch(chunk_items)
             .unwrap_or_else(|e| {
                 log::warn!("Depth batch failed: {e} — using uniform depth 0.5");
                 chunk_items.iter().map(|it| {
                     (it.id.clone(), vec![0.5f32; proxy_w * proxy_h], proxy_w, proxy_h)
                 }).collect()
             });
+
+        // Guard against a malformed server response returning fewer results than requested.
+        if results.len() < chunk_items.len() {
+            log::warn!(
+                "Depth batch returned {} results for {} items — padding missing with uniform depth",
+                results.len(), chunk_items.len()
+            );
+            for it in &chunk_items[results.len()..] {
+                results.push((it.id.clone(), vec![0.5f32; proxy_w * proxy_h], proxy_w, proxy_h));
+            }
+        }
 
         for (kf, (_, depth_raw, dw, dh)) in chunk_kfs.iter().zip(results.iter()) {
             let depth = if *dw == info.width && *dh == info.height {
@@ -360,6 +371,13 @@ pub fn run(args: GradeArgs) -> Result<()> {
     let _ = inf_server.shutdown();
     encoder.finish().context("ffmpeg encoder failed to finalize")?;
 
+    if info.frame_count > 0 && frame_count < info.frame_count {
+        log::warn!(
+            "Incomplete grading: {frame_count} frames processed, {} expected \
+             (decoder may have stopped early)",
+            info.frame_count
+        );
+    }
     log::info!("Done. Graded {frame_count} frames → {}", output.display());
     Ok(())
 }

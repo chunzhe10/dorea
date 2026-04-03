@@ -129,6 +129,12 @@ class DepthAnythingInference:
 
         dims = set(r.size for r in resized)  # (tw, th) tuples
         if len(dims) > 1:
+            import sys
+            print(
+                f"[dorea_inference] WARNING: infer_batch: images have different post-resize "
+                f"dims {dims}; falling back to sequential inference (performance penalty)",
+                file=sys.stderr,
+            )
             return [self.infer(img, max_size) for img in imgs]
 
         arrays = []
