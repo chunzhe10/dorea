@@ -11,6 +11,9 @@ pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "cuda")]
+pub mod device;
+
 use dorea_cal::Calibration;
 use thiserror::Error;
 
