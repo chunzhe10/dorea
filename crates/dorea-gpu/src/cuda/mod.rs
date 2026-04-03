@@ -3,9 +3,9 @@
 //! Only compiled when the `cuda` feature is enabled (detected by build.rs).
 //!
 //! `CudaGrader` holds an `Arc<CudaDevice>` and loads the three PTX modules
-//! (lut_apply, hsl_correct, clarity) on construction. `grade_frame_cuda` uploads
-//! host data, runs the three kernel stages, and downloads the result — all device
-//! memory is RAII via `CudaSlice<T>` (drop = cudaFree).
+//! (lut_apply, hsl_correct, clarity) on construction. Device buffers are
+//! pre-allocated and cached across frames in `ResolutionBuffers` and
+//! `CalibrationBuffers`; they live for the grader's lifetime.
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
@@ -129,6 +129,13 @@ impl CudaGrader {
             return Err(GpuError::InvalidInput("n_zones must be >= 1".into()));
         }
         let lut_size = depth_luts.luts[0].size;
+
+        // --- Guard against jagged LUTs (all grids must have same size) ---
+        if depth_luts.luts.iter().any(|lg| lg.size != lut_size) {
+            return Err(GpuError::InvalidInput(
+                "all depth LUT grids must have the same size".into(),
+            ));
+        }
 
         // --- Ensure ResolutionBuffers for this (width, height) ---
         {
@@ -291,12 +298,7 @@ impl CudaGrader {
         }
 
         // Sub-kernel B: 3-pass box blur
-        let blur_rows_cfg = LaunchConfig {
-            grid_dim: (div_ceil(proxy_w as u32, 32), div_ceil(proxy_h as u32, 8), 1),
-            block_dim: (32, 8, 1),
-            shared_mem_bytes: 0,
-        };
-        let blur_cols_cfg = LaunchConfig {
+        let blur_cfg = LaunchConfig {
             grid_dim: (div_ceil(proxy_w as u32, 32), div_ceil(proxy_h as u32, 8), 1),
             block_dim: (32, 8, 1),
             shared_mem_bytes: 0,
@@ -310,7 +312,7 @@ impl CudaGrader {
                     .get_func("clarity", "clarity_box_blur_rows")
                     .ok_or_else(|| GpuError::ModuleLoad("clarity_box_blur_rows not found".into()))?;
                 unsafe {
-                    func.launch(blur_rows_cfg, (src, &res_bufs.d_blur_a, proxy_w as i32, proxy_h as i32, BLUR_RADIUS))
+                    func.launch(blur_cfg, (src, &res_bufs.d_blur_a, proxy_w as i32, proxy_h as i32, BLUR_RADIUS))
                 }
                 .map_err(map_cudarc_error)?;
             }
@@ -320,7 +322,7 @@ impl CudaGrader {
                     .get_func("clarity", "clarity_box_blur_cols")
                     .ok_or_else(|| GpuError::ModuleLoad("clarity_box_blur_cols not found".into()))?;
                 unsafe {
-                    func.launch(blur_cols_cfg, (&res_bufs.d_blur_a, &res_bufs.d_blur_b, proxy_w as i32, proxy_h as i32, BLUR_RADIUS))
+                    func.launch(blur_cfg, (&res_bufs.d_blur_a, &res_bufs.d_blur_b, proxy_w as i32, proxy_h as i32, BLUR_RADIUS))
                 }
                 .map_err(map_cudarc_error)?;
             }
