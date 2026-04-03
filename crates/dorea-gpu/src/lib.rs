@@ -93,7 +93,6 @@ pub fn grade_frame(
                             height,
                             params,
                             calibration,
-                            true, // GPU clarity kernel already applied
                         ));
                     }
                     Err(e) => {
@@ -160,7 +159,6 @@ pub fn grade_frames_with_capacity(
                 height,
                 params,
                 calibration,
-                true,
             ))
         })
         .collect()
@@ -207,6 +205,5 @@ pub fn grade_frame_with_grader(
         height,
         params,
         calibration,
-        true, // GPU clarity kernel already applied
     ))
 }

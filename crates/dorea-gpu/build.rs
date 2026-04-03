@@ -66,7 +66,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/cuda/kernels/lut_apply.cu");
     println!("cargo:rerun-if-changed=src/cuda/kernels/hsl_correct.cu");
-    println!("cargo:rerun-if-changed=src/cuda/kernels/clarity.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=PATH");
@@ -80,7 +79,7 @@ fn main() {
     println!("cargo:warning=Found nvcc at {}", nvcc.display());
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let kernel_names = ["lut_apply", "hsl_correct", "clarity"];
+    let kernel_names = ["lut_apply", "hsl_correct"];
 
     let cuda_include = nvcc.parent()
         .and_then(|p| p.parent())

@@ -2,8 +2,8 @@
 //!
 //! Only compiled when the `cuda` feature is enabled (detected by build.rs).
 //!
-//! `CudaGrader` holds an `Arc<CudaDevice>` and loads the three PTX modules
-//! (lut_apply, hsl_correct, clarity) on construction. Device buffers are
+//! `CudaGrader` holds an `Arc<CudaDevice>` and loads the two PTX modules
+//! (lut_apply, hsl_correct) on construction. Device buffers are
 //! pre-allocated and cached across frames in `ResolutionBuffers` and
 //! `CalibrationBuffers`; they live for the grader's lifetime.
 
@@ -25,16 +25,6 @@ use dorea_cal::Calibration;
 const LUT_APPLY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/lut_apply.ptx"));
 #[cfg(feature = "cuda")]
 const HSL_CORRECT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/hsl_correct.ptx"));
-#[cfg(feature = "cuda")]
-const CLARITY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/clarity.ptx"));
-
-/// Blur radius for the clarity box-blur passes (matches CPU path).
-#[cfg(feature = "cuda")]
-const BLUR_RADIUS: i32 = 30;
-
-/// Maximum proxy long-edge for clarity downsampling (matches CPU path: 518).
-#[cfg(feature = "cuda")]
-const PROXY_MAX_SIZE: usize = 518;
 
 /// CUDA grader: holds a device handle and pre-loaded PTX modules.
 ///
@@ -74,19 +64,6 @@ impl CudaGrader {
             )
             .map_err(|e| GpuError::ModuleLoad(format!("load hsl_correct PTX: {e}")))?;
 
-        device
-            .load_ptx(
-                Ptx::from_src(CLARITY_PTX),
-                "clarity",
-                &[
-                    "clarity_extract_L_proxy",
-                    "clarity_box_blur_rows",
-                    "clarity_box_blur_cols",
-                    "clarity_apply_kernel",
-                ],
-            )
-            .map_err(|e| GpuError::ModuleLoad(format!("load clarity PTX: {e}")))?;
-
         Ok(Self {
             device,
             res_bufs: RefCell::new(None),
@@ -118,10 +95,10 @@ impl CudaGrader {
         Ok(grader)
     }
 
-    /// Run the GPU grading pipeline: LUT apply -> HSL correct -> clarity.
+    /// Run the GPU grading pipeline: LUT apply -> HSL correct.
     ///
-    /// Returns interleaved f32 RGB [0,1] with clarity applied.
-    /// The caller should pass this to `cpu::finish_grade(skip_clarity=true)`.
+    /// Returns interleaved f32 RGB [0,1] after HSL correction.
+    /// The caller should pass this to `cpu::finish_grade()`.
     pub fn grade_frame_cuda(
         &self,
         pixels: &[u8],
@@ -296,107 +273,8 @@ impl CudaGrader {
             .map_err(map_cudarc_error)?;
         }
 
-        // =====================================================================
-        // CLARITY (proxy-resolution box blur)
-        // =====================================================================
-        let mean_d = depth.iter().sum::<f32>() / depth.len().max(1) as f32;
-        let clarity_amount = (0.2 + 0.25 * mean_d) * params.contrast;
-
-        let proxy_w = res_bufs.proxy_w;
-        let proxy_h = res_bufs.proxy_h;
-
-        // Sub-kernel A: extract proxy L
-        {
-            let func = dev
-                .get_func("clarity", "clarity_extract_L_proxy")
-                .ok_or_else(|| GpuError::ModuleLoad("clarity_extract_L_proxy not found".into()))?;
-
-            let cfg = LaunchConfig {
-                grid_dim: (div_ceil(proxy_w as u32, 16), div_ceil(proxy_h as u32, 16), 1),
-                block_dim: (16, 16, 1),
-                shared_mem_bytes: 0,
-            };
-
-            unsafe {
-                func.launch(
-                    cfg,
-                    (
-                        &res_bufs.d_rgb_after_hsl,
-                        &res_bufs.d_proxy_l,
-                        width as i32,
-                        height as i32,
-                        proxy_w as i32,
-                        proxy_h as i32,
-                    ),
-                )
-            }
-            .map_err(map_cudarc_error)?;
-        }
-
-        // Sub-kernel B: 3-pass box blur
-        let blur_cfg = LaunchConfig {
-            grid_dim: (div_ceil(proxy_w as u32, 32), div_ceil(proxy_h as u32, 8), 1),
-            block_dim: (32, 8, 1),
-            shared_mem_bytes: 0,
-        };
-
-        for pass in 0..3 {
-            let src: &CudaSlice<f32> = if pass == 0 { &res_bufs.d_proxy_l } else { &res_bufs.d_blur_b };
-
-            {
-                let func = dev
-                    .get_func("clarity", "clarity_box_blur_rows")
-                    .ok_or_else(|| GpuError::ModuleLoad("clarity_box_blur_rows not found".into()))?;
-                unsafe {
-                    func.launch(blur_cfg, (src, &res_bufs.d_blur_a, proxy_w as i32, proxy_h as i32, BLUR_RADIUS))
-                }
-                .map_err(map_cudarc_error)?;
-            }
-
-            {
-                let func = dev
-                    .get_func("clarity", "clarity_box_blur_cols")
-                    .ok_or_else(|| GpuError::ModuleLoad("clarity_box_blur_cols not found".into()))?;
-                unsafe {
-                    func.launch(blur_cfg, (&res_bufs.d_blur_a, &res_bufs.d_blur_b, proxy_w as i32, proxy_h as i32, BLUR_RADIUS))
-                }
-                .map_err(map_cudarc_error)?;
-            }
-        }
-
-        // Sub-kernel C: apply clarity at full resolution
-        {
-            let func = dev
-                .get_func("clarity", "clarity_apply_kernel")
-                .ok_or_else(|| GpuError::ModuleLoad("clarity_apply_kernel not found".into()))?;
-
-            let cfg = LaunchConfig {
-                grid_dim: (div_ceil(n as u32, 256), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-
-            unsafe {
-                func.launch(
-                    cfg,
-                    (
-                        &res_bufs.d_rgb_after_hsl,
-                        &res_bufs.d_rgb_out,
-                        &res_bufs.d_blur_b,
-                        clarity_amount,
-                        width as i32,
-                        height as i32,
-                        proxy_w as i32,
-                        proxy_h as i32,
-                    ),
-                )
-            }
-            .map_err(map_cudarc_error)?;
-        }
-
-        // NOTE: dtoh_sync_copy internally calls device.synchronize(), leaving the stream idle.
-        // The pre-allocated buffers can be safely overwritten on the next grade_frame_cuda call.
-        let result = dev.dtoh_sync_copy(&res_bufs.d_rgb_out).map_err(map_cudarc_error)?;
+        // Download result (HSL output is now the final GPU stage)
+        let result = dev.dtoh_sync_copy(&res_bufs.d_rgb_after_hsl).map_err(map_cudarc_error)?;
 
         Ok(result)
     }
@@ -410,16 +288,10 @@ impl CudaGrader {
 struct ResolutionBuffers {
     width: usize,
     height: usize,
-    proxy_w: usize,
-    proxy_h: usize,
     d_rgb_in: CudaSlice<f32>,         // n * 3  — input RGB as f32
     d_depth: CudaSlice<f32>,          // n — depth map; held for full frame (no early drop with pre-alloc)
     d_rgb_after_lut: CudaSlice<f32>,  // n * 3  — LUT-stage output (scratch)
-    d_rgb_after_hsl: CudaSlice<f32>,  // n * 3  — HSL-stage output (scratch)
-    d_proxy_l: CudaSlice<f32>,        // proxy_n — clarity proxy luminance (scratch)
-    d_blur_a: CudaSlice<f32>,         // proxy_n — blur ping-pong A (scratch)
-    d_blur_b: CudaSlice<f32>,         // proxy_n — blur ping-pong B (scratch)
-    d_rgb_out: CudaSlice<f32>,        // n * 3  — final output (scratch)
+    d_rgb_after_hsl: CudaSlice<f32>,  // n * 3  — HSL-stage output (final GPU-stage result)
 }
 
 /// Holds all device buffers sized by `(n_zones, lut_size)`.
@@ -448,21 +320,13 @@ fn alloc_resolution_buffers(
     let n = width.checked_mul(height).ok_or_else(|| {
         GpuError::InvalidInput("frame dimensions overflow usize".into())
     })?;
-    let (proxy_w, proxy_h) = proxy_dims(width, height, PROXY_MAX_SIZE);
-    let proxy_n = proxy_w * proxy_h;
     Ok(ResolutionBuffers {
         width,
         height,
-        proxy_w,
-        proxy_h,
         d_rgb_in: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
         d_depth: dev.alloc_zeros(n).map_err(map_cudarc_error)?,
         d_rgb_after_lut: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
         d_rgb_after_hsl: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
-        d_proxy_l: dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?,
-        d_blur_a: dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?,
-        d_blur_b: dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?,
-        d_rgb_out: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
     })
 }
 
@@ -513,19 +377,6 @@ fn div_ceil(a: u32, b: u32) -> u32 {
     a.div_ceil(b)
 }
 
-/// Compute proxy dimensions: scale so the long edge <= max_size.
-/// Inline here to avoid a dep on dorea-video just for this helper.
-#[cfg(feature = "cuda")]
-fn proxy_dims(src_w: usize, src_h: usize, max_size: usize) -> (usize, usize) {
-    let long_edge = src_w.max(src_h);
-    if long_edge <= max_size {
-        return (src_w, src_h);
-    }
-    let scale = max_size as f64 / long_edge as f64;
-    let pw = ((src_w as f64 * scale).round() as usize).max(1);
-    let ph = ((src_h as f64 * scale).round() as usize).max(1);
-    (pw, ph)
-}
 
 #[cfg(all(feature = "cuda", test))]
 mod tests {

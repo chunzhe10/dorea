@@ -214,21 +214,6 @@ pub fn fused_ambiance_warmth(
         });
 }
 
-/// Run the clarity pass (box-blur detail extraction) at full resolution on CPU.
-/// Called by `finish_grade` when `skip_clarity` is false (CPU-only path).
-pub(crate) fn apply_cpu_clarity(
-    rgb: &mut [f32],
-    depth: &[f32],
-    width: usize,
-    height: usize,
-    contrast_scale: f32,
-) {
-    let mean_d: f32 = depth.iter().sum::<f32>() / depth.len() as f32;
-    let radius = (30.0_f32 * 3.0).ceil() as usize;
-    let clarity_amount = (0.2 + 0.25 * mean_d) * contrast_scale;
-    apply_clarity(rgb, width, height, radius, clarity_amount);
-}
-
 /// Apply depth_aware_ambiance, warmth, blend, and convert f32 → u8.
 ///
 /// Called by both the CPU and CUDA code paths after LUT+HSL processing.
@@ -241,19 +226,13 @@ pub(crate) fn finish_grade(
     width: usize,
     height: usize,
     params: &GradeParams,
-    _cal: &Calibration,  // reserved: available for per-calibration finish adjustments if needed
-    skip_clarity: bool,
+    _cal: &Calibration,
 ) -> Vec<u8> {
     // 1. Fused ambiance + warmth (single LAB roundtrip, rayon-parallelized)
     let warmth_factor = 1.0 + (params.warmth - 1.0) * 0.3;
     fused_ambiance_warmth(rgb_f32, depth, width, height, params.contrast, warmth_factor);
 
-    // 2. Clarity — skip when the CUDA path already ran the GPU clarity kernel.
-    if !skip_clarity {
-        apply_cpu_clarity(rgb_f32, depth, width, height, params.contrast);
-    }
-
-    // 3. Blend with original using strength
+    // 2. Blend with original using strength
     if params.strength < 1.0 - 1e-4 {
         for i in 0..rgb_f32.len() {
             let orig = orig_pixels[i] as f32 / 255.0;
@@ -261,149 +240,8 @@ pub(crate) fn finish_grade(
         }
     }
 
-    // 4. f32 → u8
+    // 3. f32 → u8
     rgb_f32.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect()
-}
-
-/// Apply clarity enhancement: extract low-frequency blur, boost detail.
-fn apply_clarity(rgb: &mut [f32], width: usize, height: usize, radius: usize, clarity: f32) {
-    // Work on just the L channel in LAB space for clarity
-    let n = width * height;
-    let mut l_channel: Vec<f32> = (0..n)
-        .map(|i| {
-            let r = rgb[i * 3];
-            let g = rgb[i * 3 + 1];
-            let b = rgb[i * 3 + 2];
-            let (l, _, _) = srgb_to_lab(r, g, b);
-            l / 100.0
-        })
-        .collect();
-
-    // 3-pass box blur to approximate Gaussian
-    let blur = three_pass_box_blur(&l_channel, width, height, radius);
-
-    // Apply clarity: detail = tanh((L - blur) * 3) / 3
-    for i in 0..n {
-        let detail = ((l_channel[i] - blur[i]) * 3.0).tanh() / 3.0;
-        l_channel[i] = (l_channel[i] + detail * clarity).clamp(0.0, 1.0);
-    }
-
-    // Write back L channel modifications into rgb
-    for i in 0..n {
-        let r = rgb[i * 3];
-        let g = rgb[i * 3 + 1];
-        let b = rgb[i * 3 + 2];
-        let (l_old, a, b_ab) = srgb_to_lab(r, g, b);
-
-        let l_new = l_channel[i] * 100.0;
-        let l_delta = l_new - l_old;
-        let l_adjusted = (l_old + l_delta).clamp(0.0, 100.0);
-
-        let (ro, go, bo) = lab_to_srgb(l_adjusted, a, b_ab);
-        rgb[i * 3]     = ro.clamp(0.0, 1.0);
-        rgb[i * 3 + 1] = go.clamp(0.0, 1.0);
-        rgb[i * 3 + 2] = bo.clamp(0.0, 1.0);
-    }
-}
-
-/// Three-pass box blur approximating a Gaussian, operating on a 1D luminance array.
-fn three_pass_box_blur(input: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
-    let mut buf_a = input.to_vec();
-    let mut buf_b = vec![0.0_f32; input.len()];
-    for _ in 0..3 {
-        box_blur_rows_sliding(&buf_a, &mut buf_b, width, height, radius);
-        box_blur_cols_via_transpose(&buf_b, &mut buf_a, width, height, radius);
-    }
-    buf_a
-}
-
-fn box_blur_rows(src: &[f32], dst: &mut [f32], width: usize, height: usize, radius: usize) {
-    let r = radius.min(width - 1) as isize;
-    for row in 0..height {
-        let base = row * width;
-        for col in 0..width {
-            let lo = (col as isize - r).max(0) as usize;
-            let hi = (col as isize + r).min(width as isize - 1) as usize;
-            let mut s = 0.0_f32;
-            for k in lo..=hi {
-                s += src[base + k];
-            }
-            dst[base + col] = s / (hi - lo + 1) as f32;
-        }
-    }
-}
-
-/// Sliding-window box blur over rows. O(W) per row — replaces the naive O(W×radius) version.
-fn box_blur_rows_sliding(src: &[f32], dst: &mut [f32], width: usize, height: usize, radius: usize) {
-    let r = radius as isize;
-    for row in 0..height {
-        let base = row * width;
-        let mut sum = 0.0f32;
-        let mut count = 0usize;
-
-        // Seed window for col=0: indices [0..min(r, W-1)]
-        let init_hi = r.min(width as isize - 1) as usize;
-        for k in 0..=init_hi {
-            sum += src[base + k];
-            count += 1;
-        }
-
-        for col in 0..width {
-            dst[base + col] = sum / count as f32;
-
-            // Expand right edge for next column
-            let add = col as isize + r + 1;
-            if add < width as isize {
-                sum += src[base + add as usize];
-                count += 1;
-            }
-            // Shrink left edge for next column
-            let rem = col as isize - r;
-            if rem >= 0 {
-                sum -= src[base + rem as usize];
-                count -= 1;
-            }
-        }
-    }
-}
-
-/// Column box blur using transpose → row blur → transpose back.
-/// Avoids the strided-memory cache thrash of direct column access.
-fn box_blur_cols_via_transpose(
-    src: &[f32],
-    dst: &mut [f32],
-    width: usize,
-    height: usize,
-    radius: usize,
-) {
-    let mut transposed = vec![0.0f32; width * height];
-    for row in 0..height {
-        for col in 0..width {
-            transposed[col * height + row] = src[row * width + col];
-        }
-    }
-    let mut blurred_t = vec![0.0f32; width * height];
-    box_blur_rows_sliding(&transposed, &mut blurred_t, height, width, radius);
-    for row in 0..height {
-        for col in 0..width {
-            dst[row * width + col] = blurred_t[col * height + row];
-        }
-    }
-}
-
-fn box_blur_cols(src: &[f32], dst: &mut [f32], width: usize, height: usize, radius: usize) {
-    let r = radius.min(height - 1) as isize;
-    for col in 0..width {
-        for row in 0..height {
-            let lo = (row as isize - r).max(0) as usize;
-            let hi = (row as isize + r).min(height as isize - 1) as usize;
-            let mut s = 0.0_f32;
-            for k in lo..=hi {
-                s += src[k * width + col];
-            }
-            dst[row * width + col] = s / (hi - lo + 1) as f32;
-        }
-    }
 }
 
 /// Full CPU grading pipeline: LUT apply → HSL correct → depth_aware_ambiance → user params.
@@ -445,8 +283,8 @@ pub fn grade_frame_cpu(
         rgb_f32[i * 3 + 2] = px[2];
     }
 
-    // 3–5. Ambiance + clarity + warmth + blend + u8 (CPU finish pass)
-    Ok(finish_grade(&mut rgb_f32, pixels, depth, width, height, params, calibration, false))
+    // 3–4. Ambiance + warmth + blend + u8 (CPU finish pass)
+    Ok(finish_grade(&mut rgb_f32, pixels, depth, width, height, params, calibration))
 }
 
 #[cfg(test)]
@@ -499,59 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn box_blur_rows_sliding_matches_naive_small() {
-        let src: Vec<f32> = vec![
-            1.0, 2.0, 3.0, 4.0, 5.0,
-            5.0, 4.0, 3.0, 2.0, 1.0,
-        ];
-        let mut dst_sliding = vec![0.0f32; 10];
-        let mut dst_naive   = vec![0.0f32; 10];
-        box_blur_rows_sliding(&src, &mut dst_sliding, 5, 2, 1);
-        box_blur_rows(&src, &mut dst_naive, 5, 2, 1);
-        for (a, b) in dst_sliding.iter().zip(dst_naive.iter()) {
-            assert!((a - b).abs() < 1e-5, "mismatch: {a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn box_blur_rows_sliding_radius_zero() {
-        let src: Vec<f32> = vec![1.0, 2.0, 3.0];
-        let mut dst = vec![0.0f32; 3];
-        box_blur_rows_sliding(&src, &mut dst, 3, 1, 0);
-        assert_eq!(dst, src, "radius=0 should be identity");
-    }
-
-    #[test]
-    fn box_blur_rows_sliding_radius_exceeds_width() {
-        let src: Vec<f32> = vec![1.0, 2.0, 3.0];
-        let expected_mean = 2.0f32;
-        let mut dst = vec![0.0f32; 3];
-        box_blur_rows_sliding(&src, &mut dst, 3, 1, 100);
-        for v in &dst {
-            assert!((v - expected_mean).abs() < 1e-5, "expected {expected_mean}, got {v}");
-        }
-    }
-
-    #[test]
-    fn box_blur_cols_via_transpose_matches_naive_small() {
-        let src: Vec<f32> = vec![
-            1.0, 2.0, 3.0,
-            4.0, 5.0, 6.0,
-            7.0, 8.0, 9.0,
-            6.0, 5.0, 4.0,
-            3.0, 2.0, 1.0,
-        ];
-        let mut dst_transpose = vec![0.0f32; 15];
-        let mut dst_naive     = vec![0.0f32; 15];
-        box_blur_cols_via_transpose(&src, &mut dst_transpose, 3, 5, 1);
-        box_blur_cols(&src, &mut dst_naive, 3, 5, 1);
-        for (i, (a, b)) in dst_transpose.iter().zip(dst_naive.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-5, "pixel {i}: {a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn finish_grade_skip_clarity_runs_without_panic() {
+    fn finish_grade_runs_without_panic() {
         use crate::GradeParams;
         use dorea_cal::Calibration;
         use dorea_hsl::HslCorrections;
@@ -572,16 +358,16 @@ mod tests {
         let orig: Vec<u8>  = vec![128u8; n * 3];
         let depth: Vec<f32> = vec![0.5; n];
 
-        // skip_clarity = true: must not panic, output must be in [0,1]
+        // must not panic, output must be in [0,255]
         let out = finish_grade(&mut rgb_f32, &orig, &depth, width, height,
-                               &GradeParams::default(), &cal, true);
+                               &GradeParams::default(), &cal);
         assert_eq!(out.len(), n * 3);
         for &v in &out { assert!(v <= 255, "out of range: {v}"); }
 
-        // skip_clarity = false: same shape, must not panic
+        // second call: same shape, must not panic
         let mut rgb_f32b: Vec<f32> = vec![0.5; n * 3];
         let out2 = finish_grade(&mut rgb_f32b, &orig, &depth, width, height,
-                                &GradeParams::default(), &cal, false);
+                                &GradeParams::default(), &cal);
         assert_eq!(out2.len(), n * 3);
     }
 
@@ -716,7 +502,7 @@ mod tests {
         let depth: Vec<f32> = vec![0.5; n];
         let params = GradeParams::default();
 
-        let out = finish_grade(&mut rgb_f32, &orig_pixels, &depth, width, height, &params, &cal, false);
+        let out = finish_grade(&mut rgb_f32, &orig_pixels, &depth, width, height, &params, &cal);
         assert_eq!(out.len(), n * 3);
     }
 }
