@@ -384,61 +384,126 @@ pub fn run(args: GradeArgs) -> Result<()> {
 
 /// Temporary on-disk store for calibration frames.
 ///
-/// Frames are written to disk as they come off the inference server so the process
-/// heap never holds more than one frame at a time. The three calibration passes
-/// (depth sampling, LUT build, HSL) each re-read from disk sequentially, letting
-/// the OS page cache manage the working set (~2 GB for ~1000 4K proxy frames).
+/// Two packed binary files, both memory-mapped after the inference phase:
+///   depths.bin  — all depth maps concatenated (f32 LE), one region per frame
+///   pixtar.bin  — all [pixels | target] pairs concatenated (u8 RGB), one pair per frame
+///
+/// This gives three fast sequential scans (one per calibration pass) instead of
+/// 988×3 individual file open/read/close calls. Passes 2 and 3 both scan pixtar.bin
+/// sequentially, so pass 3 is served entirely from the OS page cache.
 struct PagedCalibrationStore {
     dir: std::path::PathBuf,
     widths: Vec<usize>,
     heights: Vec<usize>,
+    /// Byte offset in depths.bin for each frame's depth region
+    depth_offsets: Vec<usize>,
+    /// Byte offset in pixtar.bin for each frame's pixels region (target follows immediately)
+    pixtar_offsets: Vec<usize>,
+    /// Write handles — None after seal()
+    depth_writer: Option<std::io::BufWriter<std::fs::File>>,
+    pixtar_writer: Option<std::io::BufWriter<std::fs::File>>,
+    /// Read-only mmaps — Some after seal()
+    depth_mmap: Option<memmap2::Mmap>,
+    pixtar_mmap: Option<memmap2::Mmap>,
 }
 
 impl PagedCalibrationStore {
     fn new() -> Result<Self> {
+        use std::io::BufWriter;
         let dir = std::env::temp_dir()
             .join(format!("dorea_cal_{}", std::process::id()));
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create calibration temp dir {:?}", dir))?;
-        Ok(Self { dir, widths: Vec::new(), heights: Vec::new() })
+        let dw = BufWriter::new(
+            std::fs::File::create(dir.join("depths.bin")).context("create depths.bin")?
+        );
+        let pw = BufWriter::new(
+            std::fs::File::create(dir.join("pixtar.bin")).context("create pixtar.bin")?
+        );
+        Ok(Self {
+            dir,
+            widths: Vec::new(),
+            heights: Vec::new(),
+            depth_offsets: Vec::new(),
+            pixtar_offsets: Vec::new(),
+            depth_writer: Some(dw),
+            pixtar_writer: Some(pw),
+            depth_mmap: None,
+            pixtar_mmap: None,
+        })
     }
 
-    fn len(&self) -> usize { self.widths.len() }
-
     fn push(&mut self, pixels: &[u8], target: &[u8], depth: &[f32], width: usize, height: usize) -> Result<()> {
-        let i = self.widths.len();
-        std::fs::write(self.dir.join(format!("{i:04}_p.bin")), pixels)
-            .context("failed to write pixels")?;
-        std::fs::write(self.dir.join(format!("{i:04}_t.bin")), target)
-            .context("failed to write target")?;
-        let depth_bytes: Vec<u8> = depth.iter().flat_map(|f| f.to_le_bytes()).collect();
-        std::fs::write(self.dir.join(format!("{i:04}_d.bin")), &depth_bytes)
-            .context("failed to write depth")?;
+        use std::io::Write;
+        let dw = self.depth_writer.as_mut().context("store already sealed")?;
+        let pw = self.pixtar_writer.as_mut().context("store already sealed")?;
+
+        let depth_off = self.depth_offsets.last().copied().unwrap_or(0)
+            + self.widths.last().copied().unwrap_or(0)
+            * self.heights.last().copied().unwrap_or(0) * 4;
+        let pixtar_off = self.pixtar_offsets.last().copied().unwrap_or(0)
+            + self.widths.last().copied().unwrap_or(0)
+            * self.heights.last().copied().unwrap_or(0) * 6; // pixels + target = 3+3 bytes/px
+
+        // Write depth as raw f32 LE
+        for f in depth {
+            dw.write_all(&f.to_le_bytes()).context("write depth")?;
+        }
+        pw.write_all(pixels).context("write pixels")?;
+        pw.write_all(target).context("write target")?;
+
+        self.depth_offsets.push(depth_off);
+        self.pixtar_offsets.push(pixtar_off);
         self.widths.push(width);
         self.heights.push(height);
         Ok(())
     }
 
-    fn read_depth(&self, i: usize) -> Result<Vec<f32>> {
-        let bytes = std::fs::read(self.dir.join(format!("{i:04}_d.bin")))
-            .with_context(|| format!("failed to read depth {i}"))?;
-        Ok(bytes.chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect())
+    /// Flush writers and memory-map both files for fast read access.
+    fn seal(&mut self) -> Result<()> {
+        use std::io::Write;
+        if let Some(mut dw) = self.depth_writer.take() { dw.flush().context("flush depths")?; }
+        if let Some(mut pw) = self.pixtar_writer.take() { pw.flush().context("flush pixtar")?; }
+        let df = std::fs::File::open(self.dir.join("depths.bin")).context("open depths.bin")?;
+        let pf = std::fs::File::open(self.dir.join("pixtar.bin")).context("open pixtar.bin")?;
+        // SAFETY: files are written once, sealed, and never modified again.
+        self.depth_mmap = Some(unsafe { memmap2::Mmap::map(&df) }.context("mmap depths")?);
+        self.pixtar_mmap = Some(unsafe { memmap2::Mmap::map(&pf) }.context("mmap pixtar")?);
+        Ok(())
     }
 
-    fn read_frame(&self, i: usize) -> Result<(Vec<u8>, Vec<u8>, Vec<f32>, usize, usize)> {
-        let pixels = std::fs::read(self.dir.join(format!("{i:04}_p.bin")))
-            .with_context(|| format!("failed to read pixels {i}"))?;
-        let target = std::fs::read(self.dir.join(format!("{i:04}_t.bin")))
-            .with_context(|| format!("failed to read target {i}"))?;
-        let depth = self.read_depth(i)?;
-        Ok((pixels, target, depth, self.widths[i], self.heights[i]))
+    fn len(&self) -> usize { self.widths.len() }
+
+    /// Raw f32 LE bytes for frame i's depth map — zero-copy mmap slice.
+    fn depth_bytes(&self, i: usize) -> &[u8] {
+        let mmap = self.depth_mmap.as_ref().expect("call seal() before reading");
+        let off = self.depth_offsets[i];
+        let len = self.widths[i] * self.heights[i] * 4;
+        &mmap[off..off + len]
     }
+
+    /// Decode depth for frame i into a Vec<f32>.
+    fn read_depth(&self, i: usize) -> Vec<f32> {
+        self.depth_bytes(i).chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    }
+
+    /// Zero-copy mmap slices for pixels and target for frame i.
+    fn pixtar_slices(&self, i: usize) -> (&[u8], &[u8]) {
+        let mmap = self.pixtar_mmap.as_ref().expect("call seal() before reading");
+        let off = self.pixtar_offsets[i];
+        let n = self.widths[i] * self.heights[i] * 3;
+        (&mmap[off..off + n], &mmap[off + n..off + n * 2])
+    }
+
+    fn dims(&self, i: usize) -> (usize, usize) { (self.widths[i], self.heights[i]) }
 }
 
 impl Drop for PagedCalibrationStore {
     fn drop(&mut self) {
+        drop(self.depth_mmap.take());
+        drop(self.pixtar_mmap.take());
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -504,6 +569,7 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     }
 
     let _ = inf_server.shutdown();
+    store.seal().context("failed to seal calibration store")?;
 
     // --- Pass 1: reservoir-sample depths → adaptive zone boundaries ---
     // Avoids allocating all depth values (would be ~2 GB for 1000 frames).
@@ -513,8 +579,9 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let mut rng: u64 = 0x853c49e6748fea9b_u64; // xorshift64
 
     for i in 0..store.len() {
-        let depth = store.read_depth(i)?;
-        for &d in &depth {
+        for d in store.depth_bytes(i).chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        {
             total_seen += 1;
             if reservoir.len() < RESERVOIR_CAP {
                 reservoir.push(d);
@@ -536,7 +603,9 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     // --- Pass 2: stream frames → build LUT (O(LUT_SIZE³) RAM for accumulators) ---
     let mut lut_builder = StreamingLutBuilder::new(zone_boundaries);
     for i in 0..store.len() {
-        let (pixels_u8, target_u8, depth, w, h) = store.read_frame(i)?;
+        let (w, h) = store.dims(i);
+        let (pixels_u8, target_u8) = store.pixtar_slices(i);
+        let depth = store.read_depth(i);
         let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
             .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
             .collect();
@@ -549,6 +618,7 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let depth_luts = lut_builder.finish();
 
     // --- Pass 3: stream frames → HSL corrections (LUT must be complete first) ---
+    // pixtar.bin is still hot in the OS page cache from pass 2.
     let n_quals = HSL_QUALIFIERS.len();
     let mut h_offset_acc    = vec![0.0_f64; n_quals];
     let mut s_ratio_acc     = vec![0.0_f64; n_quals];
@@ -557,7 +627,8 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let mut total_weight_acc = vec![0.0_f64; n_quals];
 
     for i in 0..store.len() {
-        let (pixels_u8, target_u8, depth, _w, _h) = store.read_frame(i)?;
+        let (pixels_u8, target_u8) = store.pixtar_slices(i);
+        let depth = store.read_depth(i);
         let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
             .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
             .collect();
