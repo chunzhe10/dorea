@@ -20,6 +20,11 @@ use crate::{GradeParams, GpuError};
 #[cfg(feature = "cuda")]
 use dorea_cal::Calibration;
 
+#[cfg(feature = "cuda")]
+mod combined_lut;
+#[cfg(feature = "cuda")]
+pub(crate) use combined_lut::CombinedLut;
+
 // Embedded PTX compiled by build.rs
 #[cfg(feature = "cuda")]
 const LUT_APPLY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/lut_apply.ptx"));
@@ -580,6 +585,18 @@ mod tests {
             );
         }
         assert_ne!(results[0], results[1], "two distinct frames should produce distinct outputs");
+    }
+
+    #[test]
+    fn combined_lut_builds_without_panic() {
+        use crate::cuda::combined_lut::CombinedLut;
+        let cal = make_calibration(5);
+        let params = crate::GradeParams::default();
+        let device = match cudarc::driver::CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("SKIP: no CUDA device ({e})"); return; }
+        };
+        let _lut = CombinedLut::build(&device, &cal, &params).expect("CombinedLut::build failed");
     }
 
     /// `grade_frames_with_capacity` with an empty frame slice must return an empty Vec.
