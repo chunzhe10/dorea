@@ -28,6 +28,7 @@ from .protocol import (
     PongResponse,
     RauneResult,
     DepthResult,
+    DepthBatchResult,
     ErrorResponse,
     OkResponse,
     decode_png,
@@ -153,6 +154,24 @@ def main(argv: Optional[list] = None) -> None:
                 max_size = int(req.get("max_size", 518))
                 depth = depth_model.infer(img, max_size=max_size)
                 resp = DepthResult.from_array(req_id, depth)
+            elif req_type == "depth_batch":
+                if depth_model is None:
+                    raise RuntimeError("Depth Anything model not loaded (--no-depth or load failed)")
+                items = req.get("items", [])
+                imgs = []
+                for item in items:
+                    fmt = item.get("format", "png")
+                    if fmt == "raw_rgb":
+                        imgs.append(decode_raw_rgb(item["image_b64"], int(item["width"]), int(item["height"])))
+                    else:
+                        imgs.append(decode_png(item["image_b64"]))
+                max_size = int(items[0].get("max_size", 518)) if items else 518
+                depths = depth_model.infer_batch(imgs, max_size=max_size)
+                results = [
+                    DepthResult.from_array(item.get("id"), depth).to_dict()
+                    for item, depth in zip(items, depths)
+                ]
+                resp = DepthBatchResult(results=results)
             elif req_type == "shutdown":
                 resp = OkResponse()
                 try:

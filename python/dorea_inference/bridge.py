@@ -92,6 +92,13 @@ def run_depth_cpu(frame_rgb: np.ndarray, max_size: int = 518) -> np.ndarray:
     return _depth_model.infer(frame_rgb, max_size=max_size)
 
 
+def run_depth_batch_cpu(imgs: "list[np.ndarray]", max_size: int = 518) -> "list[np.ndarray]":
+    """Run batch depth inference, returning list of numpy arrays."""
+    if _depth_model is None:
+        raise RuntimeError("Depth model not loaded — call load_depth_model() first")
+    return _depth_model.infer_batch(imgs, max_size=max_size)
+
+
 def run_raune_cpu(frame_rgb: np.ndarray, max_size: int = 1024) -> np.ndarray:
     """Run RAUNE-Net on CPU, return numpy array."""
     if _raune_model is None:

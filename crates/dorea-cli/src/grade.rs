@@ -1,5 +1,6 @@
 // `dorea grade` — end-to-end video grading pipeline.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use clap::Args;
@@ -8,7 +9,7 @@ use anyhow::{Context, Result};
 use dorea_cal::Calibration;
 use dorea_gpu::{grade_frame, GradeParams};
 use dorea_video::ffmpeg::{self, FrameEncoder};
-use dorea_video::inference::{InferenceConfig, InferenceServer};
+use dorea_video::inference::{DepthBatchItem, InferenceConfig, InferenceServer};
 
 #[cfg(feature = "cuda")]
 use dorea_gpu::cuda::CudaGrader;
@@ -111,65 +112,15 @@ fn lerp_depth(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
         .collect()
 }
 
-/// A buffered frame waiting to be output once the next keyframe depth is available.
-struct BufferedFrame {
-    index: u64,
-    pixels: Vec<u8>,
-    width: usize,
-    height: usize,
-}
+/// Maximum number of keyframes per depth inference batch.
+const DEPTH_BATCH_SIZE: usize = 32;
 
-/// Flush buffered frames by interpolating depth between keyframes, then grading each
-/// frame's actual source pixels. Eliminates ghosting from pixel-wise RGB blending.
-///
-/// When `depth_after` is `None` (scene cuts / end-of-video), uses `depth_before` directly.
-fn flush_buffer_with_depth(
-    buffer: &mut Vec<BufferedFrame>,
-    depth_before: &Option<Vec<f32>>,
-    depth_after: Option<&Vec<f32>>,
-    calibration: &Calibration,
-    params: &GradeParams,
-    encoder: &mut FrameEncoder,
-    frame_count: &mut u64,
-    info: &ffmpeg::VideoInfo,
-    #[cfg(feature = "cuda")] cuda_grader: Option<&CudaGrader>,
-) -> Result<()> {
-    let Some(before) = depth_before else {
-        buffer.clear();
-        return Ok(());
-    };
-
-    let n_buffered = buffer.len();
-    let interval = (n_buffered + 1) as f32;
-
-    for (buf_idx, bf) in buffer.drain(..).enumerate() {
-        // Interpolate depth, then grade the actual source frame
-        let depth = if let Some(after) = depth_after {
-            let t = (buf_idx + 1) as f32 / interval;
-            lerp_depth(before, after, t)
-        } else {
-            before.clone()
-        };
-
-        #[cfg(feature = "cuda")]
-        let graded = grade_with_grader(
-            cuda_grader,
-            &bf.pixels, &depth, bf.width, bf.height, calibration, params,
-        ).map_err(|e| anyhow::anyhow!("Grading failed for buffered frame {}: {e}", bf.index))?;
-        #[cfg(not(feature = "cuda"))]
-        let graded = grade_frame(
-            &bf.pixels, &depth, bf.width, bf.height, calibration, params,
-        ).map_err(|e| anyhow::anyhow!("Grading failed for buffered frame {}: {e}", bf.index))?;
-
-        encoder.write_frame(&graded).context("encoder write failed")?;
-        *frame_count += 1;
-
-        if *frame_count % 100 == 0 {
-            let pct = *frame_count as f64 / info.frame_count.max(1) as f64 * 100.0;
-            log::info!("Progress: {frame_count}/{} frames ({:.1}%)", info.frame_count, pct);
-        }
-    }
-    Ok(())
+/// A keyframe collected during the proxy-decode pass.
+struct KeyframeEntry {
+    frame_index: u64,
+    proxy_pixels: Vec<u8>,
+    /// True if this keyframe follows a scene cut (suppresses lerp across cuts).
+    scene_cut_before: bool,
 }
 
 /// Grade a single frame, reusing a pre-initialized CudaGrader when available.
@@ -240,7 +191,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
         auto_calibrate(&args, &info)?
     };
 
-    // Spawn inference server for per-frame depth (depth-only; RAUNE is not needed here).
+    // Spawn inference server (depth-only; RAUNE is not needed for grading).
     let inf_cfg = InferenceConfig {
         skip_raune: true,
         ..build_inference_config(&args)
@@ -260,136 +211,152 @@ pub fn run(args: GradeArgs) -> Result<()> {
             None
         }
     };
-    // Decode and grade frames
-    let frames = ffmpeg::decode_frames(&args.input, &info)
-        .context("failed to spawn ffmpeg decoder")?;
 
-    let mut frame_count = 0u64;
     let interp_enabled = !args.no_depth_interp;
     let scene_cut_threshold = args.depth_skip_threshold * 10.0;
 
-    // Temporal interpolation state
-    let mut last_keyframe_proxy: Option<Vec<u8>> = None;
-    let mut last_keyframe_depth: Option<Vec<f32>> = None;
-    let mut frame_buffer: Vec<BufferedFrame> = Vec::new();
-    let mut frames_since_keyframe = 0usize;
-    let max_buffer = (args.depth_max_interval as f32 * 1.5) as usize;
+    // -----------------------------------------------------------------------
+    // Pass 1: proxy decode + MSE keyframe detection
+    // -----------------------------------------------------------------------
+    let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(info.width, info.height, args.proxy_size);
+    let proxy_frames = ffmpeg::decode_frames_scaled(&args.input, &info, proxy_w, proxy_h)
+        .context("failed to spawn ffmpeg proxy decoder")?;
+
+    let mut keyframes: Vec<KeyframeEntry> = Vec::new();
+    let mut last_proxy: Option<Vec<u8>> = None;
+    let mut frames_since_kf = 0usize;
+
+    for frame_result in proxy_frames {
+        let frame = frame_result.context("proxy frame decode error")?;
+        let mse = last_proxy.as_ref().map(|lp| frame_mse(&frame.pixels, lp));
+        let scene_cut = mse.map_or(false, |m| m > scene_cut_threshold);
+        let is_keyframe = !interp_enabled
+            || last_proxy.is_none()
+            || scene_cut
+            || frames_since_kf >= args.depth_max_interval
+            || mse.map_or(false, |m| m > args.depth_skip_threshold);
+
+        if is_keyframe {
+            if scene_cut {
+                log::info!(
+                    "Scene cut at frame {} (MSE={:.6})",
+                    frame.index,
+                    mse.unwrap_or(0.0),
+                );
+            }
+            keyframes.push(KeyframeEntry {
+                frame_index: frame.index,
+                proxy_pixels: frame.pixels.clone(),
+                scene_cut_before: scene_cut,
+            });
+            last_proxy = Some(frame.pixels);
+            frames_since_kf = 0;
+        } else {
+            frames_since_kf += 1;
+        }
+    }
+    log::info!("Pass 1 complete: {} keyframes detected", keyframes.len());
+
+    // -----------------------------------------------------------------------
+    // Batch depth inference
+    // -----------------------------------------------------------------------
+    let batch_items: Vec<DepthBatchItem> = keyframes.iter().enumerate().map(|(i, kf)| {
+        DepthBatchItem {
+            id: format!("kf_{i:06}"),
+            pixels: kf.proxy_pixels.clone(),
+            width: proxy_w,
+            height: proxy_h,
+            max_size: args.proxy_size,
+        }
+    }).collect();
+
+    let mut keyframe_depths: HashMap<u64, Vec<f32>> = HashMap::new();
+    for (chunk_kfs, chunk_items) in keyframes
+        .chunks(DEPTH_BATCH_SIZE)
+        .zip(batch_items.chunks(DEPTH_BATCH_SIZE))
+    {
+        let results = inf_server.run_depth_batch(chunk_items)
+            .unwrap_or_else(|e| {
+                log::warn!("Depth batch failed: {e} — using uniform depth 0.5");
+                chunk_items.iter().map(|it| {
+                    (it.id.clone(), vec![0.5f32; proxy_w * proxy_h], proxy_w, proxy_h)
+                }).collect()
+            });
+
+        for (kf, (_, depth_raw, dw, dh)) in chunk_kfs.iter().zip(results.iter()) {
+            let depth = if *dw == info.width && *dh == info.height {
+                depth_raw.clone()
+            } else {
+                InferenceServer::upscale_depth(depth_raw, *dw, *dh, info.width, info.height)
+            };
+            keyframe_depths.insert(kf.frame_index, depth);
+        }
+    }
+    log::info!("Batch depth inference complete ({} keyframes)", keyframes.len());
+
+    // Ordered list of (frame_index, scene_cut_before) for pass-2 lerp lookup.
+    let kf_index_list: Vec<(u64, bool)> = keyframes.iter()
+        .map(|kf| (kf.frame_index, kf.scene_cut_before))
+        .collect();
+
+    // -----------------------------------------------------------------------
+    // Pass 2: full-resolution decode + depth lookup + grade + encode
+    // -----------------------------------------------------------------------
+    let frames = ffmpeg::decode_frames(&args.input, &info)
+        .context("failed to spawn ffmpeg full-res decoder")?;
+
+    let mut kf_cursor = 0usize;
+    let mut frame_count = 0u64;
 
     for frame_result in frames {
         let frame = frame_result.context("frame decode error")?;
+        let fi = frame.index;
 
-        // Downscale to proxy resolution (needed for MSE check)
-        let (proxy_w, proxy_h) =
-            dorea_video::resize::proxy_dims(frame.width, frame.height, args.proxy_size);
-        let proxy_pixels = if proxy_w != frame.width || proxy_h != frame.height {
-            dorea_video::resize::resize_rgb_bilinear(
-                &frame.pixels, frame.width, frame.height, proxy_w, proxy_h,
-            )
-        } else {
-            frame.pixels.clone()
-        };
+        // Advance cursor: kf_index_list[kf_cursor].0 is the most recent keyframe ≤ fi
+        while kf_cursor + 1 < kf_index_list.len() && kf_index_list[kf_cursor + 1].0 <= fi {
+            kf_cursor += 1;
+        }
 
-        // Determine if this frame is a keyframe
-        let is_keyframe = if !interp_enabled {
-            true
-        } else if last_keyframe_proxy.is_none() {
-            true // First frame
-        } else {
-            let mse = frame_mse(&proxy_pixels, last_keyframe_proxy.as_ref().unwrap());
-            let is_scene_cut = mse > scene_cut_threshold;
-            let exceeds_interval = frames_since_keyframe >= args.depth_max_interval;
-            let exceeds_threshold = mse > args.depth_skip_threshold;
-            let buffer_overflow = frame_buffer.len() >= max_buffer;
+        let (prev_kf_idx, _) = kf_index_list[kf_cursor];
+        let prev_depth = keyframe_depths
+            .get(&prev_kf_idx)
+            .expect("prev keyframe depth missing — logic error");
 
-            if is_scene_cut {
-                log::info!("Scene cut at frame {} (MSE={:.6}) — flushing buffer", frame.index, mse);
-                // Flush buffer using last keyframe depth (no forward interp across cuts)
-                flush_buffer_with_depth(
-                    &mut frame_buffer, &last_keyframe_depth, None,
-                    &calibration, &params,
-                    &mut encoder, &mut frame_count, &info,
-                    #[cfg(feature = "cuda")] cuda_grader.as_ref(),
-                )?;
-                frames_since_keyframe = 0;
-            }
-
-            is_scene_cut || exceeds_interval || exceeds_threshold || buffer_overflow
-        };
-
-        if is_keyframe {
-            // Full pipeline: depth inference + grading
-            let (depth_proxy, dw, dh) = inf_server
-                .run_depth(
-                    &frame.index.to_string(),
-                    &proxy_pixels, proxy_w, proxy_h, args.proxy_size,
-                )
-                .unwrap_or_else(|e| {
-                    log::warn!("Depth inference failed for frame {}: {e} — uniform depth", frame.index);
-                    (vec![0.5f32; proxy_w * proxy_h], proxy_w, proxy_h)
-                });
-
-            let depth = if dw == frame.width && dh == frame.height {
-                depth_proxy
+        let depth = if fi == prev_kf_idx {
+            prev_depth.clone()
+        } else if let Some(&(next_kf_idx, scene_cut_before_next)) = kf_index_list.get(kf_cursor + 1) {
+            if scene_cut_before_next {
+                prev_depth.clone() // Don't lerp across scene cut
             } else {
-                InferenceServer::upscale_depth(&depth_proxy, dw, dh, frame.width, frame.height)
-            };
-
-            #[cfg(feature = "cuda")]
-            let graded = grade_with_grader(
-                cuda_grader.as_ref(),
-                &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-            ).map_err(|e| anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index))?;
-            #[cfg(not(feature = "cuda"))]
-            let graded = grade_frame(
-                &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-            ).map_err(|e| anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index))?;
-
-            // Flush any buffered frames — interpolate depth between previous and this keyframe
-            if !frame_buffer.is_empty() {
-                flush_buffer_with_depth(
-                    &mut frame_buffer, &last_keyframe_depth, Some(&depth),
-                    &calibration, &params,
-                    &mut encoder, &mut frame_count, &info,
-                    #[cfg(feature = "cuda")] cuda_grader.as_ref(),
-                )?;
+                let next_depth = keyframe_depths
+                    .get(&next_kf_idx)
+                    .expect("next keyframe depth missing — logic error");
+                let t = (fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32;
+                lerp_depth(prev_depth, next_depth, t)
             }
-
-            // Write this keyframe's graded output
-            encoder.write_frame(&graded).context("encoder write failed")?;
-            frame_count += 1;
-
-            if frame_count % 100 == 0 {
-                let pct = frame_count as f64 / info.frame_count.max(1) as f64 * 100.0;
-                log::info!("Progress: {frame_count}/{} frames ({:.1}%)", info.frame_count, pct);
-            }
-
-            // Update keyframe state
-            last_keyframe_proxy = Some(proxy_pixels);
-            last_keyframe_depth = Some(depth);
-            frames_since_keyframe = 0;
         } else {
-            // Buffer this frame's pixels — will be graded with interpolated depth
-            frame_buffer.push(BufferedFrame {
-                index: frame.index,
-                pixels: frame.pixels,
-                width: frame.width,
-                height: frame.height,
-            });
-            frames_since_keyframe += 1;
+            prev_depth.clone() // Past last keyframe
+        };
+
+        #[cfg(feature = "cuda")]
+        let graded = grade_with_grader(
+            cuda_grader.as_ref(),
+            &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
+        ).map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?;
+        #[cfg(not(feature = "cuda"))]
+        let graded = grade_frame(
+            &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
+        ).map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?;
+
+        encoder.write_frame(&graded).context("encoder write failed")?;
+        frame_count += 1;
+
+        if frame_count % 100 == 0 {
+            let pct = frame_count as f64 / info.frame_count.max(1) as f64 * 100.0;
+            log::info!("Progress: {frame_count}/{} frames ({:.1}%)", info.frame_count, pct);
         }
     }
 
-    // Flush any remaining buffered frames (end of video — use last keyframe depth)
-    if !frame_buffer.is_empty() {
-        flush_buffer_with_depth(
-            &mut frame_buffer, &last_keyframe_depth, None,
-            &calibration, &params,
-            &mut encoder, &mut frame_count, &info,
-            #[cfg(feature = "cuda")] cuda_grader.as_ref(),
-        )?;
-    }
-
-    // Finalize
     let _ = inf_server.shutdown();
     encoder.finish().context("ffmpeg encoder failed to finalize")?;
 

@@ -114,6 +114,15 @@ class DepthResult:
 
 
 @dataclass
+class DepthBatchResult:
+    results: list  # list of DepthResult.to_dict()
+    type: str = "depth_batch_result"
+
+    def to_dict(self) -> dict:
+        return {"type": self.type, "results": self.results}
+
+
+@dataclass
 class ErrorResponse:
     id: Optional[str]
     message: str

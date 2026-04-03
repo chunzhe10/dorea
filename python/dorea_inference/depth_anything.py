@@ -108,6 +108,54 @@ class DepthAnythingInference:
 
         return depth
 
+    def infer_batch(self, imgs: "list[np.ndarray]", max_size: int = 518) -> "list[np.ndarray]":
+        """Run depth estimation on a batch of uint8 HxWx3 RGB images.
+
+        All images must have the same source dimensions (guaranteed when called
+        with proxy-size keyframes from a single video). Stacks into one
+        (N, 3, H, W) forward pass. Each output normalized independently to [0,1].
+
+        Returns list of (H, W) float32 depth maps at inference resolution.
+        Falls back to sequential infer() if images have different post-resize dims.
+        """
+        if not imgs:
+            return []
+
+        import torch
+        from PIL import Image as _Image
+
+        pils = [_Image.fromarray(img) for img in imgs]
+        resized = [_resize_for_depth(pil, max_size) for pil in pils]
+
+        dims = set(r.size for r in resized)  # (tw, th) tuples
+        if len(dims) > 1:
+            return [self.infer(img, max_size) for img in imgs]
+
+        arrays = []
+        for r in resized:
+            arr = np.array(r).astype(np.float32) / 255.0
+            arr = (arr - self._MEAN) / self._STD
+            arrays.append(torch.from_numpy(arr).permute(2, 0, 1))
+
+        batch = torch.stack(arrays).to(self.device)  # (N, 3, H, W)
+
+        with torch.no_grad():
+            outputs = self.model(pixel_values=batch)
+
+        depths = outputs.predicted_depth.cpu().numpy()  # (N, H, W)
+
+        result = []
+        for i in range(len(imgs)):
+            depth = depths[i]
+            d_min, d_max = float(depth.min()), float(depth.max())
+            if d_max - d_min < 1e-6:
+                depth = np.zeros_like(depth, dtype=np.float32)
+            else:
+                depth = ((depth - d_min) / (d_max - d_min)).astype(np.float32)
+            result.append(depth)
+
+        return result
+
     def infer_gpu(self, img_rgb: np.ndarray, max_size: int = 518) -> "torch.Tensor":
         """Run depth estimation, return on-device f32 tensor (not copied to CPU).
 

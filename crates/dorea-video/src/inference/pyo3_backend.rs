@@ -58,6 +58,18 @@ impl Default for InferenceConfig {
     }
 }
 
+/// A single image item for batch depth inference.
+pub struct DepthBatchItem {
+    /// Unique identifier (e.g. "kf_000042") returned in the response for correlation.
+    pub id: String,
+    /// Raw RGB24 pixels, row-major.
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    /// Max dimension for depth model resize (passed to Python as `max_size`).
+    pub max_size: usize,
+}
+
 /// Guard that prevents Python's GC from reclaiming a GPU tensor while Rust
 /// holds the device pointer. Drop this guard when Rust is done with the pointer.
 pub struct DepthTensorGuard {
@@ -297,6 +309,76 @@ impl InferenceServer {
                 height: guard_height,
                 _not_send: std::marker::PhantomData,
             })
+        })
+    }
+
+    /// Run Depth Anything V2 on a batch of images in a single Python call.
+    ///
+    /// Returns `Vec<(id, depth_f32, out_width, out_height)>` in the same order as `items`.
+    #[allow(clippy::type_complexity)]
+    pub fn run_depth_batch(
+        &self,
+        items: &[DepthBatchItem],
+    ) -> Result<Vec<(String, Vec<f32>, usize, usize)>, InferenceError> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let max_size = items[0].max_size;
+
+        Python::with_gil(|py| {
+            let bridge = self.bridge.bind(py);
+
+            // Build Python list of (H, W, 3) numpy arrays
+            let py_list = pyo3::types::PyList::empty_bound(py);
+            for item in items {
+                let np_flat = numpy::PyArray1::from_slice_bound(py, &item.pixels);
+                let np_reshaped = np_flat
+                    .call_method1("reshape", ((item.height, item.width, 3),))
+                    .map_err(|e| InferenceError::Ipc(format!("reshape for id={}: {e}", item.id)))?;
+                py_list
+                    .append(np_reshaped)
+                    .map_err(|e| InferenceError::Ipc(format!("list append for id={}: {e}", item.id)))?;
+            }
+
+            // Call bridge.run_depth_batch_cpu(imgs, max_size)
+            let result = bridge
+                .call_method1("run_depth_batch_cpu", (py_list, max_size))
+                .map_err(|e| Self::map_python_error(py, e))?;
+
+            // Result is a Python list of (H, W) float32 numpy arrays
+            let result_list = result
+                .downcast::<pyo3::types::PyList>()
+                .map_err(|e| InferenceError::Ipc(format!("run_depth_batch_cpu result not a list: {e}")))?;
+
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let arr = result_list
+                    .get_item(i)
+                    .map_err(|e| InferenceError::Ipc(format!("get result[{i}] for id={}: {e}", item.id)))?;
+
+                let shape: Vec<usize> = arr
+                    .getattr("shape")
+                    .map_err(|e| InferenceError::Ipc(format!("get shape[{i}]: {e}")))?
+                    .extract()
+                    .map_err(|e| InferenceError::Ipc(format!("extract shape[{i}]: {e}")))?;
+
+                let out_h = shape[0];
+                let out_w = shape[1];
+
+                let flat = arr
+                    .call_method1("reshape", ((-1_i32,),))
+                    .map_err(|e| InferenceError::Ipc(format!("flatten result[{i}]: {e}")))?;
+                let depth_data: Vec<f32> = flat
+                    .call_method0("tolist")
+                    .map_err(|e| InferenceError::Ipc(format!("tolist[{i}]: {e}")))?
+                    .extract()
+                    .map_err(|e| InferenceError::Ipc(format!("extract depth[{i}]: {e}")))?;
+
+                out.push((item.id.clone(), depth_data, out_w, out_h));
+            }
+
+            Ok(out)
         })
     }
 

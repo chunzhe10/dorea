@@ -241,6 +241,63 @@ fn read_exact(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(pos)
 }
 
+/// Decode all frames from a video file at a custom (scaled) resolution.
+///
+/// Uses ffmpeg `-vf scale=WxH`. If the requested size matches `info`, delegates
+/// to the existing `decode_frames` path to avoid an extra scale filter.
+pub fn decode_frames_scaled(
+    input: &Path,
+    info: &VideoInfo,
+    width: usize,
+    height: usize,
+) -> Result<impl Iterator<Item = Result<Frame, FfmpegError>>, FfmpegError> {
+    let child = if width == info.width && height == info.height {
+        spawn_decoder(input, info)?
+    } else {
+        spawn_decoder_at(input, width, height)?
+    };
+    Ok(FrameReader::new(child, width, height))
+}
+
+fn spawn_decoder_at(input: &Path, width: usize, height: usize) -> Result<Child, FfmpegError> {
+    let input_str = input.to_str().unwrap_or("");
+    let scale_str = format!("scale={width}x{height}");
+
+    let hw_result = Command::new("ffmpeg")
+        .args([
+            "-hwaccel", "nvdec",
+            "-i", input_str,
+            "-vf", &scale_str,
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Ok(child) = hw_result {
+        return Ok(child);
+    } else if let Err(ref e) = hw_result {
+        log::debug!("nvdec scaled spawn failed ({e}), falling back to software decode");
+    }
+
+    Command::new("ffmpeg")
+        .args([
+            "-i", input_str,
+            "-vf", &scale_str,
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(FfmpegError::NotFound)
+}
+
 /// Extract a single frame at a given timestamp (seconds).
 pub fn extract_frame_at(
     input: &Path,

@@ -61,6 +61,18 @@ impl Default for InferenceConfig {
     }
 }
 
+/// A single image item for batch depth inference.
+pub struct DepthBatchItem {
+    /// Unique identifier (e.g. "kf_000042") returned in the response for correlation.
+    pub id: String,
+    /// Raw RGB24 pixels, row-major.
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    /// Max dimension for depth model resize (passed to Python as `max_size`).
+    pub max_size: usize,
+}
+
 /// Active connection to the Python inference subprocess.
 pub struct InferenceServer {
     child: Child,
@@ -294,6 +306,80 @@ impl InferenceServer {
             .collect();
 
         Ok((depth, w, h))
+    }
+
+    /// Run Depth Anything V2 on a batch of images in a single IPC round-trip.
+    ///
+    /// Returns `Vec<(id, depth_f32, out_width, out_height)>` in the same order as `items`.
+    #[allow(clippy::type_complexity)]
+    pub fn run_depth_batch(
+        &mut self,
+        items: &[DepthBatchItem],
+    ) -> Result<Vec<(String, Vec<f32>, usize, usize)>, InferenceError> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let json_items: Vec<serde_json::Value> = items.iter().map(|item| {
+            let b64 = B64.encode(&item.pixels);
+            serde_json::json!({
+                "id": item.id,
+                "image_b64": b64,
+                "format": "raw_rgb",
+                "width": item.width,
+                "height": item.height,
+                "max_size": item.max_size
+            })
+        }).collect();
+
+        let req = serde_json::json!({
+            "type": "depth_batch",
+            "items": json_items
+        });
+        self.send_line(&req.to_string())?;
+
+        let resp = self.recv_line()?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| InferenceError::Ipc(format!("depth_batch response parse: {e}")))?;
+
+        if v["type"].as_str() == Some("error") {
+            return Err(InferenceError::ServerError(
+                v["message"].as_str().unwrap_or("unknown error").to_string(),
+            ));
+        }
+        if v["type"].as_str() != Some("depth_batch_result") {
+            return Err(InferenceError::Ipc(format!("unexpected response type: {resp}")));
+        }
+
+        let results = v["results"].as_array()
+            .ok_or_else(|| InferenceError::Ipc("missing results array in depth_batch_result".to_string()))?;
+
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            let id = r["id"].as_str().unwrap_or("").to_string();
+            let w = r["width"].as_u64().unwrap_or(0) as usize;
+            let h = r["height"].as_u64().unwrap_or(0) as usize;
+            let b64_out = r["depth_f32_b64"].as_str()
+                .ok_or_else(|| InferenceError::Ipc(format!("missing depth_f32_b64 for id={id}")))?;
+
+            let raw = B64.decode(b64_out)
+                .map_err(|e| InferenceError::Ipc(format!("base64 decode for id={id}: {e}")))?;
+
+            if raw.len() != w * h * 4 {
+                return Err(InferenceError::Ipc(format!(
+                    "depth buffer size mismatch for id={id}: got {} bytes, expected {}",
+                    raw.len(), w * h * 4
+                )));
+            }
+
+            let depth: Vec<f32> = raw.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+
+            out.push((id, depth, w, h));
+        }
+
+        Ok(out)
     }
 
     /// Bilinearly upscale a depth map from (src_w, src_h) to (dst_w, dst_h).
