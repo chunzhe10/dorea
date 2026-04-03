@@ -159,10 +159,13 @@ impl CudaGrader {
             .map_err(map_cudarc_error)?;
         }
 
-        // Free LUT-specific device memory (drop early)
+        // Free LUT-specific device memory (drop early to reduce peak VRAM)
+        // Safe: cudarc uses stream-ordered cuMemFreeAsync on Ampere+ (sm_86).
+        // Do not relax sm_86 target without auditing these early drops.
         drop(d_rgb_in);
         drop(d_luts);
         drop(d_boundaries);
+        drop(d_depth); // depth only needed for LUT stage
 
         // =====================================================================
         // HSL CORRECT
