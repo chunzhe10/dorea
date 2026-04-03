@@ -16,7 +16,9 @@ compute (LUT trilinear + HSL correct + 3-pass clarity blur) is <1 ms total at
 during grading — the GPU idles through allocations rather than computing.
 
 Measured throughput before this change: ~83 ms/frame at 1080p (benchmark result
-2026-04-03). Expected after: ~5 ms/frame.
+2026-04-03). Expected after: ~6–10 ms/frame. `cudaMalloc` overhead (~60–70 ms)
+is eliminated; 8 `htod_sync_copy_into` calls each still call `stream.synchronize()`
+contributing ~3–6 ms total.
 
 ## Decision
 
@@ -84,8 +86,9 @@ cal_bufs: RefCell<Option<CalibrationBuffers>>,
    reallocate all 8 resolution slices.
 2. Borrow `cal_bufs` mutably; if `(n_zones, lut_size)` differs, drop and
    reallocate all 6 calibration slices.
-3. Copy input data into pre-allocated slices using `htod_copy` (no allocation,
-   async). For calibration slices: copy the current frame's calibration values in.
+3. Copy input data into pre-allocated slices using `htod_sync_copy_into` (no
+   allocation; copies into existing device slice then calls `stream.synchronize()`).
+   8 sync barriers remain per frame — these take ~3–6 ms total, not zero.
 4. Launch LUT → HSL → clarity kernels (unchanged).
 5. `dtoh_sync_copy` from `d_rgb_out` to return the result.
 

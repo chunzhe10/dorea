@@ -6,6 +6,8 @@
 
 **Architecture:** `CudaGrader` gains two `RefCell<Option<...>>` fields — `ResolutionBuffers` (8 slices, keyed by width×height) and `CalibrationBuffers` (6 slices, keyed by n_zones×lut_size). On each frame call, if the key matches the cached buffers they are reused via `htod_sync_copy_into` (copy only, no allocation); otherwise they are dropped and reallocated. Zero `cudaMalloc` calls per frame in steady state.
 
+**Expected throughput improvement:** ~83 ms/frame → ~6–10 ms/frame at 1080p. `cudaMalloc` overhead (~60–70 ms) is eliminated; 8 `htod_sync_copy_into` calls remain and each still calls `stream.synchronize()`, contributing ~3–6 ms. The ~5 ms figure in the design doc is aspirational — expect 6–10 ms in practice.
+
 **Tech Stack:** Rust, cudarc 0.12.1 (`htod_sync_copy_into`, `alloc_zeros`, `dtoh_sync_copy`), `RefCell` for interior mutability, `#[cfg(feature = "cuda")]` throughout.
 
 ---
@@ -169,8 +171,10 @@ mod tests {
 
 ```bash
 cd /workspaces/dorea-workspace/repos/dorea
-cargo test -p dorea-gpu --test -- cuda::tests 2>&1 | tail -20
+cargo test -p dorea-gpu --features cuda -- cuda::tests 2>&1 | tail -20
 ```
+
+Note: `--features cuda` is required — the test block is gated on `#[cfg(all(test, feature = "cuda"))]` and will silently be absent without it.
 
 Expected: all 3 tests PASS. If any fail, the current implementation has a bug — do not proceed until they pass.
 
@@ -416,12 +420,41 @@ This is the core change. The method signature is unchanged. The entire body is r
         let n = width * height;
         let dev = &self.device;
 
+        // Input length guards — must be checked BEFORE any borrow_mut, because
+        // htod_sync_copy_into asserts src.len() == dst.len() and panics (not Err)
+        // if they differ while a RefMut is live, permanently poisoning the RefCell.
+        if pixels.len() != n * 3 {
+            return Err(GpuError::InvalidInput(format!(
+                "pixels length {} != width*height*3 = {}", pixels.len(), n * 3
+            )));
+        }
+        if depth.len() != n {
+            return Err(GpuError::InvalidInput(format!(
+                "depth length {} != width*height = {}", depth.len(), n
+            )));
+        }
+
+        let depth_luts = &calibration.depth_luts;
+        let n_zones = depth_luts.n_zones();
+        if n_zones == 0 {
+            return Err(GpuError::InvalidInput(
+                "calibration has n_zones=0; GPU LUT stage requires at least 1 zone".into()
+            ));
+        }
+
         // --- u8 -> f32 (host side, no allocation cost) ---
         let rgb_f32: Vec<f32> = pixels.iter().map(|&p| p as f32 / 255.0).collect();
 
         // =====================================================================
         // ENSURE RESOLUTION BUFFERS  (reallocate only on resolution change)
         // =====================================================================
+        // SAFETY: dtoh_sync_copy at the end of every frame calls device.synchronize(),
+        // which guarantees the CUDA stream is idle before this borrow_mut runs.
+        // Dropping old ResolutionBuffers triggers cuMemFreeAsync (stream-ordered on
+        // sm_86). The synchronize() above ensures no kernel is reading the old buffers
+        // when they are freed. Partial OOM in alloc_resolution_buffers propagates via ?
+        // and partially-constructed ResolutionBuffers are dropped correctly — cudarc's
+        // CudaSlice::Drop calls cuMemFreeAsync for each successfully allocated slice.
         {
             let mut slot = self.res_bufs.borrow_mut();
             let needs = slot.as_ref().map_or(true, |b| b.width != width || b.height != height);
@@ -433,9 +466,7 @@ This is the core change. The method signature is unchanged. The entire body is r
         // =====================================================================
         // ENSURE CALIBRATION BUFFERS  (reallocate only on shape change)
         // =====================================================================
-        let depth_luts = &calibration.depth_luts;
-        let n_zones = depth_luts.n_zones();
-        let lut_size = if n_zones > 0 { depth_luts.luts[0].size } else { 33 };
+        let lut_size = depth_luts.luts[0].size;
         {
             let mut slot = self.cal_bufs.borrow_mut();
             let needs = slot.as_ref().map_or(true, |b| b.n_zones != n_zones || b.lut_size != lut_size);
@@ -716,7 +747,7 @@ Expected: no errors. Common issues to watch for:
 
 ```bash
 cd /workspaces/dorea-workspace/repos/dorea
-cargo test -p dorea-gpu 2>&1 | tail -30
+cargo test -p dorea-gpu --features cuda -- cuda::tests 2>&1 | tail -30
 ```
 
 Expected: `same_resolution_twice_is_deterministic`, `resolution_switch_preserves_output`, `calibration_shape_change_does_not_error` all PASS.
@@ -736,20 +767,79 @@ calibration shape changes."
 
 ---
 
-### Task 5: Run the benchmark and record the improvement
+### Task 5: Update `per_frame_vram_bytes` for the new 4-RGB-plane layout
+
+**Files:**
+- Modify: `crates/dorea-gpu/src/device.rs`
+
+After the refactor, `CudaGrader` holds 4 RGB planes simultaneously (`d_rgb_in`, `d_rgb_after_lut`, `d_rgb_after_hsl`, `d_rgb_out`) instead of 3. The `AdaptiveBatcher` uses `per_frame_vram_bytes` to size frame batches — it must reflect the actual persistent held layout.
+
+- [ ] **Step 1: Update the function body in `device.rs`**
+
+  In `crates/dorea-gpu/src/device.rs`, change:
+  ```rust
+  // Peak during LUT stage: d_rgb_in + d_depth + d_luts + d_rgb_after_lut
+  // Peak during clarity: d_rgb_after_hsl + d_proxy_l + d_blur_a + d_blur_b + d_rgb_out
+  // Conservative: 3 RGB planes + depth + LUT budget + 3 proxy planes
+  3 * rgb_f32 + depth_f32 + lut_budget + 3 * proxy_f32
+  ```
+
+  To:
+  ```rust
+  // Pre-allocated buffers held for full frame lifetime (4 RGB planes, not 3):
+  // d_rgb_in, d_rgb_after_lut, d_rgb_after_hsl, d_rgb_out (all n*3*4 bytes)
+  // + d_depth (n*4) + d_proxy_l + d_blur_a + d_blur_b (proxy*4 each)
+  // + lut_budget for CalibrationBuffers
+  4 * rgb_f32 + depth_f32 + lut_budget + 3 * proxy_f32
+  ```
+
+- [ ] **Step 2: Update the `per_frame_vram_1080p` test in `device.rs`**
+
+  Find the test at line ~100. Change the expected computation from `3 * rgb_f32` to `4 * rgb_f32`:
+  ```rust
+  let expected = 4 * rgb_f32 + depth_f32 + lut_budget + 3 * proxy_f32;
+  ```
+
+  Also update the comment block above: `// Conservative: 4 RGB planes + depth + LUT budget + 3 proxy planes`
+
+- [ ] **Step 3: Run the test to confirm it passes**
+
+```bash
+cd /workspaces/dorea-workspace/repos/dorea
+cargo test -p dorea-gpu --features cuda -- device::tests 2>&1 | tail -10
+```
+
+Expected: `per_frame_vram_1080p` PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/dorea-gpu/src/device.rs
+git commit -m "fix(dorea-gpu): per_frame_vram_bytes accounts for 4 RGB planes after pre-allocation"
+```
+
+---
+
+### Task 6: Run the benchmark and record the improvement
 
 **Files:**
 - No code changes — benchmark run only.
 
-- [ ] **Step 1: Run the Criterion benchmark**
+- [ ] **Step 0: Save a pre-refactor baseline (run this before Task 4, after Task 3)**
 
 ```bash
 cd /workspaces/dorea-workspace/repos/dorea
-cargo bench -p dorea-gpu 2>&1 | tee /tmp/bench_after_prealloc.txt
+cargo bench -p dorea-gpu --features cuda -- --save-baseline before_prealloc 2>&1 | tail -10
 ```
 
-Expected: `grading/with_grader/1080p` time should drop from ~83 ms to ~5–15 ms.
-The `grading/cpu/1080p` path should be unchanged (CPU path is not affected).
+- [ ] **Step 1: Run the Criterion benchmark against baseline**
+
+```bash
+cd /workspaces/dorea-workspace/repos/dorea
+cargo bench -p dorea-gpu --features cuda -- --baseline before_prealloc 2>&1 | tee /tmp/bench_after_prealloc.txt
+```
+
+Expected: `grading/with_grader/1080p` shows at least **80% reduction** from the 83 ms baseline (≤ 16 ms). If the improvement is less than 80%, do not mark this task complete — investigate before merging. The `grading/cpu/1080p` path must be unchanged.
 
 - [ ] **Step 2: Check Criterion comparison output**
 
@@ -768,7 +858,7 @@ The `grading/cpu/1080p` path should be unchanged (CPU path is not affected).
   - `source_origin`: `"repo:dorea"`
   - `content_role`: `"finding"`
   - Title: `"CudaGrader buffer pre-allocation benchmark result"`
-  - Body: include the before (83 ms/frame) and after times from Criterion output.
+  - Body: include the before (83 ms/frame) and after times from Criterion output, note whether the ≥80% threshold was met.
 
 ---
 
@@ -782,11 +872,15 @@ The `grading/cpu/1080p` path should be unchanged (CPU path is not affected).
 - ✅ Resolution-change reallocation → Task 4
 - ✅ Calibration-shape-change reallocation → Task 4
 - ✅ `htod_sync_copy_into` replacing `htod_sync_copy` → Task 4
+- ✅ Input length guards before borrow_mut (review fix) → Task 4
+- ✅ `n_zones == 0` guard with InvalidInput (review fix) → Task 4
+- ✅ `// SAFETY:` stream-ordering comment (review fix) → Task 4
 - ✅ Public API unchanged (signature unchanged) → Task 4
 - ✅ Resolution-switch regression test → Task 1
 - ✅ Calibration-switch regression test → Task 1
-- ✅ Benchmark validation → Task 5
+- ✅ `per_frame_vram_bytes` updated to 4 RGB planes → Task 5
+- ✅ Benchmark validation with ≥80% gate → Task 6
 
 **Placeholder scan:** None found.
 
-**Type consistency:** `CudaSlice<f32>` used throughout. `alloc_resolution_buffers` and `alloc_calibration_buffers` return the exact structs used in Tasks 3 and 4. `htod_sync_copy_into` signature `(&[T], &mut CudaSlice<T>)` matches usage.
+**Type consistency:** `CudaSlice<f32>` used throughout. `alloc_resolution_buffers` and `alloc_calibration_buffers` return the exact structs used in Tasks 3 and 4. `htod_sync_copy_into` signature `(&[T], &mut CudaSlice<T>)` matches usage. `n_zones` is always `> 0` at the point `depth_luts.luts[0].size` is accessed (guarded by the early return).
