@@ -80,23 +80,39 @@ pub fn grade_frame(
 
     #[cfg(feature = "cuda")]
     {
-        match cuda::grade_frame_cuda(pixels, depth, width, height, calibration, params) {
-            Ok(mut rgb_f32) => {
-                // GPU resources are now freed. Apply CPU-only ambiance + warmth + blend.
-                return Ok(cpu::finish_grade(
-                    &mut rgb_f32,
-                    pixels,
-                    depth,
-                    width,
-                    height,
-                    params,
-                    calibration,
-                    true,  // GPU clarity kernel already applied in grade_frame_cuda
-                ));
+        match cuda::CudaGrader::new() {
+            Ok(grader) => {
+                match grader.grade_frame_cuda(pixels, depth, width, height, calibration, params) {
+                    Ok(mut rgb_f32) => {
+                        // GPU resources are now freed. Apply CPU-only ambiance + warmth + blend.
+                        return Ok(cpu::finish_grade(
+                            &mut rgb_f32,
+                            pixels,
+                            depth,
+                            width,
+                            height,
+                            params,
+                            calibration,
+                            true, // GPU clarity kernel already applied
+                        ));
+                    }
+                    Err(e) => {
+                        log::warn!("CUDA grading failed: {e} — falling back to CPU");
+                        return Ok(cpu::grade_frame_cpu(
+                            pixels, depth, width, height, calibration, params,
+                        )
+                        .map_err(|e| GpuError::CudaFail(e))?);
+                    }
+                }
             }
-            Err(e) => {
-                return Err(e);
+            Err(GpuError::ModuleLoad(msg)) => {
+                log::error!("CUDA module load failed: {msg} — using CPU for all frames");
+                return Ok(cpu::grade_frame_cpu(
+                    pixels, depth, width, height, calibration, params,
+                )
+                .map_err(|e| GpuError::CudaFail(e))?);
             }
+            Err(e) => return Err(e),
         }
     }
 
@@ -106,4 +122,49 @@ pub fn grade_frame(
             "dorea grade requires CUDA. Rebuild with GPU support (build.rs auto-detects nvcc).".to_string()
         ))
     }
+}
+
+/// Grade a single frame reusing an existing `CudaGrader`.
+///
+/// Avoids repeated PTX loading when processing multiple frames. The caller
+/// creates one `CudaGrader` and passes it to each call.
+///
+/// Returns graded sRGB u8 pixels with the same dimensions.
+#[cfg(feature = "cuda")]
+pub fn grade_frame_with_grader(
+    grader: &cuda::CudaGrader,
+    pixels: &[u8],
+    depth: &[f32],
+    width: usize,
+    height: usize,
+    calibration: &Calibration,
+    params: &GradeParams,
+) -> Result<Vec<u8>, GpuError> {
+    if pixels.len() != width * height * 3 {
+        return Err(GpuError::InvalidInput(format!(
+            "pixels length {} != width*height*3 {}",
+            pixels.len(),
+            width * height * 3
+        )));
+    }
+    if depth.len() != width * height {
+        return Err(GpuError::InvalidInput(format!(
+            "depth length {} != width*height {}",
+            depth.len(),
+            width * height
+        )));
+    }
+
+    let mut rgb_f32 =
+        grader.grade_frame_cuda(pixels, depth, width, height, calibration, params)?;
+    Ok(cpu::finish_grade(
+        &mut rgb_f32,
+        pixels,
+        depth,
+        width,
+        height,
+        params,
+        calibration,
+        true, // GPU clarity kernel already applied
+    ))
 }
