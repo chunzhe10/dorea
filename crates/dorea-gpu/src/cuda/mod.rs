@@ -391,6 +391,89 @@ impl CudaGrader {
     }
 }
 
+/// Holds all device buffers sized by `(width, height)`.
+///
+/// Pre-allocated once and reused across frames via `htod_sync_copy_into`.
+/// Reallocated only when the frame resolution changes.
+#[cfg(feature = "cuda")]
+struct ResolutionBuffers {
+    width: usize,
+    height: usize,
+    proxy_w: usize,
+    proxy_h: usize,
+    d_rgb_in: CudaSlice<f32>,         // n * 3  — input RGB as f32
+    d_depth: CudaSlice<f32>,          // n      — depth map
+    d_rgb_after_lut: CudaSlice<f32>,  // n * 3  — LUT-stage output (scratch)
+    d_rgb_after_hsl: CudaSlice<f32>,  // n * 3  — HSL-stage output (scratch)
+    d_proxy_l: CudaSlice<f32>,        // proxy_n — clarity proxy luminance (scratch)
+    d_blur_a: CudaSlice<f32>,         // proxy_n — blur ping-pong A (scratch)
+    d_blur_b: CudaSlice<f32>,         // proxy_n — blur ping-pong B (scratch)
+    d_rgb_out: CudaSlice<f32>,        // n * 3  — final output (scratch)
+}
+
+/// Holds all device buffers sized by `(n_zones, lut_size)`.
+///
+/// Pre-allocated once and reused across frames via `htod_sync_copy_into`.
+/// Reallocated only when the calibration shape changes.
+#[cfg(feature = "cuda")]
+struct CalibrationBuffers {
+    n_zones: usize,
+    lut_size: usize,
+    d_luts: CudaSlice<f32>,        // n_zones * lut_size^3 * 3
+    d_boundaries: CudaSlice<f32>,  // n_zones + 1
+    d_h_offsets: CudaSlice<f32>,   // 6
+    d_s_ratios: CudaSlice<f32>,    // 6
+    d_v_offsets: CudaSlice<f32>,   // 6
+    d_weights: CudaSlice<f32>,     // 6
+}
+
+/// Allocate a fresh [`ResolutionBuffers`] for the given frame dimensions.
+#[cfg(feature = "cuda")]
+fn alloc_resolution_buffers(
+    dev: &Arc<CudaDevice>,
+    width: usize,
+    height: usize,
+) -> Result<ResolutionBuffers, GpuError> {
+    let n = width * height;
+    let (proxy_w, proxy_h) = proxy_dims(width, height, PROXY_MAX_SIZE);
+    let proxy_n = proxy_w * proxy_h;
+    Ok(ResolutionBuffers {
+        width,
+        height,
+        proxy_w,
+        proxy_h,
+        d_rgb_in: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
+        d_depth: dev.alloc_zeros(n).map_err(map_cudarc_error)?,
+        d_rgb_after_lut: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
+        d_rgb_after_hsl: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
+        d_proxy_l: dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?,
+        d_blur_a: dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?,
+        d_blur_b: dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?,
+        d_rgb_out: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
+    })
+}
+
+/// Allocate a fresh [`CalibrationBuffers`] for the given calibration shape.
+#[cfg(feature = "cuda")]
+fn alloc_calibration_buffers(
+    dev: &Arc<CudaDevice>,
+    n_zones: usize,
+    lut_size: usize,
+) -> Result<CalibrationBuffers, GpuError> {
+    Ok(CalibrationBuffers {
+        n_zones,
+        lut_size,
+        d_luts: dev
+            .alloc_zeros(n_zones * lut_size * lut_size * lut_size * 3)
+            .map_err(map_cudarc_error)?,
+        d_boundaries: dev.alloc_zeros(n_zones + 1).map_err(map_cudarc_error)?,
+        d_h_offsets: dev.alloc_zeros(6).map_err(map_cudarc_error)?,
+        d_s_ratios: dev.alloc_zeros(6).map_err(map_cudarc_error)?,
+        d_v_offsets: dev.alloc_zeros(6).map_err(map_cudarc_error)?,
+        d_weights: dev.alloc_zeros(6).map_err(map_cudarc_error)?,
+    })
+}
+
 /// Map cudarc DriverError to GpuError, detecting OOM conditions.
 #[cfg(feature = "cuda")]
 fn map_cudarc_error(e: cudarc::driver::result::DriverError) -> GpuError {
