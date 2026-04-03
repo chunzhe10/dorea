@@ -402,7 +402,7 @@ struct ResolutionBuffers {
     proxy_w: usize,
     proxy_h: usize,
     d_rgb_in: CudaSlice<f32>,         // n * 3  — input RGB as f32
-    d_depth: CudaSlice<f32>,          // n      — depth map
+    d_depth: CudaSlice<f32>,          // n — depth map; held for full frame (no early drop with pre-alloc)
     d_rgb_after_lut: CudaSlice<f32>,  // n * 3  — LUT-stage output (scratch)
     d_rgb_after_hsl: CudaSlice<f32>,  // n * 3  — HSL-stage output (scratch)
     d_proxy_l: CudaSlice<f32>,        // proxy_n — clarity proxy luminance (scratch)
@@ -419,7 +419,7 @@ struct ResolutionBuffers {
 struct CalibrationBuffers {
     n_zones: usize,
     lut_size: usize,
-    d_luts: CudaSlice<f32>,        // n_zones * lut_size^3 * 3
+    d_luts: CudaSlice<f32>,        // n_zones * lut_size³ * 3  (lut_size cubed)
     d_boundaries: CudaSlice<f32>,  // n_zones + 1
     d_h_offsets: CudaSlice<f32>,   // 6
     d_s_ratios: CudaSlice<f32>,    // 6
@@ -434,7 +434,9 @@ fn alloc_resolution_buffers(
     width: usize,
     height: usize,
 ) -> Result<ResolutionBuffers, GpuError> {
-    let n = width * height;
+    let n = width.checked_mul(height).ok_or_else(|| {
+        GpuError::InvalidInput("frame dimensions overflow usize".into())
+    })?;
     let (proxy_w, proxy_h) = proxy_dims(width, height, PROXY_MAX_SIZE);
     let proxy_n = proxy_w * proxy_h;
     Ok(ResolutionBuffers {
@@ -460,6 +462,9 @@ fn alloc_calibration_buffers(
     n_zones: usize,
     lut_size: usize,
 ) -> Result<CalibrationBuffers, GpuError> {
+    if n_zones == 0 {
+        return Err(GpuError::InvalidInput("n_zones must be >= 1".into()));
+    }
     Ok(CalibrationBuffers {
         n_zones,
         lut_size,
