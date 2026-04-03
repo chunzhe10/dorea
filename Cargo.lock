@@ -392,6 +392,7 @@ dependencies = [
  "dorea-hsl",
  "dorea-lut",
  "log",
+ "rayon",
  "thiserror 1.0.69",
 ]
 

@@ -365,6 +365,8 @@ impl Drop for InferenceServer {
 }
 
 /// Encode RGB24 pixels to PNG bytes in memory.
+/// Only used in tests (IPC switched to raw RGB in production).
+#[cfg(test)]
 fn encode_png_bytes(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>, InferenceError> {
     // Minimal uncompressed PNG (for speed; compression is the Python server's concern)
     // Use the `image` crate idiom via raw bytes.
@@ -411,6 +413,7 @@ fn encode_png_bytes(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>, 
     Ok(out)
 }
 
+#[cfg(test)]
 fn deflate_zlib(data: &[u8]) -> Vec<u8> {
     // Use a simple store-mode zlib (no compression) for speed.
     // Format: zlib header (0x78 0x01) + DEFLATE stored blocks + adler32 checksum.
@@ -441,6 +444,7 @@ fn deflate_zlib(data: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(chunk_type);
@@ -449,6 +453,7 @@ fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc.to_be_bytes());
 }
 
+#[cfg(test)]
 fn crc32(chunk_type: &[u8], data: &[u8]) -> u32 {
     // CRC-32 (IEEE 802.3)
     let table: [u32; 256] = {

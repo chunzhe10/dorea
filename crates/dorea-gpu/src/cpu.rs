@@ -31,9 +31,6 @@ pub fn depth_aware_ambiance(
     assert_eq!(rgb.len(), width * height * 3, "rgb length mismatch");
     assert_eq!(depth.len(), width * height, "depth length mismatch");
 
-    // Mean depth (for clarity amount)
-    let mean_d: f32 = depth.iter().sum::<f32>() / depth.len() as f32;
-
     let n = width * height;
     for i in 0..n {
         let d = depth[i];
@@ -247,13 +244,11 @@ pub(crate) fn finish_grade(
     _cal: &Calibration,  // reserved: available for per-calibration finish adjustments if needed
     skip_clarity: bool,
 ) -> Vec<u8> {
-    let n = width * height;
-
     // 1. Fused ambiance + warmth (single LAB roundtrip, rayon-parallelized)
     let warmth_factor = 1.0 + (params.warmth - 1.0) * 0.3;
     fused_ambiance_warmth(rgb_f32, depth, width, height, params.contrast, warmth_factor);
 
-    // 1b. Clarity — skip when the CUDA path already ran the GPU clarity kernel.
+    // 2. Clarity — skip when the CUDA path already ran the GPU clarity kernel.
     if !skip_clarity {
         apply_cpu_clarity(rgb_f32, depth, width, height, params.contrast);
     }
@@ -618,7 +613,7 @@ mod tests {
         fused_ambiance_warmth(&mut rgb_new, &depth, width, height, 1.0, warmth_factor);
 
         // Fused output won't be bit-exact (different order of LAB roundtrips),
-        // but should be perceptually close. Accept ΔE < 2 ≈ delta < 0.02 in normalised RGB.
+        // but should be perceptually close. Tolerance 0.05 in normalized RGB (~13/255).
         for i in 0..rgb_new.len() {
             let diff = (rgb_new[i] - rgb_old[i]).abs();
             assert!(diff < 0.05, "pixel {i}: old={:.4} new={:.4} diff={:.4}", rgb_old[i], rgb_new[i], diff);

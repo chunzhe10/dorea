@@ -54,9 +54,7 @@ class DepthAnythingInference:
                 "Cannot run depth inference on CPU — GPU is required for dorea grade."
             )
 
-        self.device = torch.device(
-            device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
-        )
+        self.device = torch.device(device)
 
         path = Path(model_path) if model_path else _DEFAULT_DEPTH_MODEL
         model_id_or_path = str(path)

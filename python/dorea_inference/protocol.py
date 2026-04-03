@@ -160,7 +160,7 @@ def decode_raw_rgb(b64: str, width: int, height: int) -> "np.ndarray":
     expected = width * height * 3
     if len(raw) != expected:
         raise ValueError(f"raw_rgb size mismatch: got {len(raw)}, expected {expected}")
-    return np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+    return np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
 
 
 def decode_depth_f32(b64: str, width: int, height: int) -> "np.ndarray":

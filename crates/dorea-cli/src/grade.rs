@@ -87,6 +87,9 @@ pub struct GradeArgs {
 /// Returns value in [0, 1] where 0 = identical.
 fn frame_mse(a: &[u8], b: &[u8]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
+    if a.is_empty() {
+        return 0.0;
+    }
     let n = a.len() as f64;
     let sum_sq: f64 = a.iter().zip(b.iter())
         .map(|(&av, &bv)| {
@@ -116,10 +119,13 @@ struct BufferedFrame {
 }
 
 /// Write all buffered frames by interpolating between bracketing keyframe graded outputs.
+///
+/// When `graded_after` is `None`, all buffered frames get the `graded_before` output
+/// directly (no interpolation). Used for scene cuts and end-of-video.
 fn flush_buffer_graded(
     buffer: &mut Vec<BufferedFrame>,
     graded_before: &Option<Vec<u8>>,
-    graded_after: &Option<Vec<u8>>,
+    graded_after: Option<&Vec<u8>>,
     encoder: &mut FrameEncoder,
     frame_count: &mut u64,
     info: &ffmpeg::VideoInfo,
@@ -132,17 +138,12 @@ fn flush_buffer_graded(
     let n_buffered = buffer.len();
     let interval = (n_buffered + 1) as f32;
 
-    let same_keyframe = match graded_after {
-        Some(after) => std::ptr::eq(before.as_ptr(), after.as_ptr()),
-        None => true,
-    };
-
     for (buf_idx, bf) in buffer.drain(..).enumerate() {
-        let output = if same_keyframe {
-            before.clone()
-        } else {
+        let output = if let Some(after) = graded_after {
             let t = (buf_idx + 1) as f32 / interval;
-            lerp_graded(before, graded_after.as_ref().unwrap(), t)
+            lerp_graded(before, after, t)
+        } else {
+            before.clone()
         };
 
         let expected = bf.width * bf.height * 3;
@@ -165,6 +166,16 @@ fn flush_buffer_graded(
 }
 
 pub fn run(args: GradeArgs) -> Result<()> {
+    if args.cpu_only {
+        anyhow::bail!(
+            "--cpu-only is no longer supported for dorea grade; GPU (CUDA) is required. \
+             Use dorea preview for CPU-only workflows."
+        );
+    }
+    if args.depth_max_interval == 0 {
+        anyhow::bail!("--depth-max-interval must be >= 1");
+    }
+
     let output = args.output.clone().unwrap_or_else(|| {
         let stem = args.input.file_stem().unwrap_or_default().to_string_lossy();
         args.input.with_file_name(format!("{stem}_graded.mp4"))
@@ -254,9 +265,10 @@ pub fn run(args: GradeArgs) -> Result<()> {
                 log::info!("Scene cut at frame {} (MSE={:.6}) — flushing buffer", frame.index, mse);
                 // Flush buffer using last keyframe graded output (no forward interp across cuts)
                 flush_buffer_graded(
-                    &mut frame_buffer, &last_keyframe_graded, &last_keyframe_graded,
+                    &mut frame_buffer, &last_keyframe_graded, None,
                     &mut encoder, &mut frame_count, &info,
                 )?;
+                frames_since_keyframe = 0;
             }
 
             is_scene_cut || exceeds_interval || exceeds_threshold || buffer_overflow
@@ -287,7 +299,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
             // Flush any buffered frames — interpolate between previous and this keyframe's graded output
             if !frame_buffer.is_empty() {
                 flush_buffer_graded(
-                    &mut frame_buffer, &last_keyframe_graded, &Some(graded.clone()),
+                    &mut frame_buffer, &last_keyframe_graded, Some(&graded),
                     &mut encoder, &mut frame_count, &info,
                 )?;
             }
@@ -319,7 +331,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
     // Flush any remaining buffered frames (end of video — use last keyframe, no interpolation)
     if !frame_buffer.is_empty() {
         flush_buffer_graded(
-            &mut frame_buffer, &last_keyframe_graded, &last_keyframe_graded,
+            &mut frame_buffer, &last_keyframe_graded, None,
             &mut encoder, &mut frame_count, &info,
         )?;
     }
@@ -400,5 +412,71 @@ fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
         depth_model: args.depth_model.clone(),
         device: if args.cpu_only { Some("cpu".to_string()) } else { None },
         startup_timeout: Duration::from_secs(180),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_mse_identical_is_zero() {
+        let a: Vec<u8> = vec![100, 150, 200, 50, 75, 125];
+        assert_eq!(frame_mse(&a, &a), 0.0);
+    }
+
+    #[test]
+    fn frame_mse_empty_is_zero() {
+        assert_eq!(frame_mse(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn frame_mse_opposite_is_one() {
+        let a: Vec<u8> = vec![0, 0, 0];
+        let b: Vec<u8> = vec![255, 255, 255];
+        let mse = frame_mse(&a, &b);
+        assert!((mse - 1.0).abs() < 1e-5, "expected ~1.0, got {mse}");
+    }
+
+    #[test]
+    fn frame_mse_known_value() {
+        // All pixels differ by 1 → MSE = 1/(255²) ≈ 0.0000154
+        let a: Vec<u8> = vec![100, 100, 100];
+        let b: Vec<u8> = vec![101, 101, 101];
+        let mse = frame_mse(&a, &b);
+        let expected = 1.0 / (255.0 * 255.0);
+        assert!((mse as f64 - expected).abs() < 1e-8, "expected {expected}, got {mse}");
+    }
+
+    #[test]
+    fn lerp_graded_at_zero() {
+        let a: Vec<u8> = vec![10, 20, 30];
+        let b: Vec<u8> = vec![110, 120, 130];
+        assert_eq!(lerp_graded(&a, &b, 0.0), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn lerp_graded_at_one() {
+        let a: Vec<u8> = vec![10, 20, 30];
+        let b: Vec<u8> = vec![110, 120, 130];
+        assert_eq!(lerp_graded(&a, &b, 1.0), vec![110, 120, 130]);
+    }
+
+    #[test]
+    fn lerp_graded_at_half() {
+        let a: Vec<u8> = vec![0, 100, 200];
+        let b: Vec<u8> = vec![100, 200, 250];
+        let result = lerp_graded(&a, &b, 0.5);
+        assert_eq!(result, vec![50, 150, 225]);
+    }
+
+    #[test]
+    fn lerp_graded_clamps_t() {
+        let a: Vec<u8> = vec![10, 20];
+        let b: Vec<u8> = vec![110, 120];
+        // t > 1 should clamp to 1
+        assert_eq!(lerp_graded(&a, &b, 2.0), vec![110, 120]);
+        // t < 0 should clamp to 0
+        assert_eq!(lerp_graded(&a, &b, -1.0), vec![10, 20]);
     }
 }
