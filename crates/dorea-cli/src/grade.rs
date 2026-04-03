@@ -270,7 +270,10 @@ pub fn run(args: GradeArgs) -> Result<()> {
         }
     }).collect();
 
-    let mut keyframe_depths: HashMap<u64, Vec<f32>> = HashMap::new();
+    // Store depth at proxy resolution — upscale on-demand in pass 2.
+    // Full-res storage (info.width × info.height × 4 bytes × n_keyframes) can reach tens of
+    // GB for tight intervals on 4K footage; proxy storage is ~50× smaller.
+    let mut keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)> = HashMap::new();
     for (chunk_kfs, chunk_items) in keyframes
         .chunks(DEPTH_BATCH_SIZE)
         .zip(batch_items.chunks(DEPTH_BATCH_SIZE))
@@ -295,12 +298,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
         }
 
         for (kf, (_, depth_raw, dw, dh)) in chunk_kfs.iter().zip(results.iter()) {
-            let depth = if *dw == info.width && *dh == info.height {
-                depth_raw.clone()
-            } else {
-                InferenceServer::upscale_depth(depth_raw, *dw, *dh, info.width, info.height)
-            };
-            keyframe_depths.insert(kf.frame_index, depth);
+            keyframe_depths.insert(kf.frame_index, (depth_raw.clone(), *dw, *dh));
         }
     }
     log::info!("Batch depth inference complete ({} keyframes)", keyframes.len());
@@ -329,24 +327,33 @@ pub fn run(args: GradeArgs) -> Result<()> {
         }
 
         let (prev_kf_idx, _) = kf_index_list[kf_cursor];
-        let prev_depth = keyframe_depths
+        let (prev_depth_proxy, dpw, dph) = keyframe_depths
             .get(&prev_kf_idx)
             .expect("prev keyframe depth missing — logic error");
+        let (dpw, dph) = (*dpw, *dph);
 
-        let depth = if fi == prev_kf_idx {
-            prev_depth.clone()
+        // Lerp at proxy resolution, then upscale once — ~50× less work than lerping full-res.
+        let depth_proxy = if fi == prev_kf_idx {
+            prev_depth_proxy.clone()
         } else if let Some(&(next_kf_idx, scene_cut_before_next)) = kf_index_list.get(kf_cursor + 1) {
             if scene_cut_before_next {
-                prev_depth.clone() // Don't lerp across scene cut
+                prev_depth_proxy.clone() // Don't lerp across scene cut
             } else {
-                let next_depth = keyframe_depths
+                let (next_depth_proxy, _, _) = keyframe_depths
                     .get(&next_kf_idx)
                     .expect("next keyframe depth missing — logic error");
                 let t = (fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32;
-                lerp_depth(prev_depth, next_depth, t)
+                lerp_depth(prev_depth_proxy, next_depth_proxy, t)
             }
         } else {
-            prev_depth.clone() // Past last keyframe
+            prev_depth_proxy.clone() // Past last keyframe
+        };
+
+        // Upscale depth to full frame resolution for grading.
+        let depth = if dpw == frame.width && dph == frame.height {
+            depth_proxy
+        } else {
+            InferenceServer::upscale_depth(&depth_proxy, dpw, dph, frame.width, frame.height)
         };
 
         #[cfg(feature = "cuda")]
