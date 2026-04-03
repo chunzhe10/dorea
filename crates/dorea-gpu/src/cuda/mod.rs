@@ -108,7 +108,7 @@ pub fn grade_frame_cuda(
         )
     };
     if status != 0 {
-        return Err(GpuError::Cuda(format!("dorea_lut_apply_gpu returned CUDA error {status}")));
+        return Err(GpuError::CudaFail(format!("dorea_lut_apply_gpu returned CUDA error {status}")));
     }
 
     // --- Extract HSL arrays (6 qualifiers) ---
@@ -137,7 +137,7 @@ pub fn grade_frame_cuda(
         )
     };
     if status != 0 {
-        return Err(GpuError::Cuda(format!("dorea_hsl_correct_gpu returned CUDA error {status}")));
+        return Err(GpuError::CudaFail(format!("dorea_hsl_correct_gpu returned CUDA error {status}")));
     }
 
     // --- GPU: Clarity at proxy resolution ---
@@ -162,7 +162,7 @@ pub fn grade_frame_cuda(
         )
     };
     if status != 0 {
-        return Err(GpuError::Cuda(format!(
+        return Err(GpuError::CudaFail(format!(
             "dorea_clarity_gpu returned CUDA error {status}"
         )));
     }

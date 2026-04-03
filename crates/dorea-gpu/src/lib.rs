@@ -5,6 +5,7 @@
 // - `grade_frame` — applies full grading pipeline (LUT + HSL + depth_aware_ambiance)
 // - `cpu::depth_aware_ambiance` — always available, pure CPU
 
+pub mod batcher;
 pub mod cpu;
 
 #[cfg(feature = "cuda")]
@@ -32,8 +33,12 @@ impl Default for GradeParams {
 
 #[derive(Debug, Error)]
 pub enum GpuError {
+    #[error("CUDA OOM: {0}")]
+    Oom(String),
     #[error("CUDA error: {0}")]
-    Cuda(String),
+    CudaFail(String),
+    #[error("CUDA module load failed: {0}")]
+    ModuleLoad(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
@@ -94,7 +99,7 @@ pub fn grade_frame(
 
     #[cfg(not(feature = "cuda"))]
     {
-        Err(GpuError::Cuda(
+        Err(GpuError::CudaFail(
             "dorea grade requires CUDA. Rebuild with GPU support (build.rs auto-detects nvcc).".to_string()
         ))
     }
