@@ -12,10 +12,6 @@ use dorea_video::inference::{InferenceConfig, InferenceServer};
 
 #[cfg(feature = "cuda")]
 use dorea_gpu::cuda::CudaGrader;
-#[cfg(feature = "cuda")]
-use dorea_gpu::batcher::AdaptiveBatcher;
-#[cfg(feature = "cuda")]
-use dorea_gpu::GpuError;
 
 #[derive(Args, Debug)]
 pub struct GradeArgs {
@@ -191,7 +187,7 @@ fn grade_with_grader(
     params: &GradeParams,
 ) -> Result<Vec<u8>, dorea_gpu::GpuError> {
     if let Some(g) = grader {
-        dorea_gpu::grade_frame_with_grader(g, pixels, depth, width, height, calibration, params)
+        dorea_gpu::grade_frame_with_grader(g, pixels, depth, width, height)
     } else {
         grade_frame(pixels, depth, width, height, calibration, params)
     }
@@ -252,9 +248,9 @@ pub fn run(args: GradeArgs) -> Result<()> {
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
         .context("failed to spawn inference server — check --python and --depth-model")?;
 
-    // Initialize CUDA grader (loads PTX once, reuses across all frames)
+    // Initialize CUDA grader (loads PTX once, builds combined LUT, reuses across all frames)
     #[cfg(feature = "cuda")]
-    let cuda_grader = match CudaGrader::new() {
+    let cuda_grader = match CudaGrader::new(&calibration, &params) {
         Ok(g) => {
             log::info!("CUDA grader initialized (cudarc + PTX modules loaded)");
             Some(g)
@@ -264,9 +260,6 @@ pub fn run(args: GradeArgs) -> Result<()> {
             None
         }
     };
-    #[cfg(feature = "cuda")]
-    let mut batcher = AdaptiveBatcher::fixed(args.depth_max_interval);
-
     // Decode and grade frames
     let frames = ffmpeg::decode_frames(&args.input, &info)
         .context("failed to spawn ffmpeg decoder")?;
@@ -342,27 +335,10 @@ pub fn run(args: GradeArgs) -> Result<()> {
             };
 
             #[cfg(feature = "cuda")]
-            let graded = {
-                match grade_with_grader(
-                    cuda_grader.as_ref(),
-                    &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-                ) {
-                    Ok(pixels) => {
-                        batcher.report_success();
-                        pixels
-                    }
-                    Err(GpuError::Oom(ref msg)) => {
-                        let at_min = batcher.report_oom();
-                        log::warn!("CUDA OOM on frame {} ({}){} — falling back to CPU",
-                            frame.index, msg,
-                            if at_min { ", already at minimum batch" } else { "" });
-                        dorea_gpu::cpu::grade_frame_cpu(
-                            &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-                        ).map_err(|e| anyhow::anyhow!("CPU fallback failed for frame {}: {e}", frame.index))?
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index)),
-                }
-            };
+            let graded = grade_with_grader(
+                cuda_grader.as_ref(),
+                &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
+            ).map_err(|e| anyhow::anyhow!("Grading failed for frame {}: {e}", frame.index))?;
             #[cfg(not(feature = "cuda"))]
             let graded = grade_frame(
                 &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
