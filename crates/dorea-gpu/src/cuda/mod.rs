@@ -421,3 +421,139 @@ fn proxy_dims(src_w: usize, src_h: usize, max_size: usize) -> (usize, usize) {
     let ph = ((src_h as f64 * scale).round() as usize).max(1);
     (pw, ph)
 }
+
+#[cfg(all(feature = "cuda", test))]
+mod tests {
+    use super::*;
+    use crate::GradeParams;
+    use dorea_cal::Calibration;
+    use dorea_hsl::derive::{HslCorrections, QualifierCorrection};
+    use dorea_lut::types::{DepthLuts, LutGrid};
+
+    /// Build an identity LUT of given size: output == input for all lattice points.
+    fn identity_lut(size: usize) -> LutGrid {
+        let mut lut = LutGrid::new(size);
+        for ri in 0..size {
+            for gi in 0..size {
+                for bi in 0..size {
+                    let r = ri as f32 / (size - 1) as f32;
+                    let g = gi as f32 / (size - 1) as f32;
+                    let b = bi as f32 / (size - 1) as f32;
+                    lut.set(ri, gi, bi, [r, g, b]);
+                }
+            }
+        }
+        lut
+    }
+
+    /// Build a `Calibration` with `n_zones` depth zones, each holding an identity LUT.
+    fn make_calibration(n_zones: usize) -> Calibration {
+        let luts: Vec<LutGrid> = (0..n_zones).map(|_| identity_lut(17)).collect();
+        let boundaries: Vec<f32> = (0..=n_zones).map(|i| i as f32 / n_zones as f32).collect();
+        let depth_luts = DepthLuts::new(luts, boundaries);
+        let hsl = HslCorrections(vec![QualifierCorrection {
+            h_center: 0.0,
+            h_width: 1.0,
+            h_offset: 0.0,
+            s_ratio: 1.0,
+            v_offset: 0.0,
+            weight: 0.0,
+        }]);
+        Calibration::new(depth_luts, hsl, 1)
+    }
+
+    /// Build synthetic pixel and depth data for a frame of size `w * h`.
+    fn make_frame(w: usize, h: usize) -> (Vec<u8>, Vec<f32>) {
+        let n = w * h;
+        let pixels: Vec<u8> = (0..n * 3).map(|i| ((i * 7 + 128) % 256) as u8).collect();
+        let depth: Vec<f32> = (0..n).map(|i| (i as f32) / n as f32 * 0.8 + 0.1).collect();
+        (pixels, depth)
+    }
+
+    /// Calling `grade_frame_cuda` twice with the same input must produce identical output.
+    ///
+    /// This verifies that the GPU pipeline is deterministic: no race conditions,
+    /// no uninitialized memory, no stale state between calls.
+    #[test]
+    fn determinism() {
+        let grader = CudaGrader::new().expect("CudaGrader::new() failed");
+        let cal = make_calibration(5);
+        let params = GradeParams::default();
+        let (pixels, depth) = make_frame(320, 240);
+
+        let out1 = grader
+            .grade_frame_cuda(&pixels, &depth, 320, 240, &cal, &params)
+            .expect("first grade_frame_cuda call failed");
+        let out2 = grader
+            .grade_frame_cuda(&pixels, &depth, 320, 240, &cal, &params)
+            .expect("second grade_frame_cuda call failed");
+
+        assert_eq!(out1.len(), out2.len(), "output length must be identical between runs");
+        for (i, (a, b)) in out1.iter().zip(out2.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "output differs at element {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Switching resolution between calls must succeed and return the correct output size.
+    ///
+    /// Sequence: 1280×720, then 1920×1080, then 1280×720 again.
+    /// Each call must return `width * height * 3` f32 elements.
+    #[test]
+    fn resolution_switch_round_trip() {
+        let grader = CudaGrader::new().expect("CudaGrader::new() failed");
+        let cal = make_calibration(5);
+        let params = GradeParams::default();
+
+        let resolutions: &[(usize, usize)] = &[(1280, 720), (1920, 1080), (1280, 720)];
+
+        for &(w, h) in resolutions {
+            let (pixels, depth) = make_frame(w, h);
+            let out = grader
+                .grade_frame_cuda(&pixels, &depth, w, h, &cal, &params)
+                .unwrap_or_else(|e| panic!("grade_frame_cuda failed at {w}×{h}: {e}"));
+
+            let expected_len = w * h * 3;
+            assert_eq!(
+                out.len(),
+                expected_len,
+                "output length for {w}×{h} should be {expected_len}, got {}",
+                out.len()
+            );
+        }
+    }
+
+    /// Switching calibration zone count between calls must succeed and return correct output size.
+    ///
+    /// Sequence: 5-zone calibration, then 3-zone, then 5-zone again.
+    /// Output length must always equal `width * height * 3`.
+    #[test]
+    fn calibration_shape_switch() {
+        let grader = CudaGrader::new().expect("CudaGrader::new() failed");
+        let params = GradeParams::default();
+        let (w, h) = (320, 240);
+        let (pixels, depth) = make_frame(w, h);
+        let expected_len = w * h * 3;
+
+        let zone_counts = [5usize, 3, 5];
+
+        for n_zones in zone_counts {
+            let cal = make_calibration(n_zones);
+            let out = grader
+                .grade_frame_cuda(&pixels, &depth, w, h, &cal, &params)
+                .unwrap_or_else(|e| {
+                    panic!("grade_frame_cuda failed with {n_zones}-zone calibration: {e}")
+                });
+
+            assert_eq!(
+                out.len(),
+                expected_len,
+                "output length for {n_zones}-zone calibration should be {expected_len}, got {}",
+                out.len()
+            );
+        }
+    }
+}
