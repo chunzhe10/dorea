@@ -64,8 +64,6 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let kernels_dir = manifest_dir.join("src").join("cuda").join("kernels");
 
-    println!("cargo:rerun-if-changed=src/cuda/kernels/lut_apply.cu");
-    println!("cargo:rerun-if-changed=src/cuda/kernels/hsl_correct.cu");
     println!("cargo:rerun-if-changed=src/cuda/kernels/grade_pixel.cuh");
     println!("cargo:rerun-if-changed=src/cuda/kernels/build_combined_lut.cu");
     println!("cargo:rerun-if-changed=src/cuda/kernels/combined_lut.cu");
@@ -82,7 +80,7 @@ fn main() {
     println!("cargo:warning=Found nvcc at {}", nvcc.display());
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let kernel_names = ["lut_apply", "hsl_correct", "build_combined_lut", "combined_lut"];
+    let kernel_names = ["build_combined_lut", "combined_lut"];
 
     let cuda_include = nvcc.parent()
         .and_then(|p| p.parent())

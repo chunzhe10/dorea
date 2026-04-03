@@ -191,7 +191,7 @@ fn grade_with_grader(
     params: &GradeParams,
 ) -> Result<Vec<u8>, dorea_gpu::GpuError> {
     if let Some(g) = grader {
-        dorea_gpu::grade_frame_with_grader(g, pixels, depth, width, height, calibration, params)
+        dorea_gpu::grade_frame_with_grader(g, pixels, depth, width, height)
     } else {
         grade_frame(pixels, depth, width, height, calibration, params)
     }
@@ -252,9 +252,9 @@ pub fn run(args: GradeArgs) -> Result<()> {
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
         .context("failed to spawn inference server — check --python and --depth-model")?;
 
-    // Initialize CUDA grader (loads PTX once, reuses across all frames)
+    // Initialize CUDA grader (loads PTX once, builds combined LUT, reuses across all frames)
     #[cfg(feature = "cuda")]
-    let cuda_grader = match CudaGrader::new() {
+    let cuda_grader = match CudaGrader::new(&calibration, &params) {
         Ok(g) => {
             log::info!("CUDA grader initialized (cudarc + PTX modules loaded)");
             Some(g)

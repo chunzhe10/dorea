@@ -75,7 +75,7 @@ fn bench_grade(c: &mut Criterion) {
         #[cfg(feature = "cuda")]
         {
             use dorea_gpu::{cuda::CudaGrader, grade_frame_with_grader};
-            match CudaGrader::new() {
+            match CudaGrader::new(&calibration, &params) {
                 Ok(grader) => {
                     group.bench_with_input(
                         BenchmarkId::new("with_grader", label),
@@ -83,7 +83,7 @@ fn bench_grade(c: &mut Criterion) {
                         |b, _| {
                             b.iter(|| {
                                 grade_frame_with_grader(
-                                    &grader, &pixels, &depth, w, h, &calibration, &params,
+                                    &grader, &pixels, &depth, w, h,
                                 )
                                 .expect("grade_frame_with_grader failed")
                             });
