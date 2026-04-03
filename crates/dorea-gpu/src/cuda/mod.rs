@@ -110,32 +110,89 @@ impl CudaGrader {
         let n = width * height;
         let dev = &self.device;
 
-        // --- u8 -> f32 ---
+        // --- Input length guards (BEFORE any borrow_mut — htod_sync_copy_into panics on mismatch) ---
+        if pixels.len() != n * 3 {
+            return Err(GpuError::InvalidInput(format!(
+                "pixels len {} != width*height*3 {}", pixels.len(), n * 3
+            )));
+        }
+        if depth.len() != n {
+            return Err(GpuError::InvalidInput(format!(
+                "depth len {} != width*height {}", depth.len(), n
+            )));
+        }
+
+        // --- Calibration shape ---
+        let depth_luts = &calibration.depth_luts;
+        let n_zones = depth_luts.n_zones();
+        if n_zones == 0 {
+            return Err(GpuError::InvalidInput("n_zones must be >= 1".into()));
+        }
+        let lut_size = depth_luts.luts[0].size;
+
+        // --- Ensure ResolutionBuffers for this (width, height) ---
+        {
+            let mut guard = self.res_bufs.borrow_mut();
+            let needs_alloc = guard.as_ref()
+                .map_or(true, |b| b.width != width || b.height != height);
+            if needs_alloc {
+                *guard = Some(alloc_resolution_buffers(dev, width, height)?);
+            }
+        }
+
+        // --- Ensure CalibrationBuffers for this (n_zones, lut_size) ---
+        {
+            let mut guard = self.cal_bufs.borrow_mut();
+            let needs_alloc = guard.as_ref()
+                .map_or(true, |b| b.n_zones != n_zones || b.lut_size != lut_size);
+            if needs_alloc {
+                *guard = Some(alloc_calibration_buffers(dev, n_zones, lut_size)?);
+            }
+        }
+
+        // --- Upload resolution-keyed data (no alloc — copy only) ---
         let rgb_f32: Vec<f32> = pixels.iter().map(|&p| p as f32 / 255.0).collect();
+        {
+            let mut guard = self.res_bufs.borrow_mut();
+            let bufs = guard.as_mut().unwrap();
+            dev.htod_sync_copy_into(&rgb_f32, &mut bufs.d_rgb_in).map_err(map_cudarc_error)?;
+            dev.htod_sync_copy_into(depth, &mut bufs.d_depth).map_err(map_cudarc_error)?;
+        }
+
+        // --- Upload calibration-keyed data (no alloc — copy only) ---
+        let luts_flat: Vec<f32> = depth_luts.luts.iter()
+            .flat_map(|lg| lg.data.iter().copied())
+            .collect();
+        let mut h_offsets = [0.0f32; 6];
+        let mut s_ratios  = [1.0f32; 6];
+        let mut v_offsets = [0.0f32; 6];
+        let mut weights   = [0.0f32; 6];
+        for (i, q) in calibration.hsl_corrections.0.iter().enumerate().take(6) {
+            h_offsets[i] = q.h_offset;
+            s_ratios[i]  = q.s_ratio;
+            v_offsets[i] = q.v_offset;
+            weights[i]   = q.weight;
+        }
+        {
+            let mut guard = self.cal_bufs.borrow_mut();
+            let bufs = guard.as_mut().unwrap();
+            dev.htod_sync_copy_into(&luts_flat,                          &mut bufs.d_luts      ).map_err(map_cudarc_error)?;
+            dev.htod_sync_copy_into(&depth_luts.zone_boundaries,         &mut bufs.d_boundaries).map_err(map_cudarc_error)?;
+            dev.htod_sync_copy_into(&h_offsets,                          &mut bufs.d_h_offsets ).map_err(map_cudarc_error)?;
+            dev.htod_sync_copy_into(&s_ratios,                           &mut bufs.d_s_ratios  ).map_err(map_cudarc_error)?;
+            dev.htod_sync_copy_into(&v_offsets,                          &mut bufs.d_v_offsets ).map_err(map_cudarc_error)?;
+            dev.htod_sync_copy_into(&weights,                            &mut bufs.d_weights   ).map_err(map_cudarc_error)?;
+        }
+
+        // --- Kernel launches — immutable borrow on both buffer sets ---
+        let res = self.res_bufs.borrow();
+        let res_bufs = res.as_ref().unwrap();
+        let cal = self.cal_bufs.borrow();
+        let cal_bufs = cal.as_ref().unwrap();
 
         // =====================================================================
         // LUT APPLY
         // =====================================================================
-        let depth_luts = &calibration.depth_luts;
-        let n_zones = depth_luts.n_zones();
-        let lut_size = if n_zones > 0 { depth_luts.luts[0].size } else { 33 };
-
-        let luts_flat: Vec<f32> = depth_luts
-            .luts
-            .iter()
-            .flat_map(|lg| lg.data.iter().copied())
-            .collect();
-
-        // Upload inputs
-        let d_rgb_in = dev.htod_sync_copy(&rgb_f32).map_err(map_cudarc_error)?;
-        let d_depth = dev.htod_sync_copy(depth).map_err(map_cudarc_error)?;
-        let d_luts = dev.htod_sync_copy(&luts_flat).map_err(map_cudarc_error)?;
-        let d_boundaries = dev
-            .htod_sync_copy(&depth_luts.zone_boundaries)
-            .map_err(map_cudarc_error)?;
-        let d_rgb_after_lut: CudaSlice<f32> =
-            dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?;
-
         {
             let func = dev
                 .get_func("lut_apply", "lut_apply_kernel")
@@ -151,11 +208,11 @@ impl CudaGrader {
                 func.launch(
                     cfg,
                     (
-                        &d_rgb_in,
-                        &d_depth,
-                        &d_luts,
-                        &d_boundaries,
-                        &d_rgb_after_lut,
+                        &res_bufs.d_rgb_in,
+                        &res_bufs.d_depth,
+                        &cal_bufs.d_luts,
+                        &cal_bufs.d_boundaries,
+                        &res_bufs.d_rgb_after_lut,
                         n as i32,
                         lut_size as i32,
                         n_zones as i32,
@@ -165,35 +222,9 @@ impl CudaGrader {
             .map_err(map_cudarc_error)?;
         }
 
-        // Free LUT-specific device memory (drop early to reduce peak VRAM)
-        // Safe: cudarc uses stream-ordered cuMemFreeAsync on Ampere+ (sm_86).
-        // Do not relax sm_86 target without auditing these early drops.
-        drop(d_rgb_in);
-        drop(d_luts);
-        drop(d_boundaries);
-        drop(d_depth); // depth only needed for LUT stage
-
         // =====================================================================
         // HSL CORRECT
         // =====================================================================
-        let mut h_offsets = [0.0f32; 6];
-        let mut s_ratios = [1.0f32; 6];
-        let mut v_offsets = [0.0f32; 6];
-        let mut weights = [0.0f32; 6];
-        for (i, q) in calibration.hsl_corrections.0.iter().enumerate().take(6) {
-            h_offsets[i] = q.h_offset;
-            s_ratios[i] = q.s_ratio;
-            v_offsets[i] = q.v_offset;
-            weights[i] = q.weight;
-        }
-
-        let d_h_offsets = dev.htod_sync_copy(&h_offsets).map_err(map_cudarc_error)?;
-        let d_s_ratios = dev.htod_sync_copy(&s_ratios).map_err(map_cudarc_error)?;
-        let d_v_offsets = dev.htod_sync_copy(&v_offsets).map_err(map_cudarc_error)?;
-        let d_weights = dev.htod_sync_copy(&weights).map_err(map_cudarc_error)?;
-        let d_rgb_after_hsl: CudaSlice<f32> =
-            dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?;
-
         {
             let func = dev
                 .get_func("hsl_correct", "hsl_correct_kernel")
@@ -209,12 +240,12 @@ impl CudaGrader {
                 func.launch(
                     cfg,
                     (
-                        &d_rgb_after_lut,
-                        &d_rgb_after_hsl,
-                        &d_h_offsets,
-                        &d_s_ratios,
-                        &d_v_offsets,
-                        &d_weights,
+                        &res_bufs.d_rgb_after_lut,
+                        &res_bufs.d_rgb_after_hsl,
+                        &cal_bufs.d_h_offsets,
+                        &cal_bufs.d_s_ratios,
+                        &cal_bufs.d_v_offsets,
+                        &cal_bufs.d_weights,
                         n as i32,
                     ),
                 )
@@ -222,35 +253,20 @@ impl CudaGrader {
             .map_err(map_cudarc_error)?;
         }
 
-        // Free HSL-specific device memory
-        drop(d_rgb_after_lut);
-        drop(d_h_offsets);
-        drop(d_s_ratios);
-        drop(d_v_offsets);
-        drop(d_weights);
-
         // =====================================================================
         // CLARITY (proxy-resolution box blur)
         // =====================================================================
         let mean_d = depth.iter().sum::<f32>() / depth.len().max(1) as f32;
         let clarity_amount = (0.2 + 0.25 * mean_d) * params.contrast;
 
-        let (proxy_w, proxy_h) = proxy_dims(width, height, PROXY_MAX_SIZE);
-        let proxy_n = proxy_w * proxy_h;
+        let proxy_w = res_bufs.proxy_w;
+        let proxy_h = res_bufs.proxy_h;
 
-        // Allocate proxy L buffers (ping-pong pair) and output RGB
-        let d_proxy_l: CudaSlice<f32> = dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?;
-        let d_blur_a: CudaSlice<f32> = dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?;
-        let d_blur_b: CudaSlice<f32> = dev.alloc_zeros(proxy_n).map_err(map_cudarc_error)?;
-        let d_rgb_out: CudaSlice<f32> = dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?;
-
-        // --- Sub-kernel A: extract proxy L from full-res RGB ---
+        // Sub-kernel A: extract proxy L
         {
             let func = dev
                 .get_func("clarity", "clarity_extract_L_proxy")
-                .ok_or_else(|| {
-                    GpuError::ModuleLoad("clarity_extract_L_proxy not found".into())
-                })?;
+                .ok_or_else(|| GpuError::ModuleLoad("clarity_extract_L_proxy not found".into()))?;
 
             let cfg = LaunchConfig {
                 grid_dim: (div_ceil(proxy_w as u32, 16), div_ceil(proxy_h as u32, 16), 1),
@@ -262,8 +278,8 @@ impl CudaGrader {
                 func.launch(
                     cfg,
                     (
-                        &d_rgb_after_hsl,
-                        &d_proxy_l,
+                        &res_bufs.d_rgb_after_hsl,
+                        &res_bufs.d_proxy_l,
                         width as i32,
                         height as i32,
                         proxy_w as i32,
@@ -274,93 +290,47 @@ impl CudaGrader {
             .map_err(map_cudarc_error)?;
         }
 
-        // --- Sub-kernel B: 3-pass box blur (rows + cols each pass) ---
-        // Pass 1: proxy_l -> blur_a (rows) -> blur_b (cols)
-        // Pass 2: blur_b -> blur_a (rows) -> blur_b (cols) -- but we need to ping-pong
-        // Actually: each pass is rows then cols. We read from src, write to dst, swap.
-        //
-        // Pass 1: rows(proxy_l -> blur_a), cols(blur_a -> blur_b)
-        // Pass 2: rows(blur_b -> blur_a), cols(blur_a -> blur_b)
-        // Pass 3: rows(blur_b -> blur_a), cols(blur_a -> blur_b)
-        // Result in blur_b.
-
+        // Sub-kernel B: 3-pass box blur
         let blur_rows_cfg = LaunchConfig {
-            grid_dim: (
-                div_ceil(proxy_w as u32, 32),
-                div_ceil(proxy_h as u32, 8),
-                1,
-            ),
+            grid_dim: (div_ceil(proxy_w as u32, 32), div_ceil(proxy_h as u32, 8), 1),
             block_dim: (32, 8, 1),
             shared_mem_bytes: 0,
         };
-
         let blur_cols_cfg = LaunchConfig {
-            grid_dim: (
-                div_ceil(proxy_w as u32, 32),
-                div_ceil(proxy_h as u32, 8),
-                1,
-            ),
+            grid_dim: (div_ceil(proxy_w as u32, 32), div_ceil(proxy_h as u32, 8), 1),
             block_dim: (32, 8, 1),
             shared_mem_bytes: 0,
         };
 
         for pass in 0..3 {
-            // Rows: src -> blur_a
+            let src: &CudaSlice<f32> = if pass == 0 { &res_bufs.d_proxy_l } else { &res_bufs.d_blur_b };
+
             {
                 let func = dev
                     .get_func("clarity", "clarity_box_blur_rows")
-                    .ok_or_else(|| {
-                        GpuError::ModuleLoad("clarity_box_blur_rows not found".into())
-                    })?;
-
-                let src: &CudaSlice<f32> = if pass == 0 { &d_proxy_l } else { &d_blur_b };
+                    .ok_or_else(|| GpuError::ModuleLoad("clarity_box_blur_rows not found".into()))?;
                 unsafe {
-                    func.launch(
-                        blur_rows_cfg,
-                        (
-                            src,
-                            &d_blur_a,
-                            proxy_w as i32,
-                            proxy_h as i32,
-                            BLUR_RADIUS,
-                        ),
-                    )
+                    func.launch(blur_rows_cfg, (src, &res_bufs.d_blur_a, proxy_w as i32, proxy_h as i32, BLUR_RADIUS))
                 }
                 .map_err(map_cudarc_error)?;
             }
 
-            // Cols: blur_a -> blur_b
             {
                 let func = dev
                     .get_func("clarity", "clarity_box_blur_cols")
-                    .ok_or_else(|| {
-                        GpuError::ModuleLoad("clarity_box_blur_cols not found".into())
-                    })?;
-
+                    .ok_or_else(|| GpuError::ModuleLoad("clarity_box_blur_cols not found".into()))?;
                 unsafe {
-                    func.launch(
-                        blur_cols_cfg,
-                        (
-                            &d_blur_a,
-                            &d_blur_b,
-                            proxy_w as i32,
-                            proxy_h as i32,
-                            BLUR_RADIUS,
-                        ),
-                    )
+                    func.launch(blur_cols_cfg, (&res_bufs.d_blur_a, &res_bufs.d_blur_b, proxy_w as i32, proxy_h as i32, BLUR_RADIUS))
                 }
                 .map_err(map_cudarc_error)?;
             }
         }
-        // After 3 passes, blurred result is in d_blur_b.
 
-        // --- Sub-kernel C: apply clarity at full resolution ---
+        // Sub-kernel C: apply clarity at full resolution
         {
             let func = dev
                 .get_func("clarity", "clarity_apply_kernel")
-                .ok_or_else(|| {
-                    GpuError::ModuleLoad("clarity_apply_kernel not found".into())
-                })?;
+                .ok_or_else(|| GpuError::ModuleLoad("clarity_apply_kernel not found".into()))?;
 
             let cfg = LaunchConfig {
                 grid_dim: (div_ceil(n as u32, 256), 1, 1),
@@ -368,16 +338,13 @@ impl CudaGrader {
                 shared_mem_bytes: 0,
             };
 
-            // Match the actual kernel signature:
-            // clarity_apply_kernel(rgb_in, rgb_out, blur_proxy,
-            //                      clarity_amount, full_w, full_h, proxy_w, proxy_h)
             unsafe {
                 func.launch(
                     cfg,
                     (
-                        &d_rgb_after_hsl,
-                        &d_rgb_out,
-                        &d_blur_b,
+                        &res_bufs.d_rgb_after_hsl,
+                        &res_bufs.d_rgb_out,
+                        &res_bufs.d_blur_b,
                         clarity_amount,
                         width as i32,
                         height as i32,
@@ -389,10 +356,11 @@ impl CudaGrader {
             .map_err(map_cudarc_error)?;
         }
 
-        // Download result
-        let result = dev.dtoh_sync_copy(&d_rgb_out).map_err(map_cudarc_error)?;
+        // SAFETY: dtoh_sync_copy calls device.synchronize() — stream is idle after this download.
+        // Buffer contents are stable on device; the next grade_frame_cuda call can safely re-upload
+        // into these pre-allocated slices without data races.
+        let result = dev.dtoh_sync_copy(&res_bufs.d_rgb_out).map_err(map_cudarc_error)?;
 
-        // All CudaSlice values drop here, freeing device memory.
         Ok(result)
     }
 }
