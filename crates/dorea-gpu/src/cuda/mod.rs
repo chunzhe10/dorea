@@ -153,7 +153,7 @@ impl CudaGrader {
         if let Some((cap_w, cap_h)) = self.capacity {
             if width != cap_w || height != cap_h {
                 return Err(GpuError::InvalidInput(format!(
-                    "frame {}×{} does not match with_capacity {}×{}", width, height, cap_w, cap_h
+                    "frame {width}×{height} does not match with_capacity {cap_w}×{cap_h}"
                 )));
             }
         }
@@ -177,7 +177,7 @@ impl CudaGrader {
         {
             let mut guard = self.res_bufs.borrow_mut();
             let needs_alloc = guard.as_ref()
-                .map_or(true, |b| b.width != width || b.height != height);
+                .is_none_or(|b| b.width != width || b.height != height);
             if needs_alloc {
                 *guard = Some(alloc_resolution_buffers(dev, width, height)?);
             }
@@ -187,7 +187,7 @@ impl CudaGrader {
         {
             let mut guard = self.cal_bufs.borrow_mut();
             let needs_alloc = guard.as_ref()
-                .map_or(true, |b| b.n_zones != n_zones || b.lut_size != lut_size);
+                .is_none_or(|b| b.n_zones != n_zones || b.lut_size != lut_size);
             if needs_alloc {
                 *guard = Some(alloc_calibration_buffers(dev, n_zones, lut_size)?);
             }
