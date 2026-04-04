@@ -377,6 +377,12 @@ pub fn run(args: GradeArgs) -> Result<()> {
         calibration = Calibration::load(cal_path)
             .context("failed to load .dorea-cal file")?;
 
+        // Shut down Maxine server first to free VRAM before spawning depth-only server.
+        if let Some(srv) = maxine_server.take() {
+            let _ = srv.shutdown();
+            log::info!("Maxine server shut down — VRAM freed for depth inference");
+        }
+
         // Depth-only inference for grading depth cache.
         let inf_cfg = InferenceConfig {
             skip_raune: true,
@@ -423,12 +429,6 @@ pub fn run(args: GradeArgs) -> Result<()> {
         log::info!("Depth batch complete ({} keyframes)", keyframes.len());
         let _ = inf_server.shutdown();
         keyframe_depths = kf_depths;
-
-        // Shut down Maxine server (VRAM freed for Pass 2 CUDA grading).
-        if let Some(srv) = maxine_server.take() {
-            let _ = srv.shutdown();
-            log::info!("Maxine server shut down — VRAM freed for Pass 2");
-        }
 
     } else {
         // Auto-calibrate: fused RAUNE+depth, dual output.
