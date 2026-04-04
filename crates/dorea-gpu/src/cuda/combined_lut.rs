@@ -242,7 +242,6 @@ impl CombinedLut {
 struct TextureSet {
     arrays: Vec<CUarray>,
     textures: Vec<CUtexObject>,
-    n_zones: usize,
     zone_boundaries: Vec<f32>,
 }
 
@@ -274,14 +273,20 @@ impl TextureSet {
             }
             arrays.push(arr);
 
-            let tex = Self::create_texture(arr)?;
+            let tex = Self::create_texture(arr).map_err(|e| {
+                // arr was just pushed; clean up all accumulated resources
+                unsafe {
+                    for &t in &textures { let _ = sys::lib().cuTexObjectDestroy(t); }
+                    for &a in &arrays   { let _ = sys::lib().cuArrayDestroy(a); }
+                }
+                e
+            })?;
             textures.push(tex);
         }
 
         Ok(Self {
             arrays,
             textures,
-            n_zones,
             zone_boundaries: vec![0.0; n_zones + 1],
         })
     }
@@ -328,8 +333,8 @@ impl Drop for TextureSet {
 /// be rebuilt for the next keyframe. Swapping is a pointer toggle — no copies.
 pub(crate) struct AdaptiveLut {
     sets: [TextureSet; 2],
-    /// Index of the set currently used for grading (0 or 1).
-    pub active: usize,
+    /// Index of the set currently used for grading (0 or 1). Private — mutate only via `swap()`.
+    active: usize,
     pub grid_size: usize,
     pub runtime_n_zones: usize,
 
@@ -509,6 +514,11 @@ impl AdaptiveLut {
     /// Swap active/inactive sets. Returns the new active index.
     pub(crate) fn swap(&mut self) -> usize {
         self.active = 1 - self.active;
+        self.active
+    }
+
+    /// Read-only access to the active set index (0 or 1).
+    pub(crate) fn active_index(&self) -> usize {
         self.active
     }
 
