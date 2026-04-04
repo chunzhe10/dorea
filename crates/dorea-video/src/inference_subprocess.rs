@@ -602,6 +602,11 @@ impl InferenceServer {
                 v["message"].as_str().unwrap_or("unknown error").to_string(),
             ));
         }
+        if v["type"].as_str() != Some("ok") {
+            return Err(InferenceError::Ipc(format!(
+                "unexpected response type for unload_maxine: {resp}"
+            )));
+        }
         Ok(())
     }
 
@@ -625,6 +630,11 @@ impl InferenceServer {
                 v["message"].as_str().unwrap_or("unknown error").to_string(),
             ));
         }
+        if v["type"].as_str() != Some("ok") {
+            return Err(InferenceError::Ipc(format!(
+                "unexpected response type for load_raune: {resp}"
+            )));
+        }
         Ok(())
     }
 
@@ -645,6 +655,11 @@ impl InferenceServer {
             return Err(InferenceError::ServerError(
                 v["message"].as_str().unwrap_or("unknown error").to_string(),
             ));
+        }
+        if v["type"].as_str() != Some("ok") {
+            return Err(InferenceError::Ipc(format!(
+                "unexpected response type for load_depth: {resp}"
+            )));
         }
         Ok(())
     }
@@ -1124,5 +1139,20 @@ mod tests {
         });
         assert_eq!(req["type"].as_str().unwrap(), "load_depth");
         assert_eq!(req["model_path"].as_str().unwrap(), "/models/depth_anything");
+    }
+
+    #[test]
+    fn skip_depth_takes_precedence_over_depth_model() {
+        let config = InferenceConfig {
+            skip_depth: true,
+            depth_model: Some(std::path::PathBuf::from("/some/model")),
+            ..InferenceConfig::default()
+        };
+        let args = config.build_args();
+        assert!(args.contains(&"--no-depth".to_string()), "skip_depth should emit --no-depth");
+        assert!(
+            !args.contains(&"--depth-model".to_string()),
+            "--depth-model should NOT appear when skip_depth is true"
+        );
     }
 }
