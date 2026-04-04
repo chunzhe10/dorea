@@ -62,8 +62,8 @@ def load_raune_model(
     )
 
 
-def load_maxine_model(upscale_factor: int = 2, device: str = "cuda") -> None:
-    """Load the Maxine enhancer. Called on demand after spawn."""
+def load_maxine_model(upscale_factor: int = 2) -> None:
+    """Load the Maxine enhancer. Always CUDA-backed — no device selection."""
     global _maxine_model
     from .maxine_enhancer import MaxineEnhancer
     _maxine_model = MaxineEnhancer(upscale_factor=upscale_factor)
@@ -81,8 +81,8 @@ def unload_maxine() -> None:
         pass
 
 
-def run_maxine_cpu(frame_rgb: np.ndarray, artifact_reduce: bool = True) -> np.ndarray:
-    """Run Maxine enhancement, return same-resolution numpy uint8 array."""
+def run_maxine(frame_rgb: np.ndarray, artifact_reduce: bool = True) -> np.ndarray:
+    """Run Maxine enhancement (CUDA-backed), return same-resolution numpy uint8 array."""
     if _maxine_model is None:
         raise RuntimeError("Maxine model not loaded — call load_maxine_model() first")
     h, w = frame_rgb.shape[:2]
