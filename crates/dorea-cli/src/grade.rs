@@ -578,7 +578,7 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
             pixels: px.clone(),
             width: kf_w,
             height: kf_h,
-            raune_max_size: kf_w,
+            raune_max_size: kf_w.max(kf_h),
             depth_max_size: 518,
         }
     }).collect();
@@ -620,6 +620,10 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let _ = inf_server.shutdown();
 
     // --- Phase 3: push to store ---
+    debug_assert_eq!(
+        kf_results.len(), kf_pixels.len(),
+        "fused inference must produce exactly one result per keyframe before Phase 3"
+    );
     for (i, (pixels, (enhanced, depth_proxy, dw, dh))) in
         kf_pixels.iter().zip(kf_results.iter()).enumerate()
     {
