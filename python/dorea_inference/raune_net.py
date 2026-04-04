@@ -183,15 +183,14 @@ class RauneNetInference:
 
         Returns (batch_tensor, out_w, out_h) where batch_tensor is (N, 3, H, W)
         float32 in [0, 1], still on self.device. Caller must not let it be GC'd.
-        Falls back to stacking infer() results if dims differ.
+        Falls back to sequential per-image forward passes (results stacked on device) if dims differ.
         """
-        if not imgs:
-            import torch
-            return torch.zeros(0, 3, 1, 1, device=self.device), 0, 0
-
         import torch
         import torchvision.transforms as transforms
         from PIL import Image as _Image
+
+        if not imgs:
+            return torch.zeros(0, 3, 0, 0, device=self.device), 0, 0
 
         normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         tensors = []
