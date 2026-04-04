@@ -128,7 +128,7 @@ class RauneDepthBatchResult:
 
     Each result dict contains:
       id, image_b64 (PNG, enhanced frame), enhanced_width, enhanced_height,
-      depth_f32_b64, depth_width, depth_height, type="depth_result"
+      depth_f32_b64, depth_width, depth_height
     """
     results: list
     type: str = "raune_depth_batch_result"

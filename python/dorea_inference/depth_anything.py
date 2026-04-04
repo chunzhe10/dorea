@@ -212,11 +212,14 @@ class DepthAnythingInference:
         Returns list of (H_d, W_d) float32 depth maps normalized to [0, 1].
         The resize and re-normalisation happen on-device — no dtoh between models.
         """
-        if enhanced.device != self.device:
+        if enhanced.device.type != self.device.type or (enhanced.device.index or 0) != (self.device.index or 0):
             raise ValueError(
                 f"infer_batch_from_tensors: enhanced tensor is on {enhanced.device} "
                 f"but model is on {self.device}. Caller must keep tensors on the same device."
             )
+
+        if enhanced.numel() == 0:
+            return []
 
         import torch
         import torch.nn.functional as F

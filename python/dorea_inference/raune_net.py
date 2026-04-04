@@ -203,18 +203,13 @@ class RauneNetInference:
             tensors.append(normalize(transforms.ToTensor()(r)))
 
         if len(wh_set) > 1:
-            # Different sizes: run sequentially, collect results as GPU tensors
-            results = []
-            for img in imgs:
-                r, tw, th = _resize_maintain_aspect(_Image.fromarray(img), max_size)
-                t = normalize(transforms.ToTensor()(r)).unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    out = self.model(t)
-                out = ((out.squeeze(0) + 1.0) / 2.0).clamp(0.0, 1.0)
-                results.append(out)
-            stacked = torch.stack(results)
-            _, _, H, W = stacked.shape
-            return stacked, W, H
+            # Different post-resize dimensions: stacking is not possible.
+            # Raise a clear error — the fused GPU path requires uniform input dims.
+            raise ValueError(
+                f"infer_batch_gpu: images have different post-resize dimensions {wh_set}. "
+                "The GPU tensor path requires uniform dimensions. Use infer_batch() for "
+                "mixed-size inputs or ensure all images have the same source resolution."
+            )
 
         batch = torch.stack(tensors)
         if self.device.type == "cuda":

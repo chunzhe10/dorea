@@ -583,7 +583,7 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
         }
     }).collect();
 
-    // (id, enhanced_rgb, enh_w, enh_h, depth_f32, depth_w, depth_h)
+    // (enhanced_rgb_u8, depth_f32_raw, depth_w, depth_h) — id and enh_w/h stripped on push
     let mut kf_results: Vec<(Vec<u8>, Vec<f32>, usize, usize)> = Vec::with_capacity(n_kf);
 
     for (chunk_items, chunk_pixels) in fused_items
@@ -620,9 +620,10 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let _ = inf_server.shutdown();
 
     // --- Phase 3: push to store ---
-    debug_assert_eq!(
-        kf_results.len(), kf_pixels.len(),
-        "fused inference must produce exactly one result per keyframe before Phase 3"
+    anyhow::ensure!(
+        kf_results.len() == kf_pixels.len(),
+        "fused inference produced {} results for {} keyframes — calibration aborted",
+        kf_results.len(), kf_pixels.len()
     );
     for (i, (pixels, (enhanced, depth_proxy, dw, dh))) in
         kf_pixels.iter().zip(kf_results.iter()).enumerate()
