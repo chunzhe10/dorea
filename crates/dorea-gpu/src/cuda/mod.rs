@@ -25,6 +25,10 @@ pub(crate) use combined_lut::CombinedLut;
 #[cfg(feature = "cuda")]
 const COMBINED_LUT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/combined_lut.ptx"));
 
+#[cfg(feature = "cuda")]
+const BUILD_COMBINED_LUT_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/build_combined_lut.ptx"));
+
 /// CUDA grader: holds a device handle and the precomputed combined LUT textures.
 ///
 /// Create once via `CudaGrader::new(calibration, params)`, reuse across frames.
@@ -96,6 +100,8 @@ impl CudaGrader {
         let d_depth     = dev.htod_sync_copy(depth).map_err(map_cudarc_error)?;
 
         // Upload texture handles (CUtexObject = u64) to device
+        // For the single-texture CudaGrader, pass the same set for both A and B
+        // with blend_t=0.0 so set B is never sampled.
         let d_textures: CudaSlice<u64> = dev
             .htod_sync_copy(&self.combined_lut.textures)
             .map_err(map_cudarc_error)?;
@@ -108,7 +114,8 @@ impl CudaGrader {
         // Output buffer
         let d_pixels_out: CudaSlice<u8> = dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?;
 
-        // Launch combined_lut_kernel
+        // Launch combined_lut_kernel (11-arg dual-texture signature)
+        // blend_t=0.0 → early-out after set A, set B args are never sampled
         {
             let func = dev.get_func("combined_lut", "combined_lut_kernel")
                 .ok_or_else(|| GpuError::ModuleLoad("combined_lut_kernel not found".into()))?;
@@ -121,8 +128,11 @@ impl CudaGrader {
                 func.launch(cfg, (
                     &d_pixels_in,
                     &d_depth,
-                    &d_textures,
-                    &d_boundaries,
+                    &d_textures,       // textures_a
+                    &d_boundaries,     // zone_boundaries_a
+                    &d_textures,       // textures_b (same — never sampled when blend_t=0)
+                    &d_boundaries,     // zone_boundaries_b (same)
+                    0.0f32,            // blend_t = 0.0
                     &d_pixels_out,
                     n as i32,
                     self.combined_lut.n_zones as i32,
@@ -425,5 +435,145 @@ mod tests {
             assert!(max_diff <= tol,
                 "n_zones={n_zones}: GPU/CPU max diff {max_diff}/255 exceeds {tol}/255");
         }
+    }
+}
+
+/// Adaptive grader with per-keyframe zone boundaries and dual-texture blending.
+///
+/// Field order matters for drop: `adaptive_lut` before `device`.
+#[cfg(feature = "cuda")]
+pub struct AdaptiveGrader {
+    adaptive_lut: combined_lut::AdaptiveLut,  // dropped first
+    device:       Arc<CudaDevice>,            // dropped second
+    _not_send:    std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(feature = "cuda")]
+impl AdaptiveGrader {
+    /// Initialize CUDA device, load both kernels, allocate double-buffered textures.
+    pub fn new(
+        base_luts_flat: &[f32],
+        base_boundaries: &[f32],
+        base_n_zones: usize,
+        hsl_data: (&[f32], &[f32], &[f32], &[f32]),
+        params: &GradeParams,
+        lut_size: usize,
+        runtime_n_zones: usize,
+    ) -> Result<Self, GpuError> {
+        let device = CudaDevice::new(0).map_err(|e| {
+            GpuError::ModuleLoad(format!("CudaDevice::new(0) failed: {e}"))
+        })?;
+
+        device.load_ptx(
+            Ptx::from_src(COMBINED_LUT_PTX),
+            "combined_lut",
+            &["combined_lut_kernel"],
+        ).map_err(|e| GpuError::ModuleLoad(format!("load combined_lut PTX: {e}")))?;
+
+        device.load_ptx(
+            Ptx::from_src(BUILD_COMBINED_LUT_PTX),
+            "build_combined_lut",
+            &["build_combined_lut_kernel"],
+        ).map_err(|e| GpuError::ModuleLoad(format!("load build_combined_lut PTX: {e}")))?;
+
+        let adaptive_lut = combined_lut::AdaptiveLut::new(
+            &device,
+            base_luts_flat,
+            base_boundaries,
+            base_n_zones,
+            hsl_data,
+            (params.warmth, params.strength, params.contrast),
+            lut_size,
+            runtime_n_zones,
+        )?;
+
+        Ok(Self {
+            adaptive_lut,
+            device,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// Build runtime textures for the next keyframe into the inactive set.
+    pub fn prepare_keyframe(&mut self, runtime_boundaries: &[f32]) -> Result<(), GpuError> {
+        let inactive = 1 - self.adaptive_lut.active_index();
+        self.adaptive_lut.rebuild_set(&self.device, inactive, runtime_boundaries)
+    }
+
+    /// Swap active/inactive texture sets (call at keyframe boundary after prepare_keyframe).
+    pub fn swap_textures(&mut self) {
+        self.adaptive_lut.swap();
+    }
+
+    /// Load new segment base LUT + HSL corrections.
+    pub fn load_segment(
+        &mut self,
+        base_luts_flat: &[f32],
+        base_boundaries: &[f32],
+        hsl_data: (&[f32], &[f32], &[f32], &[f32]),
+    ) -> Result<(), GpuError> {
+        self.adaptive_lut.load_segment(
+            &self.device, base_luts_flat, base_boundaries, hsl_data,
+        )
+    }
+
+    /// Grade one frame with dual-texture temporal blending.
+    ///
+    /// `blend_t`: 0.0 = keyframe (uses active set only), 0.0–1.0 between keyframes.
+    pub fn grade_frame_blended(
+        &self,
+        pixels: &[u8],
+        depth: &[f32],
+        width: usize,
+        height: usize,
+        blend_t: f32,
+    ) -> Result<Vec<u8>, GpuError> {
+        let n = width * height;
+        if pixels.len() != n * 3 {
+            return Err(GpuError::InvalidInput(format!(
+                "pixels len {} != {}*3", pixels.len(), n
+            )));
+        }
+        if depth.len() != n {
+            return Err(GpuError::InvalidInput(format!(
+                "depth len {} != {}", depth.len(), n
+            )));
+        }
+        let dev = &self.device;
+
+        let d_pixels_in  = dev.htod_sync_copy(pixels).map_err(map_cudarc_error)?;
+        let d_depth      = dev.htod_sync_copy(depth).map_err(map_cudarc_error)?;
+        let d_textures_a = dev.htod_sync_copy(self.adaptive_lut.active_textures()).map_err(map_cudarc_error)?;
+        let d_bounds_a   = dev.htod_sync_copy(self.adaptive_lut.active_boundaries()).map_err(map_cudarc_error)?;
+        let d_textures_b = dev.htod_sync_copy(self.adaptive_lut.inactive_textures()).map_err(map_cudarc_error)?;
+        let d_bounds_b   = dev.htod_sync_copy(self.adaptive_lut.inactive_boundaries()).map_err(map_cudarc_error)?;
+        let d_pixels_out: CudaSlice<u8> = dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?;
+
+        let func = dev.get_func("combined_lut", "combined_lut_kernel")
+            .ok_or_else(|| GpuError::ModuleLoad("combined_lut_kernel not found".into()))?;
+        let cfg = LaunchConfig {
+            grid_dim: (div_ceil(n as u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            func.launch(cfg, (
+                &d_pixels_in,
+                &d_depth,
+                &d_textures_a,
+                &d_bounds_a,
+                &d_textures_b,
+                &d_bounds_b,
+                blend_t,
+                &d_pixels_out,
+                n as i32,
+                self.adaptive_lut.runtime_n_zones as i32,
+                self.adaptive_lut.grid_size as i32,
+            ))
+        }.map_err(map_cudarc_error)?;
+
+        let result = dev.dtoh_sync_copy(&d_pixels_out).map_err(map_cudarc_error)?;
+        Ok(result)
     }
 }

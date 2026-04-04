@@ -12,6 +12,9 @@ pub mod cpu;
 pub mod cuda;
 
 #[cfg(feature = "cuda")]
+pub use cuda::AdaptiveGrader;
+
+#[cfg(feature = "cuda")]
 pub mod device;
 
 use dorea_cal::Calibration;
@@ -169,4 +172,33 @@ pub fn grade_frame_with_grader(
         )));
     }
     grader.grade_frame_cuda(pixels, depth, width, height)
+}
+
+/// Grade a single frame using an existing `AdaptiveGrader` with dual-texture blending.
+///
+/// `blend_t`: 0.0 = keyframe (active set only), up to 1.0 at next keyframe.
+#[cfg(feature = "cuda")]
+pub fn grade_frame_with_adaptive_grader(
+    grader: &cuda::AdaptiveGrader,
+    pixels: &[u8],
+    depth: &[f32],
+    width: usize,
+    height: usize,
+    blend_t: f32,
+) -> Result<Vec<u8>, GpuError> {
+    if pixels.len() != width * height * 3 {
+        return Err(GpuError::InvalidInput(format!(
+            "pixels length {} != width*height*3 {}",
+            pixels.len(),
+            width * height * 3
+        )));
+    }
+    if depth.len() != width * height {
+        return Err(GpuError::InvalidInput(format!(
+            "depth length {} != width*height {}",
+            depth.len(),
+            width * height
+        )));
+    }
+    grader.grade_frame_blended(pixels, depth, width, height, blend_t)
 }
