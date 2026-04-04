@@ -65,6 +65,14 @@ pub struct GradeDefaults {
     pub fused_batch_size: Option<usize>,
     /// Number of adaptive depth zones for calibration LUT (default: 16)
     pub depth_zones: Option<usize>,
+    /// Fine zones for segment-level base LUT (default: 32)
+    pub base_lut_zones: Option<usize>,
+    /// Wasserstein-1 distance threshold for scene segment boundary (default: 0.15)
+    pub scene_threshold: Option<f32>,
+    /// Minimum keyframes per scene segment before merge (default: 5)
+    pub min_segment_keyframes: Option<usize>,
+    /// Zone boundary smoothing window width; 1 = no smoothing (default: 3)
+    pub zone_smoothing_window: Option<usize>,
 }
 
 /// Maxine VFX SDK defaults (used when Maxine is re-enabled).

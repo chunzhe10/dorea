@@ -56,7 +56,7 @@ class MaxineEnhancer:
         # the input dimensions to configure the output size.
 
     def _init_effects(self, width: int, height: int) -> None:
-        """Lazily initialize Maxine effects with known input dimensions."""
+        """Lazily initialize Maxine VideoSuperRes with known input dimensions."""
         import torch
 
         out_w = width * self.upscale_factor
@@ -70,13 +70,9 @@ class MaxineEnhancer:
         self._sr_effect.set_cuda_stream(stream.cuda_stream)
         self._sr_effect.load()
 
-        self._ar_effect = _nvvfx.ArtifactReduction()
-        self._ar_effect.set_cuda_stream(stream.cuda_stream)
-        self._ar_effect.load()
-
         log.info(
-            "Maxine effects loaded: SR %dx%d→%dx%d, AR %dx%d",
-            width, height, out_w, out_h, width, height,
+            "Maxine VideoSuperRes loaded: %dx%d→%dx%d",
+            width, height, out_w, out_h,
         )
 
     def enhance(
@@ -86,9 +82,10 @@ class MaxineEnhancer:
         height: int,
         artifact_reduce: bool = True,
     ) -> np.ndarray:
-        """Enhance a single RGB u8 frame. Returns RGB u8 at original resolution.
+        """Enhance a single RGB u8 frame via VideoSuperRes. Returns RGB u8 at original resolution.
 
         On any failure, logs the error and returns the original frame unchanged.
+        Note: artifact_reduce parameter is ignored (ArtifactReduction not available in nvvfx SDK).
         """
         self._total_count += 1
 
@@ -96,7 +93,7 @@ class MaxineEnhancer:
             return rgb_u8
 
         try:
-            return self._enhance_impl(rgb_u8, width, height, artifact_reduce)
+            return self._enhance_impl(rgb_u8, width, height)
         except Exception as e:
             self._passthrough_count += 1
             log.warning("Maxine enhance failed (frame passthrough): %s", e)
@@ -107,9 +104,8 @@ class MaxineEnhancer:
         rgb_u8: np.ndarray,
         width: int,
         height: int,
-        artifact_reduce: bool,
     ) -> np.ndarray:
-        """Internal enhancement — exceptions propagate to enhance() for catch."""
+        """Internal enhancement via VideoSuperRes — exceptions propagate."""
         import torch
 
         if self._sr_effect is None:
@@ -121,17 +117,7 @@ class MaxineEnhancer:
 
         tensor = torch.from_numpy(bgra).cuda()
 
-        # 1. Artifact reduction at original resolution (≤1080p only)
-        if artifact_reduce:
-            if height <= 1080 and width <= 1920:
-                tensor = self._ar_effect.run(tensor)
-            elif self._total_count == 1:
-                log.warning(
-                    "Artifact reduction skipped: input %dx%d exceeds 1080p limit",
-                    width, height,
-                )
-
-        # 2. Super-resolution → upscaled intermediate
+        # Super-resolution → upscaled intermediate
         tensor = self._sr_effect.run(tensor)
 
         # 3. Download and downsample back to original resolution

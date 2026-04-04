@@ -243,7 +243,6 @@ def main(argv: Optional[list] = None) -> None:
                                 enhanced_np[i],
                                 width=enh_w,
                                 height=enh_h,
-                                artifact_reduce=True,
                             )
                         except Exception as e:
                             raise RuntimeError(
