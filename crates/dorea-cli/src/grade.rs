@@ -178,11 +178,11 @@ pub fn run(args: GradeArgs) -> Result<()> {
     let mut keyframes: Vec<KeyframeEntry> = Vec::new();
     let mut detector: Box<dyn ChangeDetector> = Box::new(MseDetector::default());
     let mut frames_since_kf = 0usize;
+    let scene_cut_threshold = args.depth_skip_threshold * 10.0;
 
     for frame_result in proxy_frames {
         let frame = frame_result.context("proxy frame decode error")?;
         let change = detector.score(&frame.pixels);
-        let scene_cut_threshold = args.depth_skip_threshold * 10.0;
         let scene_cut = change < f32::MAX && change > scene_cut_threshold;
         let is_keyframe = !interp_enabled
             || keyframes.is_empty()
