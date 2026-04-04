@@ -181,7 +181,7 @@ impl InferenceServer {
 
             // Load Maxine if requested.
             if config.maxine {
-                Self::call_load_maxine(py, &bridge, config.maxine_upscale_factor)?;
+                Self::call_load_maxine(py, &bridge, config.maxine_upscale_factor, device)?;
             }
 
             Ok(Self {
@@ -449,7 +449,9 @@ impl InferenceServer {
 
     /// Run Maxine enhancement in-process via the PyO3 bridge.
     ///
-    /// Returns enhanced RGB u8 at the same resolution as input.
+    /// Returns enhanced RGB u8 at the same resolution as input (`width × height × 3` bytes).
+    /// Maxine always preserves input dimensions — no shape extraction needed.
+    /// Returns `ServerError` if the Python bridge returns a different size.
     pub fn enhance(
         &self,
         _id: &str,
@@ -475,6 +477,13 @@ impl InferenceServer {
                 .map_err(|e| InferenceError::Ipc(format!("tolist: {e}")))?
                 .extract()
                 .map_err(|e| InferenceError::Ipc(format!("extract rgb: {e}")))?;
+            let expected = width * height * 3;
+            if rgb_data.len() != expected {
+                return Err(InferenceError::ServerError(format!(
+                    "enhance: expected {} bytes ({}x{}x3), got {}",
+                    expected, width, height, rgb_data.len()
+                )));
+            }
             Ok(rgb_data)
         })
     }
@@ -598,9 +607,10 @@ impl InferenceServer {
         py: Python<'_>,
         bridge: &Bound<'_, PyModule>,
         upscale_factor: u32,
+        _device: &str,  // Reserved for future multi-GPU support; Python bridge is CUDA-only today
     ) -> Result<(), InferenceError> {
         bridge
-            .call_method1("load_maxine_model", (upscale_factor as i64,))
+            .call_method1("load_maxine_model", (upscale_factor,))
             .map_err(|e| InferenceError::InitFailed(format!("load_maxine_model: {e}")))?;
         Ok(())
     }
