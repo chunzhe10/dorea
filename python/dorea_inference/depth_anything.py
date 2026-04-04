@@ -143,7 +143,11 @@ class DepthAnythingInference:
             arr = (arr - self._MEAN) / self._STD
             arrays.append(torch.from_numpy(arr).permute(2, 0, 1))
 
-        batch = torch.stack(arrays).to(self.device)  # (N, 3, H, W)
+        batch = torch.stack(arrays)
+        if self.device.type == "cuda":
+            batch = batch.pin_memory().to(self.device, non_blocking=True)
+        else:
+            batch = batch.to(self.device)
 
         with torch.no_grad():
             outputs = self.model(pixel_values=batch)
@@ -192,3 +196,52 @@ class DepthAnythingInference:
             depth = (depth - d_min) / (d_max - d_min)
 
         return depth.to(torch.float32).contiguous()
+
+    def infer_batch_from_tensors(
+        self,
+        enhanced: "torch.Tensor",
+        depth_max_size: int = 518,
+    ) -> "list[np.ndarray]":
+        """Run depth estimation on a batch of RAUNE-output GPU tensors.
+
+        Args:
+            enhanced: (N, 3, H_r, W_r) float32 in [0, 1], on self.device.
+                      This is the direct output of RauneNetInference.infer_batch_gpu().
+            depth_max_size: max long-edge for depth model (default 518).
+
+        Returns list of (H_d, W_d) float32 depth maps normalized to [0, 1].
+        The resize and re-normalisation happen on-device — no dtoh between models.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        N, _, H_r, W_r = enhanced.shape
+
+        # GPU resize: keep aspect, snap to multiples of _PATCH_SIZE
+        scale = depth_max_size / max(H_r, W_r)
+        H_d = max(_PATCH_SIZE, int(H_r * scale) // _PATCH_SIZE * _PATCH_SIZE)
+        W_d = max(_PATCH_SIZE, int(W_r * scale) // _PATCH_SIZE * _PATCH_SIZE)
+
+        resized = F.interpolate(
+            enhanced, size=(H_d, W_d), mode="bilinear", align_corners=False
+        )  # (N, 3, H_d, W_d) in [0, 1]
+
+        # Re-normalise [0,1] → ImageNet stats Depth Anything expects
+        mean = torch.tensor(self._MEAN, dtype=torch.float32, device=enhanced.device).view(1, 3, 1, 1)
+        std  = torch.tensor(self._STD,  dtype=torch.float32, device=enhanced.device).view(1, 3, 1, 1)
+        depth_input = (resized - mean) / std  # (N, 3, H_d, W_d)
+
+        with torch.no_grad():
+            outputs = self.model(pixel_values=depth_input)
+
+        depths_raw = outputs.predicted_depth.cpu().numpy()  # (N, H_d, W_d)
+
+        result = []
+        for i in range(N):
+            d = depths_raw[i]
+            d_min, d_max = float(d.min()), float(d.max())
+            if d_max - d_min < 1e-6:
+                result.append(np.zeros_like(d, dtype=np.float32))
+            else:
+                result.append(((d - d_min) / (d_max - d_min)).astype(np.float32))
+        return result

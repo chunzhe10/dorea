@@ -53,3 +53,48 @@ class TestRauneInferBatch:
         imgs = [_make_rgb(60, 80), _make_rgb(40, 60)]  # different sizes
         results = model.infer_batch(imgs, max_size=160)
         assert len(results) == 2
+
+
+class TestDepthInferBatchFromTensors:
+    def test_accepts_gpu_tensor_shape(self):
+        """infer_batch_from_tensors returns one depth map per input tensor."""
+        from dorea_inference.depth_anything import DepthAnythingInference
+
+        class _FakeDepthModel(torch.nn.Module):
+            class _Out:
+                def __init__(self, t): self.predicted_depth = t
+            def forward(self, pixel_values=None):
+                N, _, H, W = pixel_values.shape
+                return self._Out(pixel_values[:, 0, :, :])  # (N, H, W) dummy
+
+        model = DepthAnythingInference.__new__(DepthAnythingInference)
+        model.device = torch.device("cpu")
+        model.model = _FakeDepthModel()
+
+        # Simulate RAUNE output: (3, 3, H, W) float32 in [0, 1]
+        fake_enhanced = torch.rand(3, 3, 56, 84)  # 3 frames, not yet patch-aligned
+        depths = model.infer_batch_from_tensors(fake_enhanced, depth_max_size=56)
+        assert len(depths) == 3
+        assert all(isinstance(d, np.ndarray) for d in depths)
+        assert all(d.dtype == np.float32 for d in depths)
+
+    def test_output_dims_are_patch_aligned(self):
+        """Output depth map dimensions are multiples of 14."""
+        from dorea_inference.depth_anything import DepthAnythingInference
+
+        class _FakeDepthModel(torch.nn.Module):
+            class _Out:
+                def __init__(self, t): self.predicted_depth = t
+            def forward(self, pixel_values=None):
+                N, _, H, W = pixel_values.shape
+                return self._Out(pixel_values[:, 0, :, :])
+
+        model = DepthAnythingInference.__new__(DepthAnythingInference)
+        model.device = torch.device("cpu")
+        model.model = _FakeDepthModel()
+
+        fake_enhanced = torch.rand(1, 3, 100, 180)
+        depths = model.infer_batch_from_tensors(fake_enhanced, depth_max_size=98)
+        H, W = depths[0].shape
+        assert H % 14 == 0, f"height {H} not multiple of 14"
+        assert W % 14 == 0, f"width {W} not multiple of 14"
