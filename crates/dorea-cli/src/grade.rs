@@ -6,14 +6,16 @@ use std::time::Duration;
 use clap::Args;
 use anyhow::{Context, Result};
 
-use dorea_cal::Calibration;
-use dorea_gpu::{grade_frame, GradeParams};
+use dorea_gpu::GradeParams;
 use dorea_video::ffmpeg::{self, FrameEncoder};
 use dorea_video::inference::{RauneDepthBatchItem, InferenceConfig, InferenceServer};
-use crate::change_detect::{ChangeDetector, MseDetector};
+use crate::change_detect::{
+    ChangeDetector, MseDetector,
+    detect_scene_segments, compute_per_kf_zones, smooth_zone_boundaries,
+};
 
 #[cfg(feature = "cuda")]
-use dorea_gpu::cuda::CudaGrader;
+use dorea_gpu::AdaptiveGrader;
 
 #[derive(Args, Debug)]
 pub struct GradeArgs {
@@ -140,26 +142,6 @@ struct KeyframeEntry {
     scene_cut_before: bool,
 }
 
-/// Grade a single frame, reusing a pre-initialized CudaGrader when available.
-///
-/// Falls back to `grade_frame()` (which creates its own CudaGrader per-call) when the
-/// grader is `None` (e.g. CUDA init failed at startup).
-#[cfg(feature = "cuda")]
-fn grade_with_grader(
-    grader: Option<&CudaGrader>,
-    pixels: &[u8],
-    depth: &[f32],
-    width: usize,
-    height: usize,
-    calibration: &Calibration,
-    params: &GradeParams,
-) -> Result<Vec<u8>, dorea_gpu::GpuError> {
-    if let Some(g) = grader {
-        dorea_gpu::grade_frame_with_grader(g, pixels, depth, width, height)
-    } else {
-        grade_frame(pixels, depth, width, height, calibration, params)
-    }
-}
 
 pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     // Resolve config → CLI → built-in defaults (CLI wins, config fills missing, built-in is last resort)
@@ -486,137 +468,181 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     log::info!("Fused inference complete ({} keyframes)", keyframes.len());
     let _ = inf_server.shutdown();
 
-    let calibration: Calibration;
-    let keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)>;
-    keyframe_depths = kf_depths;
+    let keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)> = kf_depths;
 
     store.seal().context("failed to seal calibration store")?;
 
-    // ---- 3-pass calibration (inline) ----
+    // ---- Pre-compute depth timeline ----
     use dorea_hsl::derive::{derive_hsl_corrections, HslCorrections, QualifierCorrection};
     use dorea_hsl::{HSL_QUALIFIERS, MIN_WEIGHT};
     use dorea_lut::apply::apply_depth_luts;
     use dorea_lut::build::{adaptive_zone_boundaries, compute_importance, StreamingLutBuilder};
 
-    // Pass 1: reservoir-sample depths → adaptive zone boundaries
-    const RESERVOIR_CAP: usize = 1_000_000;
-    let mut reservoir: Vec<f32> = Vec::with_capacity(RESERVOIR_CAP);
-    let mut total_seen: u64 = 0;
-    let mut rng: u64 = 0x853c49e6748fea9b_u64;
+    // Step 1: Collect per-keyframe depth maps from store
+    let kf_depths_store: Vec<Vec<f32>> = (0..store.len())
+        .map(|i| store.read_depth(i))
+        .collect();
 
-    for i in 0..store.len() {
-        for d in store.depth_bytes(i).chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        {
-            total_seen += 1;
-            if reservoir.len() < RESERVOIR_CAP {
-                reservoir.push(d);
-            } else {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                let j = (rng % total_seen) as usize;
-                if j < RESERVOIR_CAP {
-                    reservoir[j] = d;
+    // Step 2: Compute per-keyframe zone boundaries (runtime zones, depth_zones wide)
+    let raw_kf_zones = compute_per_kf_zones(&kf_depths_store, depth_zones);
+
+    // Step 3: Detect scene segments via Wasserstein-1 depth histogram distance
+    let segments = detect_scene_segments(&kf_depths_store, scene_threshold, min_segment_kfs);
+    log::info!("Scene segments: {} (from {} keyframes)", segments.len(), store.len());
+    for (si, seg) in segments.iter().enumerate() {
+        log::info!(
+            "  segment {si}: keyframes {}..{} ({} KFs)",
+            seg.start, seg.end, seg.end - seg.start
+        );
+    }
+
+    // Step 4: Smooth zone boundaries (respecting segment boundaries)
+    let smoothed_kf_zones = smooth_zone_boundaries(&raw_kf_zones, &segments, zone_smoothing_w);
+
+    // Step 5: Build per-segment base LUTs + HSL corrections
+    struct SegmentCalibration {
+        depth_luts: dorea_lut::types::DepthLuts,
+        hsl_corrections: HslCorrections,
+    }
+    let n_quals = HSL_QUALIFIERS.len();
+
+    let segment_calibrations: Vec<SegmentCalibration> = segments.iter().map(|seg| {
+        // Collect depths from all keyframes in this segment → base zone boundaries
+        let seg_depths: Vec<f32> = (seg.start..seg.end)
+            .flat_map(|i| kf_depths_store[i].iter().cloned())
+            .collect();
+        let base_boundaries = adaptive_zone_boundaries(&seg_depths, base_lut_zones);
+
+        // Build streaming LUT for this segment (base_lut_zones fine zones)
+        let mut lut_builder = StreamingLutBuilder::new(base_boundaries);
+        for i in seg.start..seg.end {
+            let (w, h) = store.dims(i);
+            let (pixels_u8, target_u8) = store.pixtar_slices(i);
+            let depth = store.read_depth(i);
+            let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect();
+            let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect();
+            let importance = compute_importance(&depth, w, h);
+            lut_builder.add_frame(&original, &target, &depth, &importance);
+        }
+        let depth_luts = lut_builder.finish();
+
+        // HSL corrections: weighted average over keyframes in segment
+        let mut h_offset_acc    = vec![0.0_f64; n_quals];
+        let mut s_ratio_acc     = vec![0.0_f64; n_quals];
+        let mut v_offset_acc    = vec![0.0_f64; n_quals];
+        let mut active_count    = vec![0_usize;  n_quals];
+        let mut total_weight_acc = vec![0.0_f64; n_quals];
+
+        for i in seg.start..seg.end {
+            let (pixels_u8, target_u8) = store.pixtar_slices(i);
+            let depth = store.read_depth(i);
+            let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect();
+            let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect();
+            let lut_output = apply_depth_luts(&original, &depth, &depth_luts);
+            let corrs = derive_hsl_corrections(&lut_output, &target);
+            for (qi, corr) in corrs.0.iter().enumerate() {
+                if corr.weight >= MIN_WEIGHT {
+                    let w = corr.weight as f64;
+                    h_offset_acc[qi]     += corr.h_offset as f64 * w;
+                    s_ratio_acc[qi]      += corr.s_ratio  as f64 * w;
+                    v_offset_acc[qi]     += corr.v_offset as f64 * w;
+                    active_count[qi]     += 1;
+                    total_weight_acc[qi] += w;
                 }
             }
         }
-    }
-    let zone_boundaries = adaptive_zone_boundaries(&reservoir, depth_zones);
-    log::info!("Depth zones: {depth_zones} adaptive zones from {} depth samples", total_seen);
-    drop(reservoir);
 
-    // Pass 2: stream frames → build LUT
-    let mut lut_builder = StreamingLutBuilder::new(zone_boundaries);
-    for i in 0..store.len() {
-        let (w, h) = store.dims(i);
-        let (pixels_u8, target_u8) = store.pixtar_slices(i);
-        let depth = store.read_depth(i);
-        let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
-            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
-            .collect();
-        let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
-            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
-            .collect();
-        let importance = compute_importance(&depth, w, h);
-        lut_builder.add_frame(&original, &target, &depth, &importance);
-    }
-    let depth_luts = lut_builder.finish();
-
-    // Pass 3: stream frames → HSL corrections
-    let n_quals = HSL_QUALIFIERS.len();
-    let mut h_offset_acc    = vec![0.0_f64; n_quals];
-    let mut s_ratio_acc     = vec![0.0_f64; n_quals];
-    let mut v_offset_acc    = vec![0.0_f64; n_quals];
-    let mut active_count    = vec![0_usize;  n_quals];
-    let mut total_weight_acc = vec![0.0_f64; n_quals];
-
-    for i in 0..store.len() {
-        let (pixels_u8, target_u8) = store.pixtar_slices(i);
-        let depth = store.read_depth(i);
-        let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
-            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
-            .collect();
-        let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
-            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
-            .collect();
-        let lut_output = apply_depth_luts(&original, &depth, &depth_luts);
-        let corrs = derive_hsl_corrections(&lut_output, &target);
-        for (qi, corr) in corrs.0.iter().enumerate() {
-            if corr.weight >= MIN_WEIGHT {
-                let w = corr.weight as f64;
-                h_offset_acc[qi]    += corr.h_offset as f64 * w;
-                s_ratio_acc[qi]     += corr.s_ratio  as f64 * w;
-                v_offset_acc[qi]    += corr.v_offset as f64 * w;
-                active_count[qi]    += 1;
-                total_weight_acc[qi] += w;
+        let avg_corrections: Vec<QualifierCorrection> = (0..n_quals).map(|qi| {
+            let qual = &HSL_QUALIFIERS[qi];
+            if active_count[qi] > 0 {
+                let tw = total_weight_acc[qi];
+                QualifierCorrection {
+                    h_center: qual.h_center,
+                    h_width:  qual.h_width,
+                    h_offset: (h_offset_acc[qi] / tw) as f32,
+                    s_ratio:  (s_ratio_acc[qi]  / tw) as f32,
+                    v_offset: (v_offset_acc[qi] / tw) as f32,
+                    weight:   tw as f32,
+                }
+            } else {
+                QualifierCorrection {
+                    h_center: qual.h_center,
+                    h_width:  qual.h_width,
+                    h_offset: 0.0,
+                    s_ratio:  1.0,
+                    v_offset: 0.0,
+                    weight:   0.0,
+                }
             }
-        }
-    }
+        }).collect();
 
-    let mut avg_corrections: Vec<QualifierCorrection> = Vec::with_capacity(n_quals);
-    for qi in 0..n_quals {
-        let qual = &HSL_QUALIFIERS[qi];
-        if active_count[qi] > 0 {
-            let tw = total_weight_acc[qi];
-            avg_corrections.push(QualifierCorrection {
-                h_center: qual.h_center,
-                h_width:  qual.h_width,
-                h_offset: (h_offset_acc[qi] / tw) as f32,
-                s_ratio:  (s_ratio_acc[qi]  / tw) as f32,
-                v_offset: (v_offset_acc[qi] / tw) as f32,
-                weight:   tw as f32,
-            });
-        } else {
-            avg_corrections.push(QualifierCorrection {
-                h_center: qual.h_center,
-                h_width:  qual.h_width,
-                h_offset: 0.0,
-                s_ratio:  1.0,
-                v_offset: 0.0,
-                weight:   0.0,
-            });
+        SegmentCalibration {
+            depth_luts,
+            hsl_corrections: HslCorrections(avg_corrections),
         }
-    }
+    }).collect();
 
-    calibration = Calibration::new(depth_luts, HslCorrections(avg_corrections), store.len());
     log::info!(
-        "Auto-calibration complete ({} keyframes → {} depth zones)",
-        store.len(), depth_zones
+        "Pre-compute complete: {} segments, {} per-KF zone sets",
+        segment_calibrations.len(), smoothed_kf_zones.len(),
     );
 
-    // Initialize CUDA grader (loads PTX once, builds combined LUT, reuses across all frames)
-    #[cfg(feature = "cuda")]
-    let cuda_grader = match CudaGrader::new(&calibration, &params) {
-        Ok(g) => {
-            log::info!("CUDA grader initialized (cudarc + PTX modules loaded)");
-            Some(g)
+    // Build segment-to-keyframe index lookup
+    let kf_to_segment: Vec<usize> = {
+        let mut map = vec![0usize; store.len()];
+        for (si, seg) in segments.iter().enumerate() {
+            for ki in seg.start..seg.end {
+                map[ki] = si;
+            }
         }
-        Err(e) => {
-            log::warn!("CUDA grader init failed: {e} — will use per-frame fallback");
-            None
-        }
+        map
     };
+
+    // Initialize adaptive CUDA grader with first segment's base LUT
+    #[cfg(feature = "cuda")]
+    let mut adaptive_grader = {
+        let seg0 = &segment_calibrations[0];
+        let base_flat: Vec<f32> = seg0.depth_luts.luts.iter()
+            .flat_map(|lut| lut.data.iter().copied())
+            .collect();
+        let base_bounds = &seg0.depth_luts.zone_boundaries;
+        let hsl = &seg0.hsl_corrections;
+        let h_offsets: Vec<f32> = hsl.0.iter().map(|q| q.h_offset).collect();
+        let s_ratios:  Vec<f32> = hsl.0.iter().map(|q| q.s_ratio).collect();
+        let v_offsets: Vec<f32> = hsl.0.iter().map(|q| q.v_offset).collect();
+        let weights:   Vec<f32> = hsl.0.iter().map(|q| q.weight).collect();
+        let lut_size = seg0.depth_luts.luts[0].size;
+
+        AdaptiveGrader::new(
+            &base_flat, base_bounds, base_lut_zones,
+            (&h_offsets, &s_ratios, &v_offsets, &weights),
+            &params, lut_size, depth_zones,
+        ).context("AdaptiveGrader init failed")?
+    };
+
+    // Build first keyframe's runtime texture
+    #[cfg(feature = "cuda")]
+    {
+        adaptive_grader.prepare_keyframe(&smoothed_kf_zones[0])
+            .context("prepare initial keyframe texture failed")?;
+        adaptive_grader.swap_textures();
+        // Pre-build second keyframe texture (pipelining: hidden behind encoder startup)
+        if smoothed_kf_zones.len() > 1 {
+            adaptive_grader.prepare_keyframe(&smoothed_kf_zones[1])
+                .context("prepare second keyframe texture failed")?;
+        }
+        log::info!(
+            "Adaptive CUDA grader initialized ({base_lut_zones} base zones, {depth_zones} runtime zones)"
+        );
+    }
 
     // Ordered list of (frame_index, scene_cut_before) for pass-2 lerp lookup.
     let kf_index_list: Vec<(u64, bool)> = keyframes.iter()
@@ -624,7 +650,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         .collect();
 
     // -----------------------------------------------------------------------
-    // Pass 2: full-resolution decode + depth lookup + grade + encode
+    // Pass 2: full-resolution decode + adaptive depth grading
     // -----------------------------------------------------------------------
     let decode_source = maxine_temp_path.as_deref().unwrap_or(args.input.as_path());
     let frames = ffmpeg::decode_frames(decode_source, &info)
@@ -632,14 +658,48 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
 
     let mut kf_cursor = 0usize;
     let mut frame_count = 0u64;
+    let mut current_segment = kf_to_segment.first().copied().unwrap_or(0);
 
     for frame_result in frames {
         let frame = frame_result.context("frame decode error")?;
         let fi = frame.index;
 
-        // Advance cursor: kf_index_list[kf_cursor].0 is the most recent keyframe ≤ fi
+        // Advance cursor: kf_index_list[kf_cursor] is the most recent keyframe ≤ fi.
         while kf_cursor + 1 < kf_index_list.len() && kf_index_list[kf_cursor + 1].0 <= fi {
             kf_cursor += 1;
+
+            #[cfg(feature = "cuda")]
+            {
+                // Crossed a keyframe boundary — swap textures
+                adaptive_grader.swap_textures();
+
+                // Check for segment boundary
+                let new_seg = kf_to_segment[kf_cursor];
+                if new_seg != current_segment {
+                    let seg_cal = &segment_calibrations[new_seg];
+                    let base_flat: Vec<f32> = seg_cal.depth_luts.luts.iter()
+                        .flat_map(|lut| lut.data.iter().copied())
+                        .collect();
+                    let base_bounds = &seg_cal.depth_luts.zone_boundaries;
+                    let hsl = &seg_cal.hsl_corrections;
+                    let h_offsets: Vec<f32> = hsl.0.iter().map(|q| q.h_offset).collect();
+                    let s_ratios:  Vec<f32> = hsl.0.iter().map(|q| q.s_ratio).collect();
+                    let v_offsets: Vec<f32> = hsl.0.iter().map(|q| q.v_offset).collect();
+                    let weights:   Vec<f32> = hsl.0.iter().map(|q| q.weight).collect();
+                    adaptive_grader.load_segment(
+                        &base_flat, base_bounds,
+                        (&h_offsets, &s_ratios, &v_offsets, &weights),
+                    ).context("load_segment failed")?;
+                    current_segment = new_seg;
+                    log::info!("Segment switch to {new_seg} at keyframe {kf_cursor}");
+                }
+
+                // Pre-build next keyframe's texture (pipelining: hidden behind grading of current interval)
+                if kf_cursor + 1 < smoothed_kf_zones.len() {
+                    adaptive_grader.prepare_keyframe(&smoothed_kf_zones[kf_cursor + 1])
+                        .context("prepare_keyframe failed")?;
+                }
+            }
         }
 
         let (prev_kf_idx, _) = kf_index_list[kf_cursor];
@@ -648,12 +708,12 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
             .expect("prev keyframe depth missing — logic error");
         let (dpw, dph) = (*dpw, *dph);
 
-        // Lerp at proxy resolution, then upscale once — ~50× less work than lerping full-res.
+        // Lerp depth at proxy resolution, then upscale once.
         let depth_proxy = if fi == prev_kf_idx {
             prev_depth_proxy.clone()
         } else if let Some(&(next_kf_idx, scene_cut_before_next)) = kf_index_list.get(kf_cursor + 1) {
             if scene_cut_before_next {
-                prev_depth_proxy.clone() // Don't lerp across scene cut
+                prev_depth_proxy.clone()
             } else {
                 let (next_depth_proxy, _, _) = keyframe_depths
                     .get(&next_kf_idx)
@@ -662,25 +722,43 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
                 lerp_depth(prev_depth_proxy, next_depth_proxy, t)
             }
         } else {
-            prev_depth_proxy.clone() // Past last keyframe
+            prev_depth_proxy.clone()
         };
 
-        // Upscale depth to full frame resolution for grading.
         let depth = if dpw == frame.width && dph == frame.height {
             depth_proxy
         } else {
             InferenceServer::upscale_depth(&depth_proxy, dpw, dph, frame.width, frame.height)
         };
 
+        // Compute blend_t: temporal position of this frame between adjacent keyframes.
+        let blend_t = if fi == prev_kf_idx {
+            0.0_f32
+        } else if let Some(&(next_kf_idx, scene_cut)) = kf_index_list.get(kf_cursor + 1) {
+            if scene_cut { 0.0 } else {
+                (fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32
+            }
+        } else {
+            0.0 // Past last keyframe
+        };
+
         #[cfg(feature = "cuda")]
-        let graded = grade_with_grader(
-            cuda_grader.as_ref(),
-            &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
+        let graded = adaptive_grader.grade_frame_blended(
+            &frame.pixels, &depth, frame.width, frame.height, blend_t,
         ).map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?;
+
         #[cfg(not(feature = "cuda"))]
-        let graded = grade_frame(
-            &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-        ).map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?;
+        let graded = {
+            // CPU fallback: use current segment's calibration
+            use dorea_cal::Calibration;
+            let seg_idx = kf_to_segment.get(kf_cursor).copied().unwrap_or(0);
+            let cal = &segment_calibrations[seg_idx];
+            let calibration = Calibration::new(
+                cal.depth_luts.clone(), cal.hsl_corrections.clone(), store.len(),
+            );
+            grade_frame(&frame.pixels, &depth, frame.width, frame.height, &calibration, &params)
+                .map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?
+        };
 
         encoder.write_frame(&graded).context("encoder write failed")?;
         frame_count += 1;
