@@ -131,6 +131,55 @@ pub struct RauneDepthBatchItem {
     pub depth_max_size: usize,
 }
 
+/// Parse an enhance_result JSON response, validating dimensions match the request.
+fn parse_enhance_response(
+    resp: &str,
+    expected_id: &str,
+    expected_w: usize,
+    expected_h: usize,
+) -> Result<(Vec<u8>, usize, usize), InferenceError> {
+    let v: serde_json::Value = serde_json::from_str(resp)
+        .map_err(|e| InferenceError::Ipc(format!("enhance response parse: {e}")))?;
+
+    if v["type"].as_str() == Some("error") {
+        let msg = v["message"].as_str().unwrap_or("unknown error");
+        return Err(InferenceError::ServerError(msg.to_string()));
+    }
+    if v["type"].as_str() != Some("enhance_result") {
+        return Err(InferenceError::Ipc(format!(
+            "unexpected response type for enhance: {resp}"
+        )));
+    }
+
+    let w = v["width"].as_u64().unwrap_or(0) as usize;
+    let h = v["height"].as_u64().unwrap_or(0) as usize;
+
+    if w != expected_w || h != expected_h {
+        return Err(InferenceError::Ipc(format!(
+            "enhance dimension mismatch: expected {expected_w}x{expected_h}, got {w}x{h}"
+        )));
+    }
+
+    let b64_out = v["image_b64"]
+        .as_str()
+        .ok_or_else(|| InferenceError::Ipc("missing image_b64".to_string()))?;
+
+    let raw = B64
+        .decode(b64_out)
+        .map_err(|e| InferenceError::Ipc(format!("base64 decode: {e}")))?;
+
+    if raw.len() != w * h * 3 {
+        return Err(InferenceError::Ipc(format!(
+            "enhance buffer size mismatch: got {}, expected {}",
+            raw.len(),
+            w * h * 3,
+        )));
+    }
+
+    let _ = expected_id; // id correlation not enforced in response (Python echoes it back)
+    Ok((raw, w, h))
+}
+
 /// Active connection to the Python inference subprocess.
 pub struct InferenceServer {
     child: Child,
@@ -502,6 +551,39 @@ impl InferenceServer {
             out.push((id, enh_rgb, enh_w, enh_h, depth, depth_w, depth_h));
         }
         Ok(out)
+    }
+
+    /// Send an RGB u8 frame to Maxine for enhancement.
+    /// Returns enhanced RGB u8 at the same resolution as input.
+    ///
+    /// On server-side failure the Python side returns the original frame
+    /// (passthrough), so this method only errors on IPC/protocol issues.
+    pub fn enhance(
+        &mut self,
+        id: &str,
+        image_rgb: &[u8],
+        width: usize,
+        height: usize,
+        artifact_reduce: bool,
+        upscale_factor: u32,
+    ) -> Result<Vec<u8>, InferenceError> {
+        let b64 = B64.encode(image_rgb);
+
+        let req = serde_json::json!({
+            "type": "enhance",
+            "id": id,
+            "format": "raw_rgb",
+            "image_b64": b64,
+            "width": width,
+            "height": height,
+            "no_artifact_reduce": !artifact_reduce,
+            "upscale_factor": upscale_factor,
+        });
+
+        self.send_line(&req.to_string())?;
+        let resp = self.recv_line()?;
+        let (pixels, _w, _h) = parse_enhance_response(&resp, id, width, height)?;
+        Ok(pixels)
     }
 
     /// Bilinearly upscale a depth map from (src_w, src_h) to (dst_w, dst_h).
@@ -894,5 +976,41 @@ mod tests {
         };
         let args = config.build_args();
         assert!(!args.contains(&"--maxine".to_string()), "--maxine should be absent");
+    }
+
+    #[test]
+    fn enhance_parses_valid_response() {
+        let width = 4usize;
+        let height = 2usize;
+        let pixels: Vec<u8> = vec![128u8; width * height * 3];
+        let b64 = B64.encode(&pixels);
+        let resp = serde_json::json!({
+            "type": "enhance_result",
+            "id": "test_001",
+            "image_b64": b64,
+            "width": width,
+            "height": height,
+        });
+        let (result_pixels, rw, rh) =
+            parse_enhance_response(&resp.to_string(), "test_001", width, height).unwrap();
+        assert_eq!(rw, width);
+        assert_eq!(rh, height);
+        assert_eq!(result_pixels.len(), width * height * 3);
+        assert_eq!(result_pixels[0], 128);
+    }
+
+    #[test]
+    fn enhance_rejects_dimension_mismatch() {
+        let pixels: Vec<u8> = vec![0u8; 4 * 2 * 3];
+        let b64 = B64.encode(&pixels);
+        let resp = serde_json::json!({
+            "type": "enhance_result",
+            "id": "test_001",
+            "image_b64": b64,
+            "width": 8,   // mismatch: sent 4
+            "height": 4,  // mismatch: sent 2
+        });
+        let result = parse_enhance_response(&resp.to_string(), "test_001", 4, 2);
+        assert!(result.is_err(), "should reject dimension mismatch");
     }
 }
