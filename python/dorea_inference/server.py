@@ -260,14 +260,27 @@ def main(argv: Optional[list] = None) -> None:
                     )
                     resp = EnhanceResult.from_array(req_id, enhanced)
             elif req_type == "unload_maxine":
-                import torch
                 maxine_enhancer = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
                 print("[dorea-inference] Maxine unloaded — VRAM freed", file=sys.stderr, flush=True)
                 resp = OkResponse()
 
             elif req_type == "load_raune":
+                # Unload existing model first to avoid OOM on 6 GB VRAM budget
+                if raune_model is not None:
+                    del raune_model
+                    raune_model = None
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
                 from .raune_net import RauneNetInference
                 raune_model = RauneNetInference(
                     weights_path=req.get("weights"),
@@ -278,6 +291,16 @@ def main(argv: Optional[list] = None) -> None:
                 resp = OkResponse()
 
             elif req_type == "load_depth":
+                # Unload existing model first to avoid OOM on 6 GB VRAM budget
+                if depth_model is not None:
+                    del depth_model
+                    depth_model = None
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
                 from .depth_anything import DepthAnythingInference
                 depth_model = DepthAnythingInference(
                     model_path=req.get("model_path"),
