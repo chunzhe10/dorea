@@ -39,6 +39,9 @@ pub struct InferenceConfig {
     /// Skip RAUNE-Net entirely (pass `--no-raune` to the server).
     /// Use this for inference phases that only need depth (e.g. per-frame grading).
     pub skip_raune: bool,
+    /// Skip Depth Anything entirely (pass `--no-depth` to the server).
+    /// Use this when spawning a Maxine-only server for Pass 1.
+    pub skip_depth: bool,
     /// Path to Depth Anything V2 model directory. None = use Python default / HF.
     pub depth_model: Option<PathBuf>,
     /// Compute device: "cpu" or "cuda". None = auto-detect.
@@ -58,6 +61,7 @@ impl Default for InferenceConfig {
             raune_weights: None,
             raune_models_dir: None,
             skip_raune: false,
+            skip_depth: false,
             depth_model: None,
             device: None,
             startup_timeout: Duration::from_secs(120),
@@ -86,7 +90,9 @@ impl InferenceConfig {
             args.push(p.to_str().unwrap_or("").to_string());
         }
 
-        if let Some(p) = &self.depth_model {
+        if self.skip_depth {
+            args.push("--no-depth".to_string());
+        } else if let Some(p) = &self.depth_model {
             args.push("--depth-model".to_string());
             args.push(p.to_str().unwrap_or("").to_string());
         }
@@ -584,6 +590,65 @@ impl InferenceServer {
         Ok(pixels)
     }
 
+    /// Unload Maxine model and free its VRAM without stopping the server.
+    pub fn unload_maxine(&mut self) -> Result<(), InferenceError> {
+        let req = serde_json::json!({"type": "unload_maxine"});
+        self.send_line(&req.to_string())?;
+        let resp = self.recv_line()?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| InferenceError::Ipc(format!("unload_maxine response parse: {e}")))?;
+        if v["type"].as_str() == Some("error") {
+            return Err(InferenceError::ServerError(
+                v["message"].as_str().unwrap_or("unknown error").to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Load RAUNE-Net into the running server (after it was started without it).
+    pub fn load_raune(
+        &mut self,
+        weights: Option<&std::path::Path>,
+        models_dir: Option<&std::path::Path>,
+    ) -> Result<(), InferenceError> {
+        let req = serde_json::json!({
+            "type": "load_raune",
+            "weights": weights.and_then(|p| p.to_str()),
+            "models_dir": models_dir.and_then(|p| p.to_str()),
+        });
+        self.send_line(&req.to_string())?;
+        let resp = self.recv_line()?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| InferenceError::Ipc(format!("load_raune response parse: {e}")))?;
+        if v["type"].as_str() == Some("error") {
+            return Err(InferenceError::ServerError(
+                v["message"].as_str().unwrap_or("unknown error").to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Load Depth Anything into the running server (after it was started without it).
+    pub fn load_depth(
+        &mut self,
+        model_path: Option<&std::path::Path>,
+    ) -> Result<(), InferenceError> {
+        let req = serde_json::json!({
+            "type": "load_depth",
+            "model_path": model_path.and_then(|p| p.to_str()),
+        });
+        self.send_line(&req.to_string())?;
+        let resp = self.recv_line()?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| InferenceError::Ipc(format!("load_depth response parse: {e}")))?;
+        if v["type"].as_str() == Some("error") {
+            return Err(InferenceError::ServerError(
+                v["message"].as_str().unwrap_or("unknown error").to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Bilinearly upscale a depth map from (src_w, src_h) to (dst_w, dst_h).
     pub fn upscale_depth(
         depth: &[f32],
@@ -1010,5 +1075,54 @@ mod tests {
         });
         let result = parse_enhance_response(&resp.to_string(), "test_001", 4, 2);
         assert!(result.is_err(), "should reject dimension mismatch");
+    }
+
+    #[test]
+    fn spawn_command_includes_no_depth_when_skip_depth() {
+        let config = InferenceConfig {
+            skip_depth: true,
+            ..InferenceConfig::default()
+        };
+        let args = config.build_args();
+        assert!(args.contains(&"--no-depth".to_string()), "missing --no-depth");
+    }
+
+    #[test]
+    fn spawn_command_omits_no_depth_by_default() {
+        let config = InferenceConfig::default();
+        let args = config.build_args();
+        assert!(!args.contains(&"--no-depth".to_string()), "--no-depth should be absent by default");
+    }
+
+    #[test]
+    fn unload_maxine_sends_correct_json() {
+        let req = serde_json::json!({"type": "unload_maxine"});
+        assert_eq!(req["type"].as_str().unwrap(), "unload_maxine");
+    }
+
+    #[test]
+    fn load_raune_sends_correct_json() {
+        use std::path::Path;
+        let weights = Path::new("/path/to/weights.pth");
+        let models_dir = Path::new("/path/to/raune");
+        let req = serde_json::json!({
+            "type": "load_raune",
+            "weights": weights.to_str(),
+            "models_dir": models_dir.to_str(),
+        });
+        assert_eq!(req["type"].as_str().unwrap(), "load_raune");
+        assert_eq!(req["weights"].as_str().unwrap(), "/path/to/weights.pth");
+    }
+
+    #[test]
+    fn load_depth_sends_correct_json() {
+        use std::path::Path;
+        let model = Path::new("/models/depth_anything");
+        let req = serde_json::json!({
+            "type": "load_depth",
+            "model_path": model.to_str(),
+        });
+        assert_eq!(req["type"].as_str().unwrap(), "load_depth");
+        assert_eq!(req["model_path"].as_str().unwrap(), "/models/depth_anything");
     }
 }
