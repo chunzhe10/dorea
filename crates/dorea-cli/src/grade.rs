@@ -466,6 +466,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         }
     }
     log::info!("Fused inference complete ({} keyframes)", keyframes.len());
+    debug_assert_eq!(store.len(), keyframes.len(), "store/keyframes length diverged after fused inference");
     let _ = inf_server.shutdown();
 
     let keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)> = kf_depths;
@@ -736,7 +737,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
             0.0_f32
         } else if let Some(&(next_kf_idx, scene_cut)) = kf_index_list.get(kf_cursor + 1) {
             if scene_cut { 0.0 } else {
-                (fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32
+                ((fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32).clamp(0.0, 1.0)
             }
         } else {
             0.0 // Past last keyframe
@@ -751,6 +752,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         let graded = {
             // CPU fallback: use current segment's calibration
             use dorea_cal::Calibration;
+            use dorea_gpu::grade_frame;
             let seg_idx = kf_to_segment.get(kf_cursor).copied().unwrap_or(0);
             let cal = &segment_calibrations[seg_idx];
             let calibration = Calibration::new(
@@ -971,19 +973,11 @@ mod tests {
     }
 
     #[test]
-    fn build_inference_config_maxine_disabled() {
+    fn build_inference_config_defaults() {
         let python = PathBuf::from("/opt/dorea-venv/bin/python");
         let cfg = build_inference_config(&python, None, None, None, None, 2);
-        assert!(!cfg.maxine, "Maxine is disabled until SR is re-enabled");
+        assert!(cfg.maxine, "Maxine should be enabled for fused batch upscaling");
         assert!(!cfg.skip_raune, "RAUNE should not be skipped in config");
         assert!(!cfg.skip_depth, "depth should not be skipped in config");
-    }
-
-    #[test]
-    fn build_inference_config_maxine_always_false() {
-        // Maxine is hardcoded false regardless of any arg — verify both flag states
-        let python = PathBuf::from("/opt/dorea-venv/bin/python");
-        let cfg = build_inference_config(&python, None, None, None, None, 2);
-        assert!(!cfg.maxine, "Maxine is disabled until SR is re-enabled");
     }
 }
