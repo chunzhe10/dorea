@@ -29,6 +29,7 @@ from .protocol import (
     RauneResult,
     DepthResult,
     DepthBatchResult,
+    RauneDepthBatchResult,
     ErrorResponse,
     OkResponse,
     decode_png,
@@ -172,6 +173,47 @@ def main(argv: Optional[list] = None) -> None:
                     for item, depth in zip(items, depths)
                 ]
                 resp = DepthBatchResult(results=results)
+            elif req_type == "raune_depth_batch":
+                if raune_model is None:
+                    raise RuntimeError("RAUNE-Net not loaded — pass --raune-weights")
+                if depth_model is None:
+                    raise RuntimeError("Depth Anything not loaded — pass --depth-model")
+
+                items = req.get("items", [])
+                imgs = []
+                for item in items:
+                    fmt = item.get("format", "png")
+                    if fmt == "raw_rgb":
+                        imgs.append(decode_raw_rgb(item["image_b64"], int(item["width"]), int(item["height"])))
+                    else:
+                        imgs.append(decode_png(item["image_b64"]))
+
+                raune_max = int(items[0].get("raune_max_size", 1024)) if items else 1024
+                depth_max = int(items[0].get("depth_max_size", 518)) if items else 518
+
+                # RAUNE → enhanced tensors stay on GPU
+                enhanced_batch, enh_w, enh_h = raune_model.infer_batch_gpu(imgs, max_size=raune_max)
+
+                # Depth on enhanced tensors — no dtoh between models
+                depth_maps = depth_model.infer_batch_from_tensors(enhanced_batch, depth_max_size=depth_max)
+
+                # dtoh enhanced frames for output
+                enhanced_np = (
+                    enhanced_batch.permute(0, 2, 3, 1).cpu().numpy() * 255
+                ).astype("uint8")  # (N, H, W, 3)
+
+                results = []
+                for i, (item, depth) in enumerate(zip(items, depth_maps)):
+                    depth_result = DepthResult.from_array(item.get("id"), depth)
+                    results.append({
+                        "id": item.get("id"),
+                        "image_b64": encode_png(enhanced_np[i]),
+                        "enhanced_width": int(enh_w),
+                        "enhanced_height": int(enh_h),
+                        **{k: v for k, v in depth_result.to_dict().items()
+                           if k in ("depth_f32_b64", "depth_width", "depth_height", "type")},
+                    })
+                resp = RauneDepthBatchResult(results=results)
             elif req_type == "shutdown":
                 resp = OkResponse()
                 try:

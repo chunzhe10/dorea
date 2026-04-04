@@ -98,3 +98,28 @@ class TestDepthInferBatchFromTensors:
         H, W = depths[0].shape
         assert H % 14 == 0, f"height {H} not multiple of 14"
         assert W % 14 == 0, f"width {W} not multiple of 14"
+
+
+class TestRauneDepthBatchProtocol:
+    def test_raune_depth_batch_result_roundtrip(self):
+        """RauneDepthBatchResult serialises/deserialises correctly."""
+        from dorea_inference.protocol import RauneDepthBatchResult, DepthResult, RauneResult, encode_png
+        import json
+
+        dummy_img = np.zeros((14, 14, 3), dtype=np.uint8)
+        dummy_depth = np.zeros((14, 14), dtype=np.float32)
+
+        item = {
+            "id": "kf0000",
+            "image_b64": encode_png(dummy_img),
+            "enhanced_width": 14,
+            "enhanced_height": 14,
+            **DepthResult.from_array("kf0000", dummy_depth).to_dict(),
+        }
+        resp = RauneDepthBatchResult(results=[item])
+        d = resp.to_dict()
+        assert d["type"] == "raune_depth_batch_result"
+        assert len(d["results"]) == 1
+        assert d["results"][0]["id"] == "kf0000"
+        # Round-trip through JSON
+        assert json.loads(json.dumps(d))["type"] == "raune_depth_batch_result"
