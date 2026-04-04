@@ -82,6 +82,35 @@ pub struct GradeArgs {
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Enable Maxine AI enhancement preprocessing (requires nvvfx SDK or DOREA_MAXINE_MOCK=1)
+    #[arg(long)]
+    pub maxine: bool,
+
+    /// Disable Maxine artifact reduction before upscale [default: enabled when --maxine]
+    #[arg(long)]
+    pub no_maxine_artifact_reduction: bool,
+
+    /// Maxine super-resolution upscale factor [default: 2]
+    #[arg(long, default_value = "2")]
+    pub maxine_upscale_factor: u32,
+}
+
+/// RAII guard that deletes a temp file when dropped.
+struct TempFileGuard(Option<std::path::PathBuf>);
+
+impl TempFileGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(ref p) = self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// Linearly interpolate between two f32 depth maps.
@@ -154,6 +183,28 @@ pub fn run(args: GradeArgs) -> Result<()> {
         info.width, info.height, info.fps, info.duration_secs, info.frame_count
     );
 
+    if args.maxine {
+        let valid_factors = [2u32, 3, 4];
+        if !valid_factors.contains(&args.maxine_upscale_factor) {
+            anyhow::bail!(
+                "--maxine-upscale-factor {} is not supported. Supported: {:?}",
+                args.maxine_upscale_factor, valid_factors,
+            );
+        }
+        log::info!(
+            "Maxine enabled: upscale_factor={}, artifact_reduction={}",
+            args.maxine_upscale_factor,
+            !args.no_maxine_artifact_reduction,
+        );
+        log::info!(
+            "Pass 1 will decode full-resolution (Maxine preprocessing). \
+             Estimated temp file: ~{:.1} GB for this video.",
+            // rough estimate: ffv1 at ~0.5 bits/px for natural video
+            info.width as f64 * info.height as f64 * 3.0
+                * info.frame_count as f64 * 0.5 / 8.0 / 1e9,
+        );
+    }
+
     // Determine grading parameters
     let params = GradeParams {
         warmth: args.warmth,
@@ -168,49 +219,143 @@ pub fn run(args: GradeArgs) -> Result<()> {
 
     let interp_enabled = !args.no_depth_interp;
 
+    // When Maxine is enabled: spawn ONE inference server (Maxine + RAUNE + Depth)
+    // used for Pass 1 enhance calls and the calibration batch. Shut down after calibration.
+    let mut maxine_server: Option<InferenceServer> = if args.maxine {
+        let mut cfg = build_inference_config(&args);
+        cfg.maxine = true;
+        cfg.maxine_upscale_factor = args.maxine_upscale_factor;
+        Some(
+            InferenceServer::spawn(&cfg)
+                .context("failed to spawn Maxine inference server")?,
+        )
+    } else {
+        None
+    };
+
+    let maxine_temp_path: Option<std::path::PathBuf> = if args.maxine {
+        Some(std::env::temp_dir().join(format!("dorea_maxine_{}.mkv", std::process::id())))
+    } else {
+        None
+    };
+    // Guard deletes temp file on drop (even on error / early return).
+    let _maxine_temp_guard = maxine_temp_path.as_ref()
+        .map(|p| TempFileGuard::new(p.clone()));
+
     // -----------------------------------------------------------------------
-    // Pass 1: proxy decode + change detection → keyframe list
+    // Pass 1: decode + optional Maxine enhance + proxy downscale + keyframe detect
     // -----------------------------------------------------------------------
     let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(info.width, info.height, args.proxy_size);
-    let proxy_frames = ffmpeg::decode_frames_scaled(&args.input, &info, proxy_w, proxy_h)
-        .context("failed to spawn ffmpeg proxy decoder")?;
 
     let mut keyframes: Vec<KeyframeEntry> = Vec::new();
     let mut detector: Box<dyn ChangeDetector> = Box::new(MseDetector::default());
     let mut frames_since_kf = 0usize;
     let scene_cut_threshold = args.depth_skip_threshold * 10.0;
 
-    for frame_result in proxy_frames {
-        let frame = frame_result.context("proxy frame decode error")?;
-        let change = detector.score(&frame.pixels);
-        let scene_cut = change < f32::MAX && change > scene_cut_threshold;
-        let is_keyframe = !interp_enabled
-            || keyframes.is_empty()
-            || scene_cut
-            || frames_since_kf >= args.depth_max_interval
-            || (change < f32::MAX && change > args.depth_skip_threshold);
+    if let Some(ref mut inf_srv) = maxine_server {
+        // Maxine path: full-res decode → enhance → write temp → proxy downscale → keyframe detect
+        use dorea_video::resize::resize_rgb_bilinear;
 
-        if is_keyframe {
-            if scene_cut {
-                log::info!(
-                    "Scene cut at frame {} (change={:.6})",
-                    frame.index,
-                    change,
-                );
-                detector.reset();
-            }
-            keyframes.push(KeyframeEntry {
-                frame_index: frame.index,
-                proxy_pixels: frame.pixels.clone(),
-                scene_cut_before: scene_cut,
+        let temp_path = maxine_temp_path.as_ref().unwrap();
+        let mut temp_enc = FrameEncoder::new_lossless_temp(
+            temp_path, info.width, info.height, info.fps,
+        ).context("failed to create Maxine temp encoder")?;
+
+        let full_frames = ffmpeg::decode_frames(&args.input, &info)
+            .context("failed to spawn full-res decoder for Maxine pass")?;
+
+        for frame_result in full_frames {
+            let frame = frame_result.context("Maxine pass frame decode error")?;
+
+            let maxine_full = inf_srv.enhance(
+                &frame.index.to_string(),
+                &frame.pixels,
+                frame.width,
+                frame.height,
+                !args.no_maxine_artifact_reduction,
+                args.maxine_upscale_factor,
+            ).unwrap_or_else(|e| {
+                log::warn!("enhance() IPC failed for frame {} — using original: {e}", frame.index);
+                frame.pixels.clone()
             });
-            detector.set_reference(&frame.pixels);
-            frames_since_kf = 0;
-        } else {
-            frames_since_kf += 1;
+
+            temp_enc.write_frame(&maxine_full)
+                .context("failed to write Maxine-enhanced frame to temp file")?;
+
+            let maxine_proxy = if proxy_w == frame.width && proxy_h == frame.height {
+                maxine_full.clone()
+            } else {
+                resize_rgb_bilinear(&maxine_full, frame.width, frame.height, proxy_w, proxy_h)
+            };
+
+            let change = detector.score(&maxine_proxy);
+            let scene_cut = change < f32::MAX && change > scene_cut_threshold;
+            let is_keyframe = !interp_enabled
+                || keyframes.is_empty()
+                || scene_cut
+                || frames_since_kf >= args.depth_max_interval
+                || (change < f32::MAX && change > args.depth_skip_threshold);
+
+            if is_keyframe {
+                if scene_cut {
+                    log::info!("Scene cut at frame {} (change={:.6})", frame.index, change);
+                    detector.reset();
+                }
+                keyframes.push(KeyframeEntry {
+                    frame_index: frame.index,
+                    proxy_pixels: maxine_proxy.clone(),
+                    scene_cut_before: scene_cut,
+                });
+                detector.set_reference(&maxine_proxy);
+                frames_since_kf = 0;
+            } else {
+                frames_since_kf += 1;
+            }
         }
+
+        temp_enc.finish().context("failed to finalize Maxine temp file")?;
+        log::info!(
+            "Maxine Pass 1 complete: {} keyframes, temp file: {}",
+            keyframes.len(),
+            temp_path.display(),
+        );
+    } else {
+        // No-Maxine path: proxy decode (existing behaviour)
+        let proxy_frames = ffmpeg::decode_frames_scaled(&args.input, &info, proxy_w, proxy_h)
+            .context("failed to spawn ffmpeg proxy decoder")?;
+
+        for frame_result in proxy_frames {
+            let frame = frame_result.context("proxy frame decode error")?;
+            let change = detector.score(&frame.pixels);
+            let scene_cut = change < f32::MAX && change > scene_cut_threshold;
+            let is_keyframe = !interp_enabled
+                || keyframes.is_empty()
+                || scene_cut
+                || frames_since_kf >= args.depth_max_interval
+                || (change < f32::MAX && change > args.depth_skip_threshold);
+
+            if is_keyframe {
+                if scene_cut {
+                    log::info!(
+                        "Scene cut at frame {} (change={:.6})",
+                        frame.index,
+                        change,
+                    );
+                    detector.reset();
+                }
+                keyframes.push(KeyframeEntry {
+                    frame_index: frame.index,
+                    proxy_pixels: frame.pixels.clone(),
+                    scene_cut_before: scene_cut,
+                });
+                detector.set_reference(&frame.pixels);
+                frames_since_kf = 0;
+            } else {
+                frames_since_kf += 1;
+            }
+        }
+        log::info!("Pass 1 complete: {} keyframes detected", keyframes.len());
     }
-    log::info!("Pass 1 complete: {} keyframes detected", keyframes.len());
 
     anyhow::ensure!(
         !keyframes.is_empty(),
@@ -278,6 +423,12 @@ pub fn run(args: GradeArgs) -> Result<()> {
         log::info!("Depth batch complete ({} keyframes)", keyframes.len());
         let _ = inf_server.shutdown();
         keyframe_depths = kf_depths;
+
+        // Shut down Maxine server (VRAM freed for Pass 2 CUDA grading).
+        if let Some(srv) = maxine_server.take() {
+            let _ = srv.shutdown();
+            log::info!("Maxine server shut down — VRAM freed for Pass 2");
+        }
 
     } else {
         // Auto-calibrate: fused RAUNE+depth, dual output.
@@ -361,6 +512,13 @@ pub fn run(args: GradeArgs) -> Result<()> {
         }
         log::info!("Fused inference complete ({} keyframes)", keyframes.len());
         let _ = inf_server.shutdown();
+
+        // Shut down Maxine server (VRAM freed for Pass 2 CUDA grading).
+        if let Some(srv) = maxine_server.take() {
+            let _ = srv.shutdown();
+            log::info!("Maxine server shut down — VRAM freed for Pass 2");
+        }
+
         store.seal().context("failed to seal calibration store")?;
 
         // ---- 3-pass calibration (inline) ----
@@ -498,7 +656,8 @@ pub fn run(args: GradeArgs) -> Result<()> {
     // -----------------------------------------------------------------------
     // Pass 2: full-resolution decode + depth lookup + grade + encode
     // -----------------------------------------------------------------------
-    let frames = ffmpeg::decode_frames(&args.input, &info)
+    let decode_source = maxine_temp_path.as_deref().unwrap_or(args.input.as_path());
+    let frames = ffmpeg::decode_frames(decode_source, &info)
         .context("failed to spawn ffmpeg full-res decoder")?;
 
     let mut kf_cursor = 0usize;
