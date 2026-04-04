@@ -221,7 +221,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
             || keyframes.is_empty()
             || scene_cut
             || frames_since_kf >= args.depth_max_interval
-            || change > args.depth_skip_threshold;
+            || (change < f32::MAX && change > args.depth_skip_threshold);
 
         if is_keyframe {
             if scene_cut {
