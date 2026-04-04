@@ -6,7 +6,7 @@ use crate::types::{DepthLuts, LutGrid};
 use rayon::prelude::*;
 
 pub const LUT_SIZE: usize = 33;
-pub const N_DEPTH_ZONES: usize = 5;
+pub const N_DEPTH_ZONES: usize = 16;
 pub const EDGE_SCALE: f32 = 0.3;
 pub const CONTRAST_SCALE: f32 = 0.3;
 

@@ -96,8 +96,8 @@ fn lerp_depth(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
 const DEPTH_BATCH_SIZE: usize = 32;
 
 /// Maximum frames per fused RAUNE+depth inference batch.
-/// Proxy-res frames (~518px long edge); 8 frames ≈ 3–4 MB RAUNE input on GPU.
-const FUSED_BATCH_SIZE: usize = 8;
+/// Proxy-res frames (~518px long edge); 32 frames ≈ 12–15 MB RAUNE input on GPU.
+const FUSED_BATCH_SIZE: usize = 32;
 
 /// A keyframe collected during the proxy-decode pass.
 struct KeyframeEntry {
@@ -297,7 +297,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
                 width: proxy_w,
                 height: proxy_h,
                 raune_max_size: proxy_w.max(proxy_h),
-                depth_max_size: args.proxy_size.min(518),
+                depth_max_size: args.proxy_size.min(1036),
             }
         }).collect();
 
