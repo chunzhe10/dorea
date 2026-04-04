@@ -273,7 +273,6 @@ pub fn run(args: GradeArgs) -> Result<()> {
                 frame.width,
                 frame.height,
                 !args.no_maxine_artifact_reduction,
-                args.maxine_upscale_factor,
             ).unwrap_or_else(|e| {
                 log::warn!("enhance() IPC failed for frame {} — using original: {e}", frame.index);
                 frame.pixels.clone()

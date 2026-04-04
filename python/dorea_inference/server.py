@@ -106,14 +106,22 @@ def main(argv: Optional[list] = None) -> None:
 
     maxine_enhancer = None
     if args.maxine:
-        from .maxine_enhancer import MaxineEnhancer
-        maxine_enhancer = MaxineEnhancer(upscale_factor=args.maxine_upscale_factor)
-        print(
-            f"[dorea-inference] Maxine enhancer loaded "
-            f"(upscale_factor={args.maxine_upscale_factor}, "
-            f"artifact_reduction={not args.no_maxine_artifact_reduction})",
-            file=sys.stderr, flush=True,
-        )
+        try:
+            from .maxine_enhancer import MaxineEnhancer
+            maxine_enhancer = MaxineEnhancer(upscale_factor=args.maxine_upscale_factor)
+            print(
+                f"[dorea-inference] Maxine enhancer loaded "
+                f"(upscale_factor={args.maxine_upscale_factor}, "
+                f"artifact_reduction={not args.no_maxine_artifact_reduction})",
+                file=sys.stderr, flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[dorea-inference] FATAL: Maxine enhancer failed to load: {e}\n"
+                f"  Install nvvfx from NGC or set DOREA_MAXINE_MOCK=1 for testing.",
+                file=sys.stderr, flush=True,
+            )
+            raise
 
     print("[dorea-inference] ready", file=sys.stderr, flush=True)
 

@@ -565,7 +565,6 @@ impl InferenceServer {
         width: usize,
         height: usize,
         artifact_reduce: bool,
-        upscale_factor: u32,
     ) -> Result<Vec<u8>, InferenceError> {
         let b64 = B64.encode(image_rgb);
 
@@ -577,7 +576,6 @@ impl InferenceServer {
             "width": width,
             "height": height,
             "no_artifact_reduce": !artifact_reduce,
-            "upscale_factor": upscale_factor,
         });
 
         self.send_line(&req.to_string())?;
