@@ -110,7 +110,12 @@ impl CombinedLut {
                 .ok_or_else(|| GpuError::ModuleLoad("build_combined_lut_kernel not found".into()))?;
             let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
             // cudarc 0.12 LaunchAsync supports tuples up to 12 elements.
-            // We have 14 args, so we use the raw *mut c_void params slice instead.
+            // We have 16 args, so we use the raw *mut c_void params slice instead.
+            // Kernel signature: output, base_luts, base_zone_boundaries, base_n_zones,
+            //   runtime_zone_boundaries, runtime_n_zones, h_offsets, s_ratios, v_offsets,
+            //   weights, warmth, strength, contrast, grid_size, lut_size, total_threads
+            // CombinedLut (legacy single-segment path) passes the same boundaries/zones
+            // for both base and runtime — semantically equivalent to the old single-zone set.
             let warmth   = params.warmth;
             let strength = params.strength;
             let contrast = params.contrast;
@@ -118,21 +123,23 @@ impl CombinedLut {
             let lut_size_i32 = lut_size as i32;
             let n_zones_i32  = n_zones as i32;
             let total_i32    = total_threads as i32;
-            let mut args: [*mut std::ffi::c_void; 14] = [
-                (&d_build)   .as_kernel_param(),
-                (&d_luts)    .as_kernel_param(),
-                (&d_boundaries).as_kernel_param(),
-                (&d_h_offsets) .as_kernel_param(),
-                (&d_s_ratios)  .as_kernel_param(),
-                (&d_v_offsets) .as_kernel_param(),
-                (&d_weights)   .as_kernel_param(),
-                warmth   .as_kernel_param(),
-                strength .as_kernel_param(),
-                contrast .as_kernel_param(),
-                n_i32       .as_kernel_param(),
-                lut_size_i32.as_kernel_param(),
-                n_zones_i32 .as_kernel_param(),
-                total_i32   .as_kernel_param(),
+            let mut args: [*mut std::ffi::c_void; 16] = [
+                (&d_build)     .as_kernel_param(),  // output
+                (&d_luts)      .as_kernel_param(),  // base_luts
+                (&d_boundaries).as_kernel_param(),  // base_zone_boundaries
+                n_zones_i32    .as_kernel_param(),  // base_n_zones
+                (&d_boundaries).as_kernel_param(),  // runtime_zone_boundaries (same as base)
+                n_zones_i32    .as_kernel_param(),  // runtime_n_zones (same as base)
+                (&d_h_offsets) .as_kernel_param(),  // h_offsets
+                (&d_s_ratios)  .as_kernel_param(),  // s_ratios
+                (&d_v_offsets) .as_kernel_param(),  // v_offsets
+                (&d_weights)   .as_kernel_param(),  // weights
+                warmth         .as_kernel_param(),  // warmth
+                strength       .as_kernel_param(),  // strength
+                contrast       .as_kernel_param(),  // contrast
+                n_i32          .as_kernel_param(),  // grid_size
+                lut_size_i32   .as_kernel_param(),  // lut_size
+                total_i32      .as_kernel_param(),  // total_threads
             ];
             unsafe {
                 func.launch(cfg, &mut args[..])

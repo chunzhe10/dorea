@@ -671,12 +671,11 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
 
             #[cfg(feature = "cuda")]
             {
-                // Crossed a keyframe boundary — swap textures
-                adaptive_grader.swap_textures();
-
-                // Check for segment boundary
                 let new_seg = kf_to_segment[kf_cursor];
                 if new_seg != current_segment {
+                    // Segment boundary: load new base LUT and rebuild the opening KF's
+                    // texture BEFORE swapping, so the active texture uses the correct
+                    // color science for the new segment from the very first frame.
                     let seg_cal = &segment_calibrations[new_seg];
                     let base_flat: Vec<f32> = seg_cal.depth_luts.luts.iter()
                         .flat_map(|lut| lut.data.iter().copied())
@@ -691,9 +690,16 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
                         &base_flat, base_bounds,
                         (&h_offsets, &s_ratios, &v_offsets, &weights),
                     ).context("load_segment failed")?;
+                    // Rebuild opening KF texture with new segment's LUT (into inactive slot)
+                    adaptive_grader.prepare_keyframe(&smoothed_kf_zones[kf_cursor])
+                        .context("prepare_keyframe at segment boundary failed")?;
                     current_segment = new_seg;
                     log::info!("Segment switch to {new_seg} at keyframe {kf_cursor}");
                 }
+
+                // Activate the texture for kf_cursor (pipelined from previous iteration,
+                // or just rebuilt above for segment boundaries).
+                adaptive_grader.swap_textures();
 
                 // Pre-build next keyframe's texture (pipelining: hidden behind grading of current interval)
                 if kf_cursor + 1 < smoothed_kf_zones.len() {
