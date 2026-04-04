@@ -85,7 +85,6 @@ class MaxineEnhancer:
         width: int,
         height: int,
         artifact_reduce: bool = True,
-        upscale_factor: int = 2,
     ) -> np.ndarray:
         """Enhance a single RGB u8 frame. Returns RGB u8 at original resolution.
 
@@ -97,7 +96,7 @@ class MaxineEnhancer:
             return rgb_u8
 
         try:
-            return self._enhance_impl(rgb_u8, width, height, artifact_reduce, upscale_factor)
+            return self._enhance_impl(rgb_u8, width, height, artifact_reduce)
         except Exception as e:
             self._passthrough_count += 1
             log.warning("Maxine enhance failed (frame passthrough): %s", e)
@@ -109,7 +108,6 @@ class MaxineEnhancer:
         width: int,
         height: int,
         artifact_reduce: bool,
-        upscale_factor: int,
     ) -> np.ndarray:
         """Internal enhancement — exceptions propagate to enhance() for catch."""
         import torch
