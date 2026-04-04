@@ -56,6 +56,7 @@ __global__ void build_combined_lut_kernel(
     int N3 = N * N * N;
 
     int zone = idx / N3;
+    if (zone >= runtime_n_zones) return; // belt-and-suspenders: total_threads should prevent this
     int rem  = idx % N3;
 
     // Memory layout matches cuMemcpy3D: ri is column (x/fastest), gi is row (y), bi is slice (z/depth).
