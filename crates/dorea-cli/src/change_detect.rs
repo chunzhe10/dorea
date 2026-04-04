@@ -92,6 +92,7 @@ pub struct SegmentRange {
 /// Scans consecutive keyframe depth distributions using Wasserstein-1 distance.
 /// When the distance exceeds `threshold`, a segment boundary is placed.
 /// Segments shorter than `min_keyframes` are merged into the previous segment.
+/// The first segment is never merged — if it is shorter than `min_keyframes`, it is kept as-is.
 pub fn detect_scene_segments(
     keyframe_depths: &[Vec<f32>],
     threshold: f32,
