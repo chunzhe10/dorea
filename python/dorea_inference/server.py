@@ -210,8 +210,9 @@ def main(argv: Optional[list] = None) -> None:
                         "image_b64": encode_png(enhanced_np[i]),
                         "enhanced_width": int(enh_w),
                         "enhanced_height": int(enh_h),
-                        **{k: v for k, v in depth_result.to_dict().items()
-                           if k in ("depth_f32_b64", "depth_width", "depth_height", "type")},
+                        "depth_f32_b64": depth_result.depth_f32_b64,
+                        "depth_width": depth_result.width,
+                        "depth_height": depth_result.height,
                     })
                 resp = RauneDepthBatchResult(results=results)
             elif req_type == "shutdown":
