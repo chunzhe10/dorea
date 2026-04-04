@@ -10,6 +10,7 @@ use dorea_cal::Calibration;
 use dorea_gpu::{grade_frame, GradeParams};
 use dorea_video::ffmpeg::{self, FrameEncoder};
 use dorea_video::inference::{DepthBatchItem, RauneDepthBatchItem, InferenceConfig, InferenceServer};
+use crate::change_detect::{ChangeDetector, MseDetector};
 
 #[cfg(feature = "cuda")]
 use dorea_gpu::cuda::CudaGrader;
@@ -85,23 +86,6 @@ pub struct GradeArgs {
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
-}
-
-/// Compute normalized MSE between two same-length u8 slices.
-/// Returns value in [0, 1] where 0 = identical.
-fn frame_mse(a: &[u8], b: &[u8]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    if a.is_empty() {
-        return 0.0;
-    }
-    let n = a.len() as f64;
-    let sum_sq: f64 = a.iter().zip(b.iter())
-        .map(|(&av, &bv)| {
-            let d = av as f64 - bv as f64;
-            d * d
-        })
-        .sum();
-    (sum_sq / (n * 255.0 * 255.0)) as f32
 }
 
 /// Linearly interpolate between two f32 depth maps.
@@ -217,43 +201,43 @@ pub fn run(args: GradeArgs) -> Result<()> {
     };
 
     let interp_enabled = !args.no_depth_interp;
-    let scene_cut_threshold = args.depth_skip_threshold * 10.0;
 
     // -----------------------------------------------------------------------
-    // Pass 1: proxy decode + MSE keyframe detection
+    // Pass 1: proxy decode + change detection → keyframe list
     // -----------------------------------------------------------------------
     let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(info.width, info.height, args.proxy_size);
     let proxy_frames = ffmpeg::decode_frames_scaled(&args.input, &info, proxy_w, proxy_h)
         .context("failed to spawn ffmpeg proxy decoder")?;
 
     let mut keyframes: Vec<KeyframeEntry> = Vec::new();
-    let mut last_proxy: Option<Vec<u8>> = None;
+    let mut detector: Box<dyn ChangeDetector> = Box::new(MseDetector::default());
     let mut frames_since_kf = 0usize;
 
     for frame_result in proxy_frames {
         let frame = frame_result.context("proxy frame decode error")?;
-        let mse = last_proxy.as_ref().map(|lp| frame_mse(&frame.pixels, lp));
-        let scene_cut = mse.map_or(false, |m| m > scene_cut_threshold);
+        let change = detector.score(&frame.pixels);
+        let scene_cut = change < f32::MAX && change > args.depth_skip_threshold * 10.0;
         let is_keyframe = !interp_enabled
-            || last_proxy.is_none()
+            || keyframes.is_empty()
             || scene_cut
             || frames_since_kf >= args.depth_max_interval
-            || mse.map_or(false, |m| m > args.depth_skip_threshold);
+            || change > args.depth_skip_threshold;
 
         if is_keyframe {
             if scene_cut {
                 log::info!(
-                    "Scene cut at frame {} (MSE={:.6})",
+                    "Scene cut at frame {} (change={:.6})",
                     frame.index,
-                    mse.unwrap_or(0.0),
+                    change,
                 );
+                detector.reset();
             }
             keyframes.push(KeyframeEntry {
                 frame_index: frame.index,
                 proxy_pixels: frame.pixels.clone(),
                 scene_cut_before: scene_cut,
             });
-            last_proxy = Some(frame.pixels);
+            detector.set_reference(&frame.pixels);
             frames_since_kf = 0;
         } else {
             frames_since_kf += 1;
@@ -758,35 +742,6 @@ fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn frame_mse_identical_is_zero() {
-        let a: Vec<u8> = vec![100, 150, 200, 50, 75, 125];
-        assert_eq!(frame_mse(&a, &a), 0.0);
-    }
-
-    #[test]
-    fn frame_mse_empty_is_zero() {
-        assert_eq!(frame_mse(&[], &[]), 0.0);
-    }
-
-    #[test]
-    fn frame_mse_opposite_is_one() {
-        let a: Vec<u8> = vec![0, 0, 0];
-        let b: Vec<u8> = vec![255, 255, 255];
-        let mse = frame_mse(&a, &b);
-        assert!((mse - 1.0).abs() < 1e-5, "expected ~1.0, got {mse}");
-    }
-
-    #[test]
-    fn frame_mse_known_value() {
-        // All pixels differ by 1 → MSE = 1/(255²) ≈ 0.0000154
-        let a: Vec<u8> = vec![100, 100, 100];
-        let b: Vec<u8> = vec![101, 101, 101];
-        let mse = frame_mse(&a, &b);
-        let expected = 1.0 / (255.0 * 255.0);
-        assert!((mse as f64 - expected).abs() < 1e-8, "expected {expected}, got {mse}");
-    }
 
     #[test]
     fn lerp_depth_at_zero() {
