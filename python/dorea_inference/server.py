@@ -117,11 +117,11 @@ def main(argv: Optional[list] = None) -> None:
             )
         except Exception as e:
             print(
-                f"[dorea-inference] FATAL: Maxine enhancer failed to load: {e}\n"
-                f"  Install nvvfx from NGC or set DOREA_MAXINE_MOCK=1 for testing.",
+                f"[dorea-inference] WARNING: Maxine enhancer failed to load: {e} "
+                f"— running without Maxine. Set DOREA_MAXINE_MOCK=1 for testing.",
                 file=sys.stderr, flush=True,
             )
-            raise
+            # maxine_enhancer remains None — enhance requests return passthrough
 
     print("[dorea-inference] ready", file=sys.stderr, flush=True)
 
@@ -243,22 +243,49 @@ def main(argv: Optional[list] = None) -> None:
                     })
                 resp = RauneDepthBatchResult(results=results)
             elif req_type == "enhance":
-                if maxine_enhancer is None:
-                    raise RuntimeError(
-                        "Maxine enhancer not loaded — pass --maxine to the server"
-                    )
                 fmt = req.get("format", "raw_rgb")
                 if fmt == "raw_rgb":
                     img = decode_raw_rgb(req["image_b64"], int(req["width"]), int(req["height"]))
                 else:
                     img = decode_png(req["image_b64"])
-                enhanced = maxine_enhancer.enhance(
-                    img,
-                    width=int(req["width"]),
-                    height=int(req["height"]),
-                    artifact_reduce=not req.get("no_artifact_reduce", False),
+                if maxine_enhancer is None:
+                    # Maxine not available — return original frame unchanged
+                    resp = EnhanceResult.from_array(req_id, img)
+                else:
+                    enhanced = maxine_enhancer.enhance(
+                        img,
+                        width=int(req["width"]),
+                        height=int(req["height"]),
+                        artifact_reduce=not req.get("no_artifact_reduce", False),
+                    )
+                    resp = EnhanceResult.from_array(req_id, enhanced)
+            elif req_type == "unload_maxine":
+                import torch
+                maxine_enhancer = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print("[dorea-inference] Maxine unloaded — VRAM freed", file=sys.stderr, flush=True)
+                resp = OkResponse()
+
+            elif req_type == "load_raune":
+                from .raune_net import RauneNetInference
+                raune_model = RauneNetInference(
+                    weights_path=req.get("weights"),
+                    device=device,
+                    raune_models_dir=req.get("models_dir"),
                 )
-                resp = EnhanceResult.from_array(req_id, enhanced)
+                print("[dorea-inference] RAUNE-Net loaded (on demand)", file=sys.stderr, flush=True)
+                resp = OkResponse()
+
+            elif req_type == "load_depth":
+                from .depth_anything import DepthAnythingInference
+                depth_model = DepthAnythingInference(
+                    model_path=req.get("model_path"),
+                    device=device,
+                )
+                print("[dorea-inference] Depth Anything V2 loaded (on demand)", file=sys.stderr, flush=True)
+                resp = OkResponse()
+
             elif req_type == "shutdown":
                 if maxine_enhancer is not None:
                     print(
