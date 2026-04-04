@@ -789,7 +789,7 @@ fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
         skip_depth: false,
         device: if args.cpu_only { Some("cpu".to_string()) } else { None },
         startup_timeout: Duration::from_secs(180),
-        maxine: !args.no_maxine,
+        maxine: false, // SR disabled — re-enable via !args.no_maxine when ready
         maxine_upscale_factor: args.maxine_upscale_factor,
     }
 }
@@ -835,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn build_inference_config_maxine_true_by_default() {
+    fn build_inference_config_maxine_disabled() {
         let args = GradeArgs {
             input: PathBuf::from("/dev/null"),
             output: None,
@@ -857,7 +857,7 @@ mod tests {
             verbose: false,
         };
         let cfg = build_inference_config(&args);
-        assert!(cfg.maxine, "Maxine should be enabled by default");
+        assert!(!cfg.maxine, "Maxine is disabled until SR is re-enabled");
         assert!(!cfg.skip_raune, "RAUNE should not be skipped in config");
         assert!(!cfg.skip_depth, "depth should not be skipped in config");
     }
