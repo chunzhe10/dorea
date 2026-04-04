@@ -221,6 +221,32 @@ def main(argv: Optional[list] = None) -> None:
                 # RAUNE → enhanced tensors stay on GPU
                 enhanced_batch, enh_w, enh_h = raune_model.infer_batch_gpu(imgs, max_size=raune_max)
 
+                # Maxine upscale (optional) — insert between RAUNE and Depth
+                enable_maxine = req.get("enable_maxine", False)
+                if enable_maxine and maxine_enhancer is not None:
+                    # Convert batch to uint8 RGB for Maxine (dtoh)
+                    import torch
+                    enhanced_np = (
+                        enhanced_batch.permute(0, 2, 3, 1).cpu().numpy() * 255
+                    ).astype("uint8")  # (N, H, W, 3)
+
+                    # Frame-by-frame Maxine enhance (single-frame API)
+                    for i in range(enhanced_np.shape[0]):
+                        enhanced_np[i] = maxine_enhancer.enhance(
+                            enhanced_np[i],
+                            width=enh_w,
+                            height=enh_h,
+                            artifact_reduce=True,
+                        )
+
+                    # Convert back to float32 tensor on GPU (htod)
+                    enhanced_batch = (
+                        torch.from_numpy(enhanced_np.transpose(0, 3, 1, 2) / 255.0)
+                        .float()
+                        .cuda()
+                    )
+                    # Note: enh_w, enh_h remain unchanged (Maxine returns same resolution)
+
                 # Depth on enhanced tensors — no dtoh between models
                 depth_maps = depth_model.infer_batch_from_tensors(enhanced_batch, depth_max_size=depth_max)
 

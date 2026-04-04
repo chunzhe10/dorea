@@ -18,8 +18,8 @@ strength             = 0.8   # LUT/HSL blend [0.0–1.0]
 contrast             = 1.0   # ambiance contrast [0.0–1.0]
 depth_skip_threshold = 0.005 # MSE keyframe threshold (lower = more keyframes)
 depth_max_interval   = 12    # max frames between forced keyframes
-fused_batch_size     = 16    # frames per RAUNE+depth inference batch
-depth_zones          = 8    # adaptive depth zones for calibration LUT
+fused_batch_size     = 32    # frames per RAUNE+depth inference batch
+depth_zones          = 16    # adaptive depth zones for calibration LUT
 
 [maxine]
 upscale_factor     = 2       # SR factor: 2, 3, or 4 (used when SR is re-enabled)

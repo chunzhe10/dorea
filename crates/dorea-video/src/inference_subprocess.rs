@@ -482,6 +482,7 @@ impl InferenceServer {
     pub fn run_raune_depth_batch(
         &mut self,
         items: &[RauneDepthBatchItem],
+        enable_maxine: bool,
     ) -> Result<Vec<(String, Vec<u8>, usize, usize, Vec<f32>, usize, usize)>, InferenceError> {
         if items.is_empty() {
             return Ok(vec![]);
@@ -499,7 +500,11 @@ impl InferenceServer {
             })
         }).collect();
 
-        let req = serde_json::json!({ "type": "raune_depth_batch", "items": json_items });
+        let req = serde_json::json!({
+            "type": "raune_depth_batch",
+            "items": json_items,
+            "enable_maxine": enable_maxine,
+        });
         self.send_line(&req.to_string())?;
 
         let resp = self.recv_line()?;

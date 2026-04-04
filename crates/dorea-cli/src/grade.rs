@@ -201,7 +201,8 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         info.width, info.height, info.fps, info.duration_secs, info.frame_count
     );
 
-    let use_maxine = false; // SR disabled — restore to `!args.no_maxine` when ready
+    let use_maxine = false; // Disable Pass 1 Maxine (full-res enhancement not needed)
+    let maxine_in_fused_batch = true; // Enable Maxine upscaling in fused RAUNE+depth batch instead
     if use_maxine {
         let valid_factors = [2u32, 3, 4];
         if !valid_factors.contains(&maxine_upscale_factor) {
@@ -427,7 +428,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
             batch_idx + 1,
             chunk_items.len(),
         );
-        let mut results = inf_server.run_raune_depth_batch(chunk_items)
+        let mut results = inf_server.run_raune_depth_batch(chunk_items, maxine_in_fused_batch)
             .unwrap_or_else(|e| {
                 log::warn!(
                     "Fused RAUNE+depth batch failed: {e} — using originals + uniform depth"
@@ -834,7 +835,7 @@ fn build_inference_config(
         skip_depth: false,
         device,
         startup_timeout: Duration::from_secs(180),
-        maxine: false, // SR disabled — restore to `!no_maxine` when ready
+        maxine: true, // Enable Maxine for fused batch upscaling (between RAUNE and Depth)
         maxine_upscale_factor,
     }
 }
