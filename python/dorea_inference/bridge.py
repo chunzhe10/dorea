@@ -39,6 +39,7 @@ class TensorGuard:
 
 _depth_model = None
 _raune_model = None
+_maxine_model = None
 
 
 def load_depth_model(model_path: Optional[str] = None, device: str = "cuda") -> None:
@@ -59,6 +60,33 @@ def load_raune_model(
     _raune_model = RauneNetInference(
         weights_path=weights_path, device=device, raune_models_dir=raune_models_dir,
     )
+
+
+def load_maxine_model(upscale_factor: int = 2, device: str = "cuda") -> None:
+    """Load the Maxine enhancer. Called on demand after spawn."""
+    global _maxine_model
+    from .maxine_enhancer import MaxineEnhancer
+    _maxine_model = MaxineEnhancer(upscale_factor=upscale_factor)
+
+
+def unload_maxine() -> None:
+    """Release Maxine model reference and free CUDA cache."""
+    global _maxine_model
+    _maxine_model = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def run_maxine_cpu(frame_rgb: np.ndarray, artifact_reduce: bool = True) -> np.ndarray:
+    """Run Maxine enhancement, return same-resolution numpy uint8 array."""
+    if _maxine_model is None:
+        raise RuntimeError("Maxine model not loaded — call load_maxine_model() first")
+    h, w = frame_rgb.shape[:2]
+    return _maxine_model.enhance(frame_rgb, width=w, height=h, artifact_reduce=artifact_reduce)
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +140,10 @@ def run_raune_cpu(frame_rgb: np.ndarray, max_size: int = 1024) -> np.ndarray:
 
 def unload_models() -> None:
     """Release model references so they can be garbage-collected."""
-    global _depth_model, _raune_model
+    global _depth_model, _raune_model, _maxine_model
     _depth_model = None
     _raune_model = None
+    _maxine_model = None
 
 
 # ---------------------------------------------------------------------------
