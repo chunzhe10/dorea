@@ -429,15 +429,15 @@ impl InferenceServer {
 
         if v["type"].as_str() == Some("error") {
             return Err(InferenceError::ServerError(
-                v["message"].as_str().unwrap_or("unknown").to_string(),
+                v["message"].as_str().unwrap_or("unknown error").to_string(),
             ));
         }
         if v["type"].as_str() != Some("raune_depth_batch_result") {
-            return Err(InferenceError::Ipc(format!("unexpected type: {resp}")));
+            return Err(InferenceError::Ipc(format!("unexpected response type: {resp}")));
         }
 
         let results = v["results"].as_array()
-            .ok_or_else(|| InferenceError::Ipc("missing results array".to_string()))?;
+            .ok_or_else(|| InferenceError::Ipc("missing results array in raune_depth_batch_result".to_string()))?;
 
         let mut out = Vec::with_capacity(results.len());
         for r in results {
@@ -451,6 +451,12 @@ impl InferenceServer {
             let enh_png = B64.decode(enh_b64)
                 .map_err(|e| InferenceError::Ipc(format!("base64 enh for {id}: {e}")))?;
             let enh_rgb = decode_png_bytes(&enh_png)?;
+            if enh_rgb.len() != enh_w * enh_h * 3 {
+                return Err(InferenceError::Ipc(format!(
+                    "enhanced image size mismatch for {id}: got {} want {}",
+                    enh_rgb.len(), enh_w * enh_h * 3
+                )));
+            }
 
             // Depth map (raw f32 LE)
             let depth_w = r["depth_width"].as_u64().unwrap_or(0) as usize;
