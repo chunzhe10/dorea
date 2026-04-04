@@ -49,6 +49,14 @@ pub struct GradeArgs {
     #[arg(long)]
     pub depth_max_interval: Option<usize>,
 
+    /// Frames per fused RAUNE+depth batch (config: [grade].fused_batch_size, built-in default: 32)
+    #[arg(long)]
+    pub fused_batch_size: Option<usize>,
+
+    /// Adaptive depth zones for calibration LUT (config: [grade].depth_zones, built-in default: 16)
+    #[arg(long)]
+    pub depth_zones: Option<usize>,
+
     /// Disable temporal interpolation — run full pipeline on every frame
     #[arg(long)]
     pub no_depth_interp: bool,
@@ -115,9 +123,6 @@ fn lerp_depth(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Maximum frames per fused RAUNE+depth inference batch.
-/// Proxy-res frames (~518px long edge); 32 frames ≈ 12–15 MB RAUNE input on GPU.
-const FUSED_BATCH_SIZE: usize = 32;
 
 /// A keyframe collected during the proxy-decode pass.
 struct KeyframeEntry {
@@ -156,6 +161,8 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     let proxy_size          = args.proxy_size.or(cfg.inference.proxy_size).unwrap_or(1080_usize);
     let depth_skip_threshold = args.depth_skip_threshold.or(cfg.grade.depth_skip_threshold).unwrap_or(0.005_f32);
     let depth_max_interval  = args.depth_max_interval.or(cfg.grade.depth_max_interval).unwrap_or(12_usize);
+    let fused_batch_size    = args.fused_batch_size.or(cfg.grade.fused_batch_size).unwrap_or(32_usize);
+    let depth_zones         = args.depth_zones.or(cfg.grade.depth_zones).unwrap_or(16_usize);
     let maxine_upscale_factor = args.maxine_upscale_factor.or(cfg.maxine.upscale_factor).unwrap_or(2_u32);
     let python = args.python.clone()
         .or_else(|| cfg.models.python.clone())
@@ -409,10 +416,10 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         .context("failed to create paged calibration store")?;
     let mut kf_depths: HashMap<u64, (Vec<f32>, usize, usize)> = HashMap::new();
 
-    let n_batches = keyframes.chunks(FUSED_BATCH_SIZE).count();
+    let n_batches = keyframes.chunks(fused_batch_size).count();
     for (batch_idx, (chunk_kfs, chunk_items)) in keyframes
-        .chunks(FUSED_BATCH_SIZE)
-        .zip(fused_items.chunks(FUSED_BATCH_SIZE))
+        .chunks(fused_batch_size)
+        .zip(fused_items.chunks(fused_batch_size))
         .enumerate()
     {
         log::info!(
@@ -476,7 +483,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     use dorea_hsl::derive::{derive_hsl_corrections, HslCorrections, QualifierCorrection};
     use dorea_hsl::{HSL_QUALIFIERS, MIN_WEIGHT};
     use dorea_lut::apply::apply_depth_luts;
-    use dorea_lut::build::{adaptive_zone_boundaries, compute_importance, StreamingLutBuilder, N_DEPTH_ZONES};
+    use dorea_lut::build::{adaptive_zone_boundaries, compute_importance, StreamingLutBuilder};
 
     // Pass 1: reservoir-sample depths → adaptive zone boundaries
     const RESERVOIR_CAP: usize = 1_000_000;
@@ -502,8 +509,8 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
             }
         }
     }
-    let zone_boundaries = adaptive_zone_boundaries(&reservoir, N_DEPTH_ZONES);
-    log::info!("Depth zones: {N_DEPTH_ZONES} adaptive zones from {} depth samples", total_seen);
+    let zone_boundaries = adaptive_zone_boundaries(&reservoir, depth_zones);
+    log::info!("Depth zones: {depth_zones} adaptive zones from {} depth samples", total_seen);
     drop(reservoir);
 
     // Pass 2: stream frames → build LUT
@@ -582,7 +589,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     calibration = Calibration::new(depth_luts, HslCorrections(avg_corrections), store.len());
     log::info!(
         "Auto-calibration complete ({} keyframes → {} depth zones)",
-        store.len(), N_DEPTH_ZONES
+        store.len(), depth_zones
     );
 
     // Initialize CUDA grader (loads PTX once, builds combined LUT, reuses across all frames)

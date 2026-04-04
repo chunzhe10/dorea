@@ -61,6 +61,10 @@ pub struct GradeDefaults {
     pub depth_skip_threshold: Option<f32>,
     /// Maximum frames between forced keyframes (default: 12)
     pub depth_max_interval: Option<usize>,
+    /// Frames per fused RAUNE+depth inference batch (default: 32)
+    pub fused_batch_size: Option<usize>,
+    /// Number of adaptive depth zones for calibration LUT (default: 16)
+    pub depth_zones: Option<usize>,
 }
 
 /// Maxine VFX SDK defaults (used when Maxine is re-enabled).
