@@ -21,7 +21,7 @@ def _make_enhance_req(width: int, height: int, req_id: str = "f001") -> dict:
         "image_b64": b64,
         "width": width,
         "height": height,
-        "artifact_reduce": True,
+        "no_artifact_reduce": False,
         "upscale_factor": 2,
     }
 
