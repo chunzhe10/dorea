@@ -57,6 +57,14 @@ pub struct GradeArgs {
     #[arg(long)]
     pub depth_zones: Option<usize>,
 
+    /// Fine zones for segment-level base LUT (config: [grade].base_lut_zones, built-in default: 32)
+    #[arg(long)]
+    pub base_lut_zones: Option<usize>,
+
+    /// Wasserstein-1 threshold for scene segment detection (config: [grade].scene_threshold, built-in default: 0.15)
+    #[arg(long)]
+    pub scene_threshold: Option<f32>,
+
     /// Disable temporal interpolation — run full pipeline on every frame
     #[arg(long)]
     pub no_depth_interp: bool,
@@ -163,6 +171,10 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     let depth_max_interval  = args.depth_max_interval.or(cfg.grade.depth_max_interval).unwrap_or(12_usize);
     let fused_batch_size    = args.fused_batch_size.or(cfg.grade.fused_batch_size).unwrap_or(32_usize);
     let depth_zones         = args.depth_zones.or(cfg.grade.depth_zones).unwrap_or(16_usize);
+    let base_lut_zones      = args.base_lut_zones.or(cfg.grade.base_lut_zones).unwrap_or(32_usize);
+    let scene_threshold     = args.scene_threshold.or(cfg.grade.scene_threshold).unwrap_or(0.15_f32);
+    let min_segment_kfs     = cfg.grade.min_segment_keyframes.unwrap_or(5_usize);
+    let zone_smoothing_w    = cfg.grade.zone_smoothing_window.unwrap_or(3_usize);
     let maxine_upscale_factor = args.maxine_upscale_factor.or(cfg.maxine.upscale_factor).unwrap_or(2_u32);
     let python = args.python.clone()
         .or_else(|| cfg.models.python.clone())
