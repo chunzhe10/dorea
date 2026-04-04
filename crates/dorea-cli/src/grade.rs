@@ -96,7 +96,7 @@ fn lerp_depth(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
 const DEPTH_BATCH_SIZE: usize = 32;
 
 /// Maximum frames per fused RAUNE+depth inference batch.
-/// Calibration images are ~1024×577; 8 frames ≈ 57 MB RAUNE input on GPU.
+/// Proxy-res frames (~518px long edge); 8 frames ≈ 3–4 MB RAUNE input on GPU.
 const FUSED_BATCH_SIZE: usize = 8;
 
 /// A keyframe collected during the proxy-decode pass.
@@ -182,7 +182,8 @@ pub fn run(args: GradeArgs) -> Result<()> {
     for frame_result in proxy_frames {
         let frame = frame_result.context("proxy frame decode error")?;
         let change = detector.score(&frame.pixels);
-        let scene_cut = change < f32::MAX && change > args.depth_skip_threshold * 10.0;
+        let scene_cut_threshold = args.depth_skip_threshold * 10.0;
+        let scene_cut = change < f32::MAX && change > scene_cut_threshold;
         let is_keyframe = !interp_enabled
             || keyframes.is_empty()
             || scene_cut
@@ -210,6 +211,11 @@ pub fn run(args: GradeArgs) -> Result<()> {
         }
     }
     log::info!("Pass 1 complete: {} keyframes detected", keyframes.len());
+
+    anyhow::ensure!(
+        !keyframes.is_empty(),
+        "pass 1 detected no keyframes — video may be empty or undecodable"
+    );
 
     // -----------------------------------------------------------------------
     // Calibration + depth cache
@@ -291,7 +297,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
                 width: proxy_w,
                 height: proxy_h,
                 raune_max_size: proxy_w.max(proxy_h),
-                depth_max_size: args.proxy_size,
+                depth_max_size: args.proxy_size.min(518),
             }
         }).collect();
 
@@ -303,7 +309,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
             .chunks(FUSED_BATCH_SIZE)
             .zip(fused_items.chunks(FUSED_BATCH_SIZE))
         {
-            let results = inf_server.run_raune_depth_batch(chunk_items)
+            let mut results = inf_server.run_raune_depth_batch(chunk_items)
                 .unwrap_or_else(|e| {
                     log::warn!(
                         "Fused RAUNE+depth batch failed: {e} — using originals + uniform depth"
@@ -321,19 +327,34 @@ pub fn run(args: GradeArgs) -> Result<()> {
                     "Fused batch returned {} results for {} items — padding with originals",
                     results.len(), chunk_items.len()
                 );
+                for item in &chunk_items[results.len()..] {
+                    results.push((
+                        item.id.clone(),
+                        item.pixels.clone(),
+                        item.width,
+                        item.height,
+                        vec![0.5f32; item.width * item.height],
+                        item.width,
+                        item.height,
+                    ));
+                }
             }
 
             for (kf, (_, enhanced, enh_w, enh_h, depth, dw, dh)) in
                 chunk_kfs.iter().zip(results.into_iter())
             {
-                // Upscale depth to match enhanced image dims before storing —
-                // PagedCalibrationStore tracks one (w, h) per frame for both pixels and depth.
-                let depth_for_store = if dw == enh_w && dh == enh_h {
+                // PagedCalibrationStore records one (w, h) per frame used for BOTH the
+                // pixel slices and the depth slice. proxy_pixels is always (proxy_w, proxy_h),
+                // so store dims must match. Upscale depth to proxy dims; RAUNE output should
+                // be proxy res too (assert guards this in debug builds).
+                debug_assert_eq!(enh_w, proxy_w, "RAUNE enh_w {enh_w} != proxy_w {proxy_w}");
+                debug_assert_eq!(enh_h, proxy_h, "RAUNE enh_h {enh_h} != proxy_h {proxy_h}");
+                let depth_for_store = if dw == proxy_w && dh == proxy_h {
                     depth.clone()
                 } else {
-                    InferenceServer::upscale_depth(&depth, dw, dh, enh_w, enh_h)
+                    InferenceServer::upscale_depth(&depth, dw, dh, proxy_w, proxy_h)
                 };
-                store.push(&kf.proxy_pixels, &enhanced, &depth_for_store, enh_w, enh_h)
+                store.push(&kf.proxy_pixels, &enhanced, &depth_for_store, proxy_w, proxy_h)
                     .context("failed to page fused result to store")?;
                 kf_depths.insert(kf.frame_index, (depth, dw, dh));
             }
