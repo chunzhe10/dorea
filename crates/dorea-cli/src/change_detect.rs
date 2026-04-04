@@ -4,7 +4,6 @@
 /// against it. The caller decides when to update the reference (i.e. on keyframe
 /// detection) — this is intentional: we compare each frame to the *last keyframe*,
 /// not to the immediately preceding frame.
-
 pub trait ChangeDetector: Send {
     /// Change score from `pixels` vs the stored reference frame.
     /// Returns `f32::MAX` when no reference has been set yet.
@@ -18,14 +17,9 @@ pub trait ChangeDetector: Send {
 }
 
 /// Mean-squared-error change detector.
+#[derive(Default)]
 pub struct MseDetector {
     reference: Option<Vec<u8>>,
-}
-
-impl Default for MseDetector {
-    fn default() -> Self {
-        Self { reference: None }
-    }
 }
 
 /// Normalized MSE between two equal-length u8 slices.
