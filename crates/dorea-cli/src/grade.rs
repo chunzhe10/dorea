@@ -870,6 +870,7 @@ fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
         startup_timeout: Duration::from_secs(180),
         maxine: false,
         maxine_upscale_factor: 2,
+        skip_depth: false,
     }
 }
 

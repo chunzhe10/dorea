@@ -195,6 +195,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
             startup_timeout: Duration::from_secs(180),
             maxine: false,
             maxine_upscale_factor: 2,
+            skip_depth: false,
         };
         inf_server = Some(
             InferenceServer::spawn(&cfg).context("failed to spawn inference server")?,
