@@ -212,13 +212,19 @@ class DepthAnythingInference:
         Returns list of (H_d, W_d) float32 depth maps normalized to [0, 1].
         The resize and re-normalisation happen on-device — no dtoh between models.
         """
+        if enhanced.device != self.device:
+            raise ValueError(
+                f"infer_batch_from_tensors: enhanced tensor is on {enhanced.device} "
+                f"but model is on {self.device}. Caller must keep tensors on the same device."
+            )
+
         import torch
         import torch.nn.functional as F
 
         N, _, H_r, W_r = enhanced.shape
 
         # GPU resize: keep aspect, snap to multiples of _PATCH_SIZE
-        scale = depth_max_size / max(H_r, W_r)
+        scale = min(depth_max_size / max(H_r, W_r), 1.0)
         H_d = max(_PATCH_SIZE, int(H_r * scale) // _PATCH_SIZE * _PATCH_SIZE)
         W_d = max(_PATCH_SIZE, int(W_r * scale) // _PATCH_SIZE * _PATCH_SIZE)
 
