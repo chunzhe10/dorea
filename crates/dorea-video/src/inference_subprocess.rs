@@ -132,7 +132,7 @@ pub struct RauneDepthBatchItem {
 }
 
 /// Parse an enhance_result JSON response, validating dimensions match the request.
-fn parse_enhance_response(
+pub(super) fn parse_enhance_response(
     resp: &str,
     expected_id: &str,
     expected_w: usize,
