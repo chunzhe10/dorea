@@ -101,7 +101,7 @@ def run_depth_gpu(frame_rgb: np.ndarray, max_size: int = 518) -> TensorGuard:
     return TensorGuard(tensor)
 
 
-def run_raune_gpu(frame_rgb: np.ndarray, max_size: int = 1024) -> TensorGuard:
+def run_raune_gpu(frame_rgb: np.ndarray, max_size: int = 1080) -> TensorGuard:
     """Run RAUNE-Net inference, return TensorGuard holding the on-device result."""
     if _raune_model is None:
         raise RuntimeError("RAUNE-Net model not loaded — call load_raune_model() first")
@@ -127,7 +127,7 @@ def run_depth_batch_cpu(imgs: "list[np.ndarray]", max_size: int = 518) -> "list[
     return _depth_model.infer_batch(imgs, max_size=max_size)
 
 
-def run_raune_cpu(frame_rgb: np.ndarray, max_size: int = 1024) -> np.ndarray:
+def run_raune_cpu(frame_rgb: np.ndarray, max_size: int = 1080) -> np.ndarray:
     """Run RAUNE-Net on CPU, return numpy array."""
     if _raune_model is None:
         raise RuntimeError("RAUNE-Net model not loaded — call load_raune_model() first")

@@ -30,7 +30,7 @@ class RauneRequest:
     """Run RAUNE-Net on a single image."""
     id: str
     image_b64: str   # base64-encoded PNG bytes
-    max_size: int = 1024
+    max_size: int = 1080
     type: str = "raune"
 
     def to_dict(self) -> dict:

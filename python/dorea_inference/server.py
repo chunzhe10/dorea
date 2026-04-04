@@ -163,7 +163,7 @@ def main(argv: Optional[list] = None) -> None:
                     img = decode_raw_rgb(req["image_b64"], int(req["width"]), int(req["height"]))
                 else:
                     img = decode_png(req["image_b64"])
-                max_size = int(req.get("max_size", 1024))
+                max_size = int(req.get("max_size", 1080))
                 result = raune_model.infer(img, max_size=max_size)
                 resp = RauneResult(
                     id=req_id,
@@ -215,7 +215,7 @@ def main(argv: Optional[list] = None) -> None:
                     else:
                         imgs.append(decode_png(item["image_b64"]))
 
-                raune_max = int(items[0].get("raune_max_size", 1024)) if items else 1024
+                raune_max = int(items[0].get("raune_max_size", 1080)) if items else 1080
                 depth_max = int(items[0].get("depth_max_size", 518)) if items else 518
 
                 # RAUNE → enhanced tensors stay on GPU

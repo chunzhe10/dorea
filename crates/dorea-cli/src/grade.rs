@@ -37,8 +37,8 @@ pub struct GradeArgs {
     #[arg(long, default_value = "1.0")]
     pub contrast: f32,
 
-    /// Proxy resolution for inference (long edge, pixels) [default: 518]
-    #[arg(long, default_value = "518")]
+    /// Proxy resolution for inference (long edge, pixels) [default: 1080]
+    #[arg(long, default_value = "1080")]
     pub proxy_size: usize,
 
     /// MSE threshold for keyframe detection (lower = more keyframes)
@@ -845,7 +845,7 @@ mod tests {
             warmth: 1.0,
             strength: 0.8,
             contrast: 1.0,
-            proxy_size: 518,
+            proxy_size: 1080,
             depth_skip_threshold: 0.005,
             depth_max_interval: 12,
             no_depth_interp: false,
@@ -873,7 +873,7 @@ mod tests {
             warmth: 1.0,
             strength: 0.8,
             contrast: 1.0,
-            proxy_size: 518,
+            proxy_size: 1080,
             depth_skip_threshold: 0.005,
             depth_max_interval: 12,
             no_depth_interp: false,

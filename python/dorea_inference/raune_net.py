@@ -86,7 +86,7 @@ class RauneNetInference:
         self.model.load_state_dict(state)
         self.model.eval()
 
-    def infer(self, img_rgb: np.ndarray, max_size: int = 1024) -> np.ndarray:
+    def infer(self, img_rgb: np.ndarray, max_size: int = 1080) -> np.ndarray:
         """Run RAUNE-Net on an uint8 HxWx3 RGB image.
 
         Returns uint8 HxWx3 RGB array at inference resolution (≤ max_size).
@@ -109,7 +109,7 @@ class RauneNetInference:
         result = (out.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         return result
 
-    def infer_gpu(self, img_rgb: np.ndarray, max_size: int = 1024) -> "torch.Tensor":
+    def infer_gpu(self, img_rgb: np.ndarray, max_size: int = 1080) -> "torch.Tensor":
         """Run RAUNE-Net, return on-device uint8 tensor (not copied to CPU).
 
         Returns a 3D uint8 CUDA tensor (HxWx3) at inference resolution.
@@ -134,7 +134,7 @@ class RauneNetInference:
 
         return result  # stays on device
 
-    def infer_batch(self, imgs: "list[np.ndarray]", max_size: int = 1024) -> "list[np.ndarray]":
+    def infer_batch(self, imgs: "list[np.ndarray]", max_size: int = 1080) -> "list[np.ndarray]":
         """Run RAUNE-Net on a batch of uint8 HxWx3 RGB images.
 
         All images must resize to the same dims (guaranteed for frames from one video).
@@ -178,7 +178,7 @@ class RauneNetInference:
         out_np = out.cpu().numpy()  # (N, 3, H, W) float32
         return [(out_np[i].transpose(1, 2, 0) * 255).astype(np.uint8) for i in range(len(imgs))]
 
-    def infer_batch_gpu(self, imgs: "list[np.ndarray]", max_size: int = 1024) -> "tuple[torch.Tensor, int, int]":
+    def infer_batch_gpu(self, imgs: "list[np.ndarray]", max_size: int = 1080) -> "tuple[torch.Tensor, int, int]":
         """Run RAUNE-Net batch, returning enhanced tensors on device (no dtoh).
 
         Returns (batch_tensor, out_w, out_h) where batch_tensor is (N, 3, H, W)
