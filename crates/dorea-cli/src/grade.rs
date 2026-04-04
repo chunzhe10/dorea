@@ -294,7 +294,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
                 pixels: kf.proxy_pixels.clone(),
                 width: proxy_w,
                 height: proxy_h,
-                raune_max_size: proxy_w,
+                raune_max_size: proxy_w.max(proxy_h),
                 depth_max_size: args.proxy_size,
             }
         }).collect();
@@ -320,10 +320,24 @@ pub fn run(args: GradeArgs) -> Result<()> {
                     }).collect()
                 });
 
+            if results.len() < chunk_items.len() {
+                log::warn!(
+                    "Fused batch returned {} results for {} items — padding with originals",
+                    results.len(), chunk_items.len()
+                );
+            }
+
             for (kf, (_, enhanced, enh_w, enh_h, depth, dw, dh)) in
                 chunk_kfs.iter().zip(results.into_iter())
             {
-                store.push(&kf.proxy_pixels, &enhanced, &depth, enh_w, enh_h)
+                // Upscale depth to match enhanced image dims before storing —
+                // PagedCalibrationStore tracks one (w, h) per frame for both pixels and depth.
+                let depth_for_store = if dw == enh_w && dh == enh_h {
+                    depth.clone()
+                } else {
+                    InferenceServer::upscale_depth(&depth, dw, dh, enh_w, enh_h)
+                };
+                store.push(&kf.proxy_pixels, &enhanced, &depth_for_store, enh_w, enh_h)
                     .context("failed to page fused result to store")?;
                 kf_depths.insert(kf.frame_index, (depth, dw, dh));
             }
