@@ -42,6 +42,12 @@ pub struct InferenceConfig {
     pub device: Option<String>,
     /// Startup timeout (unused for PyO3, kept for API compat).
     pub startup_timeout: Duration,
+    /// Enable Maxine enhancement.
+    pub maxine: bool,
+    /// Maxine super-resolution upscale factor (default 2).
+    pub maxine_upscale_factor: u32,
+    /// Skip Depth Anything at spawn (load on demand via load_depth()).
+    pub skip_depth: bool,
 }
 
 impl Default for InferenceConfig {
@@ -54,6 +60,9 @@ impl Default for InferenceConfig {
             depth_model: None,
             device: None,
             startup_timeout: Duration::from_secs(120),
+            maxine: false,
+            maxine_upscale_factor: 2,
+            skip_depth: false,
         }
     }
 }
@@ -111,6 +120,8 @@ impl Drop for DepthTensorGuard {
 pub struct InferenceServer {
     /// Cached bridge module — avoids re-importing on every inference call.
     bridge: Py<PyModule>,
+    /// Device string captured at spawn time (e.g. "cuda" or "cpu").
+    device: String,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -153,11 +164,13 @@ impl InferenceServer {
             let bridge = py.import_bound("dorea_inference.bridge")
                 .map_err(|e| InferenceError::InitFailed(format!("import dorea_inference.bridge: {e}")))?;
 
-            // Load depth model.
+            // Load depth model (unless skipped).
             let device = config.device.as_deref().unwrap_or("cuda");
             let depth_path = config.depth_model.as_ref().map(|p| p.to_str().unwrap_or(""));
 
-            Self::call_load_depth(py, &bridge, depth_path, device)?;
+            if !config.skip_depth {
+                Self::call_load_depth(py, &bridge, depth_path, device)?;
+            }
 
             // Load RAUNE model if not skipped.
             if !config.skip_raune {
@@ -166,8 +179,14 @@ impl InferenceServer {
                 Self::call_load_raune(py, &bridge, weights, device, models_dir)?;
             }
 
+            // Load Maxine if requested.
+            if config.maxine {
+                Self::call_load_maxine(py, &bridge, config.maxine_upscale_factor)?;
+            }
+
             Ok(Self {
                 bridge: bridge.unbind(),
+                device: device.to_string(),
                 _not_send: PhantomData,
             })
         })
@@ -428,6 +447,90 @@ impl InferenceServer {
         })
     }
 
+    /// Run Maxine enhancement in-process via the PyO3 bridge.
+    ///
+    /// Returns enhanced RGB u8 at the same resolution as input.
+    pub fn enhance(
+        &self,
+        _id: &str,
+        image_rgb: &[u8],
+        width: usize,
+        height: usize,
+        artifact_reduce: bool,
+    ) -> Result<Vec<u8>, InferenceError> {
+        Python::with_gil(|py| {
+            let bridge = self.bridge.bind(py);
+            let np_flat = numpy::PyArray1::from_slice_bound(py, image_rgb);
+            let np_reshaped = np_flat
+                .call_method1("reshape", ((height, width, 3),))
+                .map_err(|e| InferenceError::Ipc(format!("reshape: {e}")))?;
+            let result = bridge
+                .call_method1("run_maxine", (np_reshaped, artifact_reduce))
+                .map_err(|e| Self::map_python_error(py, e))?;
+            let flat = result
+                .call_method1("reshape", ((-1_i32,),))
+                .map_err(|e| InferenceError::Ipc(format!("flatten result: {e}")))?;
+            let rgb_data: Vec<u8> = flat
+                .call_method0("tolist")
+                .map_err(|e| InferenceError::Ipc(format!("tolist: {e}")))?
+                .extract()
+                .map_err(|e| InferenceError::Ipc(format!("extract rgb: {e}")))?;
+            Ok(rgb_data)
+        })
+    }
+
+    /// Unload Maxine model and free its VRAM without stopping the server.
+    pub fn unload_maxine(&self) -> Result<(), InferenceError> {
+        Python::with_gil(|py| {
+            let bridge = self.bridge.bind(py);
+            bridge
+                .call_method0("unload_maxine")
+                .map_err(|e| InferenceError::InitFailed(format!("unload_maxine: {e}")))?;
+            Ok(())
+        })
+    }
+
+    /// Load RAUNE-Net into the running server (after it was started without it).
+    pub fn load_raune(
+        &self,
+        weights: Option<&std::path::Path>,
+        models_dir: Option<&std::path::Path>,
+    ) -> Result<(), InferenceError> {
+        Python::with_gil(|py| {
+            let bridge = self.bridge.bind(py);
+            let py_weights = match weights.and_then(|p| p.to_str()) {
+                Some(p) => p.into_py(py),
+                None => py.None(),
+            };
+            let py_models_dir = match models_dir.and_then(|p| p.to_str()) {
+                Some(p) => p.into_py(py),
+                None => py.None(),
+            };
+            bridge
+                .call_method1("load_raune_model", (py_weights, self.device.as_str(), py_models_dir))
+                .map_err(|e| InferenceError::InitFailed(format!("load_raune_model: {e}")))?;
+            Ok(())
+        })
+    }
+
+    /// Load Depth Anything into the running server (after it was started without it).
+    pub fn load_depth(
+        &self,
+        model_path: Option<&std::path::Path>,
+    ) -> Result<(), InferenceError> {
+        Python::with_gil(|py| {
+            let bridge = self.bridge.bind(py);
+            let py_model_path = match model_path.and_then(|p| p.to_str()) {
+                Some(p) => p.into_py(py),
+                None => py.None(),
+            };
+            bridge
+                .call_method1("load_depth_model", (py_model_path, self.device.as_str()))
+                .map_err(|e| InferenceError::InitFailed(format!("load_depth_model: {e}")))?;
+            Ok(())
+        })
+    }
+
     /// Graceful shutdown — unload Python models and release VRAM.
     pub fn shutdown(self) -> Result<(), InferenceError> {
         Python::with_gil(|py| {
@@ -490,6 +593,18 @@ impl InferenceServer {
         Ok(())
     }
 
+    /// Load the Maxine model via the Python bridge.
+    fn call_load_maxine(
+        py: Python<'_>,
+        bridge: &Bound<'_, PyModule>,
+        upscale_factor: u32,
+    ) -> Result<(), InferenceError> {
+        bridge
+            .call_method1("load_maxine_model", (upscale_factor as i64,))
+            .map_err(|e| InferenceError::InitFailed(format!("load_maxine_model: {e}")))?;
+        Ok(())
+    }
+
     /// Map a Python exception to the appropriate InferenceError variant.
     /// Detects CUDA OOM specifically for better error reporting.
     fn map_python_error(py: Python<'_>, err: PyErr) -> InferenceError {
@@ -520,6 +635,14 @@ impl InferenceServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inference_config_default_has_maxine_fields() {
+        let cfg = InferenceConfig::default();
+        assert!(!cfg.maxine, "maxine should default to false");
+        assert_eq!(cfg.maxine_upscale_factor, 2);
+        assert!(!cfg.skip_depth, "skip_depth should default to false");
+    }
 
     #[test]
     fn upscale_depth_identity() {
