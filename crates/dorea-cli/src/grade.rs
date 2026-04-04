@@ -409,10 +409,17 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         .context("failed to create paged calibration store")?;
     let mut kf_depths: HashMap<u64, (Vec<f32>, usize, usize)> = HashMap::new();
 
-    for (chunk_kfs, chunk_items) in keyframes
+    let n_batches = keyframes.chunks(FUSED_BATCH_SIZE).count();
+    for (batch_idx, (chunk_kfs, chunk_items)) in keyframes
         .chunks(FUSED_BATCH_SIZE)
         .zip(fused_items.chunks(FUSED_BATCH_SIZE))
+        .enumerate()
     {
+        log::info!(
+            "RAUNE+depth batch {}/{n_batches} ({} frames)",
+            batch_idx + 1,
+            chunk_items.len(),
+        );
         let mut results = inf_server.run_raune_depth_batch(chunk_items)
             .unwrap_or_else(|e| {
                 log::warn!(
@@ -496,6 +503,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         }
     }
     let zone_boundaries = adaptive_zone_boundaries(&reservoir, N_DEPTH_ZONES);
+    log::info!("Depth zones: {N_DEPTH_ZONES} adaptive zones from {} depth samples", total_seen);
     drop(reservoir);
 
     // Pass 2: stream frames → build LUT
