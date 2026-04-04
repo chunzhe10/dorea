@@ -174,7 +174,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
         info.width, info.height, info.fps, info.duration_secs, info.frame_count
     );
 
-    let use_maxine = !args.no_maxine;
+    let use_maxine = false; // SR disabled — restore to `!args.no_maxine` when ready
     if use_maxine {
         let valid_factors = [2u32, 3, 4];
         if !valid_factors.contains(&args.maxine_upscale_factor) {
