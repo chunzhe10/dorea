@@ -223,21 +223,32 @@ def main(argv: Optional[list] = None) -> None:
 
                 # Maxine upscale (optional) — insert between RAUNE and Depth
                 enable_maxine = req.get("enable_maxine", False)
-                if enable_maxine and maxine_enhancer is not None:
+                if enable_maxine:
+                    if maxine_enhancer is None:
+                        raise RuntimeError(
+                            "Maxine upscaling requested but enhancer failed to load — "
+                            "check NVIDIA CUDA, VFX SDK, and dependencies"
+                        )
                     # Convert batch to uint8 RGB for Maxine (dtoh)
                     import torch
                     enhanced_np = (
                         enhanced_batch.permute(0, 2, 3, 1).cpu().numpy() * 255
                     ).astype("uint8")  # (N, H, W, 3)
 
-                    # Frame-by-frame Maxine enhance (single-frame API)
+                    # Frame-by-frame Maxine enhance (single-frame API) — propagate errors
                     for i in range(enhanced_np.shape[0]):
-                        enhanced_np[i] = maxine_enhancer.enhance(
-                            enhanced_np[i],
-                            width=enh_w,
-                            height=enh_h,
-                            artifact_reduce=True,
-                        )
+                        # Call _enhance_impl directly to avoid silent error swallowing
+                        try:
+                            enhanced_np[i] = maxine_enhancer._enhance_impl(
+                                enhanced_np[i],
+                                width=enh_w,
+                                height=enh_h,
+                                artifact_reduce=True,
+                            )
+                        except Exception as e:
+                            raise RuntimeError(
+                                f"Maxine enhance failed on frame {i}/{enhanced_np.shape[0]}: {e}"
+                            ) from e
 
                     # Convert back to float32 tensor on GPU (htod)
                     enhanced_batch = (
