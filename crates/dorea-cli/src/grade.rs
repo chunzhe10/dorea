@@ -10,6 +10,7 @@ use dorea_cal::Calibration;
 use dorea_gpu::{grade_frame, GradeParams};
 use dorea_video::ffmpeg::{self, FrameEncoder};
 use dorea_video::inference::{DepthBatchItem, RauneDepthBatchItem, InferenceConfig, InferenceServer};
+use crate::change_detect::{ChangeDetector, MseDetector};
 
 #[cfg(feature = "cuda")]
 use dorea_gpu::cuda::CudaGrader;
@@ -57,10 +58,6 @@ pub struct GradeArgs {
     #[arg(long)]
     pub no_depth_interp: bool,
 
-    /// Frames between keyframe samples for auto-calibration
-    #[arg(long, default_value = "30")]
-    pub keyframe_interval: usize,
-
     /// Path to RAUNE-Net weights .pth (for auto-calibration)
     #[arg(long)]
     pub raune_weights: Option<PathBuf>,
@@ -87,23 +84,6 @@ pub struct GradeArgs {
     pub verbose: bool,
 }
 
-/// Compute normalized MSE between two same-length u8 slices.
-/// Returns value in [0, 1] where 0 = identical.
-fn frame_mse(a: &[u8], b: &[u8]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    if a.is_empty() {
-        return 0.0;
-    }
-    let n = a.len() as f64;
-    let sum_sq: f64 = a.iter().zip(b.iter())
-        .map(|(&av, &bv)| {
-            let d = av as f64 - bv as f64;
-            d * d
-        })
-        .sum();
-    (sum_sq / (n * 255.0 * 255.0)) as f32
-}
-
 /// Linearly interpolate between two f32 depth maps.
 fn lerp_depth(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
     let t = t.clamp(0.0, 1.0);
@@ -116,7 +96,7 @@ fn lerp_depth(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
 const DEPTH_BATCH_SIZE: usize = 32;
 
 /// Maximum frames per fused RAUNE+depth inference batch.
-/// Calibration images are ~1024×577; 8 frames ≈ 57 MB RAUNE input on GPU.
+/// Proxy-res frames (~518px long edge); 8 frames ≈ 3–4 MB RAUNE input on GPU.
 const FUSED_BATCH_SIZE: usize = 8;
 
 /// A keyframe collected during the proxy-decode pass.
@@ -186,22 +166,316 @@ pub fn run(args: GradeArgs) -> Result<()> {
     let mut encoder = FrameEncoder::new(&output, info.width, info.height, info.fps, audio_src)
         .context("failed to spawn ffmpeg encoder")?;
 
-    // Load or derive calibration
-    let calibration = if let Some(cal_path) = &args.calibration {
-        log::info!("Loading calibration from {}", cal_path.display());
-        Calibration::load(cal_path).context("failed to load .dorea-cal file")?
-    } else {
-        log::info!("No calibration provided — auto-calibrating from keyframes");
-        auto_calibrate(&args, &info)?
-    };
+    let interp_enabled = !args.no_depth_interp;
 
-    // Spawn inference server (depth-only; RAUNE is not needed for grading).
-    let inf_cfg = InferenceConfig {
-        skip_raune: true,
-        ..build_inference_config(&args)
-    };
-    let mut inf_server = InferenceServer::spawn(&inf_cfg)
-        .context("failed to spawn inference server — check --python and --depth-model")?;
+    // -----------------------------------------------------------------------
+    // Pass 1: proxy decode + change detection → keyframe list
+    // -----------------------------------------------------------------------
+    let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(info.width, info.height, args.proxy_size);
+    let proxy_frames = ffmpeg::decode_frames_scaled(&args.input, &info, proxy_w, proxy_h)
+        .context("failed to spawn ffmpeg proxy decoder")?;
+
+    let mut keyframes: Vec<KeyframeEntry> = Vec::new();
+    let mut detector: Box<dyn ChangeDetector> = Box::new(MseDetector::default());
+    let mut frames_since_kf = 0usize;
+    let scene_cut_threshold = args.depth_skip_threshold * 10.0;
+
+    for frame_result in proxy_frames {
+        let frame = frame_result.context("proxy frame decode error")?;
+        let change = detector.score(&frame.pixels);
+        let scene_cut = change < f32::MAX && change > scene_cut_threshold;
+        let is_keyframe = !interp_enabled
+            || keyframes.is_empty()
+            || scene_cut
+            || frames_since_kf >= args.depth_max_interval
+            || (change < f32::MAX && change > args.depth_skip_threshold);
+
+        if is_keyframe {
+            if scene_cut {
+                log::info!(
+                    "Scene cut at frame {} (change={:.6})",
+                    frame.index,
+                    change,
+                );
+                detector.reset();
+            }
+            keyframes.push(KeyframeEntry {
+                frame_index: frame.index,
+                proxy_pixels: frame.pixels.clone(),
+                scene_cut_before: scene_cut,
+            });
+            detector.set_reference(&frame.pixels);
+            frames_since_kf = 0;
+        } else {
+            frames_since_kf += 1;
+        }
+    }
+    log::info!("Pass 1 complete: {} keyframes detected", keyframes.len());
+
+    anyhow::ensure!(
+        !keyframes.is_empty(),
+        "pass 1 detected no keyframes — video may be empty or undecodable"
+    );
+
+    // -----------------------------------------------------------------------
+    // Calibration + depth cache
+    // -----------------------------------------------------------------------
+    // When a pre-computed calibration is supplied: load it, run depth-only batch
+    // for grading (same path as before).
+    // When auto-calibrating: one fused RAUNE+depth server fills both the
+    // calibration store and the grading depth cache from the same keyframes.
+    let calibration: Calibration;
+    let keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)>;
+
+    if let Some(cal_path) = &args.calibration {
+        log::info!("Loading calibration from {}", cal_path.display());
+        calibration = Calibration::load(cal_path)
+            .context("failed to load .dorea-cal file")?;
+
+        // Depth-only inference for grading depth cache.
+        let inf_cfg = InferenceConfig {
+            skip_raune: true,
+            ..build_inference_config(&args)
+        };
+        let mut inf_server = InferenceServer::spawn(&inf_cfg)
+            .context("failed to spawn depth-only inference server")?;
+
+        let batch_items: Vec<DepthBatchItem> = keyframes.iter().map(|kf| DepthBatchItem {
+            id: format!("kf_f{}", kf.frame_index),
+            pixels: kf.proxy_pixels.clone(),
+            width: proxy_w,
+            height: proxy_h,
+            max_size: args.proxy_size,
+        }).collect();
+
+        let mut kf_depths: HashMap<u64, (Vec<f32>, usize, usize)> = HashMap::new();
+        for (chunk_kfs, chunk_items) in keyframes
+            .chunks(DEPTH_BATCH_SIZE)
+            .zip(batch_items.chunks(DEPTH_BATCH_SIZE))
+        {
+            let mut results = inf_server.run_depth_batch(chunk_items)
+                .unwrap_or_else(|e| {
+                    log::warn!("Depth batch failed: {e} — using uniform depth 0.5");
+                    chunk_items.iter().map(|it| {
+                        (it.id.clone(), vec![0.5f32; proxy_w * proxy_h], proxy_w, proxy_h)
+                    }).collect()
+                });
+
+            if results.len() < chunk_items.len() {
+                log::warn!(
+                    "Depth batch returned {} results for {} items — padding",
+                    results.len(), chunk_items.len()
+                );
+                for it in &chunk_items[results.len()..] {
+                    results.push((it.id.clone(), vec![0.5f32; proxy_w * proxy_h], proxy_w, proxy_h));
+                }
+            }
+
+            for (kf, (_, depth_raw, dw, dh)) in chunk_kfs.iter().zip(results.iter()) {
+                kf_depths.insert(kf.frame_index, (depth_raw.clone(), *dw, *dh));
+            }
+        }
+        log::info!("Depth batch complete ({} keyframes)", keyframes.len());
+        let _ = inf_server.shutdown();
+        keyframe_depths = kf_depths;
+
+    } else {
+        // Auto-calibrate: fused RAUNE+depth, dual output.
+        log::info!(
+            "No calibration — auto-calibrating from {} keyframes (fused RAUNE+depth)",
+            keyframes.len()
+        );
+
+        let inf_cfg = build_inference_config(&args);  // skip_raune: false
+        let mut inf_server = InferenceServer::spawn(&inf_cfg)
+            .context("failed to spawn fused inference server")?;
+
+        let fused_items: Vec<RauneDepthBatchItem> = keyframes.iter().map(|kf| {
+            RauneDepthBatchItem {
+                id: format!("kf_f{}", kf.frame_index),
+                pixels: kf.proxy_pixels.clone(),
+                width: proxy_w,
+                height: proxy_h,
+                raune_max_size: proxy_w.max(proxy_h),
+                depth_max_size: args.proxy_size.min(518),
+            }
+        }).collect();
+
+        let mut store = PagedCalibrationStore::new()
+            .context("failed to create paged calibration store")?;
+        let mut kf_depths: HashMap<u64, (Vec<f32>, usize, usize)> = HashMap::new();
+
+        for (chunk_kfs, chunk_items) in keyframes
+            .chunks(FUSED_BATCH_SIZE)
+            .zip(fused_items.chunks(FUSED_BATCH_SIZE))
+        {
+            let mut results = inf_server.run_raune_depth_batch(chunk_items)
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "Fused RAUNE+depth batch failed: {e} — using originals + uniform depth"
+                    );
+                    chunk_items.iter().map(|item| {
+                        (item.id.clone(), item.pixels.clone(),
+                         item.width, item.height,
+                         vec![0.5f32; item.width * item.height],
+                         item.width, item.height)
+                    }).collect()
+                });
+
+            if results.len() < chunk_items.len() {
+                log::warn!(
+                    "Fused batch returned {} results for {} items — padding with originals",
+                    results.len(), chunk_items.len()
+                );
+                for item in &chunk_items[results.len()..] {
+                    results.push((
+                        item.id.clone(),
+                        item.pixels.clone(),
+                        item.width,
+                        item.height,
+                        vec![0.5f32; item.width * item.height],
+                        item.width,
+                        item.height,
+                    ));
+                }
+            }
+
+            for (kf, (_, enhanced, enh_w, enh_h, depth, dw, dh)) in
+                chunk_kfs.iter().zip(results.into_iter())
+            {
+                // PagedCalibrationStore records one (w, h) per frame used for BOTH the
+                // pixel slices and the depth slice. proxy_pixels is always (proxy_w, proxy_h),
+                // so store dims must match. Upscale depth to proxy dims; RAUNE output should
+                // be proxy res too (assert guards this in debug builds).
+                debug_assert_eq!(enh_w, proxy_w, "RAUNE enh_w {enh_w} != proxy_w {proxy_w}");
+                debug_assert_eq!(enh_h, proxy_h, "RAUNE enh_h {enh_h} != proxy_h {proxy_h}");
+                let depth_for_store = if dw == proxy_w && dh == proxy_h {
+                    depth.clone()
+                } else {
+                    InferenceServer::upscale_depth(&depth, dw, dh, proxy_w, proxy_h)
+                };
+                store.push(&kf.proxy_pixels, &enhanced, &depth_for_store, proxy_w, proxy_h)
+                    .context("failed to page fused result to store")?;
+                kf_depths.insert(kf.frame_index, (depth, dw, dh));
+            }
+        }
+        log::info!("Fused inference complete ({} keyframes)", keyframes.len());
+        let _ = inf_server.shutdown();
+        store.seal().context("failed to seal calibration store")?;
+
+        // ---- 3-pass calibration (inline) ----
+        use dorea_hsl::derive::{derive_hsl_corrections, HslCorrections, QualifierCorrection};
+        use dorea_hsl::{HSL_QUALIFIERS, MIN_WEIGHT};
+        use dorea_lut::apply::apply_depth_luts;
+        use dorea_lut::build::{adaptive_zone_boundaries, compute_importance, StreamingLutBuilder, N_DEPTH_ZONES};
+
+        // Pass 1: reservoir-sample depths → adaptive zone boundaries
+        const RESERVOIR_CAP: usize = 1_000_000;
+        let mut reservoir: Vec<f32> = Vec::with_capacity(RESERVOIR_CAP);
+        let mut total_seen: u64 = 0;
+        let mut rng: u64 = 0x853c49e6748fea9b_u64;
+
+        for i in 0..store.len() {
+            for d in store.depth_bytes(i).chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            {
+                total_seen += 1;
+                if reservoir.len() < RESERVOIR_CAP {
+                    reservoir.push(d);
+                } else {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let j = (rng % total_seen) as usize;
+                    if j < RESERVOIR_CAP {
+                        reservoir[j] = d;
+                    }
+                }
+            }
+        }
+        let zone_boundaries = adaptive_zone_boundaries(&reservoir, N_DEPTH_ZONES);
+        drop(reservoir);
+
+        // Pass 2: stream frames → build LUT
+        let mut lut_builder = StreamingLutBuilder::new(zone_boundaries);
+        for i in 0..store.len() {
+            let (w, h) = store.dims(i);
+            let (pixels_u8, target_u8) = store.pixtar_slices(i);
+            let depth = store.read_depth(i);
+            let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect();
+            let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect();
+            let importance = compute_importance(&depth, w, h);
+            lut_builder.add_frame(&original, &target, &depth, &importance);
+        }
+        let depth_luts = lut_builder.finish();
+
+        // Pass 3: stream frames → HSL corrections
+        let n_quals = HSL_QUALIFIERS.len();
+        let mut h_offset_acc    = vec![0.0_f64; n_quals];
+        let mut s_ratio_acc     = vec![0.0_f64; n_quals];
+        let mut v_offset_acc    = vec![0.0_f64; n_quals];
+        let mut active_count    = vec![0_usize;  n_quals];
+        let mut total_weight_acc = vec![0.0_f64; n_quals];
+
+        for i in 0..store.len() {
+            let (pixels_u8, target_u8) = store.pixtar_slices(i);
+            let depth = store.read_depth(i);
+            let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect();
+            let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect();
+            let lut_output = apply_depth_luts(&original, &depth, &depth_luts);
+            let corrs = derive_hsl_corrections(&lut_output, &target);
+            for (qi, corr) in corrs.0.iter().enumerate() {
+                if corr.weight >= MIN_WEIGHT {
+                    let w = corr.weight as f64;
+                    h_offset_acc[qi]    += corr.h_offset as f64 * w;
+                    s_ratio_acc[qi]     += corr.s_ratio  as f64 * w;
+                    v_offset_acc[qi]    += corr.v_offset as f64 * w;
+                    active_count[qi]    += 1;
+                    total_weight_acc[qi] += w;
+                }
+            }
+        }
+
+        let mut avg_corrections: Vec<QualifierCorrection> = Vec::with_capacity(n_quals);
+        for qi in 0..n_quals {
+            let qual = &HSL_QUALIFIERS[qi];
+            if active_count[qi] > 0 {
+                let tw = total_weight_acc[qi];
+                avg_corrections.push(QualifierCorrection {
+                    h_center: qual.h_center,
+                    h_width:  qual.h_width,
+                    h_offset: (h_offset_acc[qi] / tw) as f32,
+                    s_ratio:  (s_ratio_acc[qi]  / tw) as f32,
+                    v_offset: (v_offset_acc[qi] / tw) as f32,
+                    weight:   tw as f32,
+                });
+            } else {
+                avg_corrections.push(QualifierCorrection {
+                    h_center: qual.h_center,
+                    h_width:  qual.h_width,
+                    h_offset: 0.0,
+                    s_ratio:  1.0,
+                    v_offset: 0.0,
+                    weight:   0.0,
+                });
+            }
+        }
+
+        calibration = Calibration::new(depth_luts, HslCorrections(avg_corrections), store.len());
+        keyframe_depths = kf_depths;
+        log::info!(
+            "Auto-calibration complete ({} keyframes → {} depth zones)",
+            store.len(), N_DEPTH_ZONES
+        );
+    }
 
     // Initialize CUDA grader (loads PTX once, builds combined LUT, reuses across all frames)
     #[cfg(feature = "cuda")]
@@ -215,102 +489,6 @@ pub fn run(args: GradeArgs) -> Result<()> {
             None
         }
     };
-
-    let interp_enabled = !args.no_depth_interp;
-    let scene_cut_threshold = args.depth_skip_threshold * 10.0;
-
-    // -----------------------------------------------------------------------
-    // Pass 1: proxy decode + MSE keyframe detection
-    // -----------------------------------------------------------------------
-    let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(info.width, info.height, args.proxy_size);
-    let proxy_frames = ffmpeg::decode_frames_scaled(&args.input, &info, proxy_w, proxy_h)
-        .context("failed to spawn ffmpeg proxy decoder")?;
-
-    let mut keyframes: Vec<KeyframeEntry> = Vec::new();
-    let mut last_proxy: Option<Vec<u8>> = None;
-    let mut frames_since_kf = 0usize;
-
-    for frame_result in proxy_frames {
-        let frame = frame_result.context("proxy frame decode error")?;
-        let mse = last_proxy.as_ref().map(|lp| frame_mse(&frame.pixels, lp));
-        let scene_cut = mse.map_or(false, |m| m > scene_cut_threshold);
-        let is_keyframe = !interp_enabled
-            || last_proxy.is_none()
-            || scene_cut
-            || frames_since_kf >= args.depth_max_interval
-            || mse.map_or(false, |m| m > args.depth_skip_threshold);
-
-        if is_keyframe {
-            if scene_cut {
-                log::info!(
-                    "Scene cut at frame {} (MSE={:.6})",
-                    frame.index,
-                    mse.unwrap_or(0.0),
-                );
-            }
-            keyframes.push(KeyframeEntry {
-                frame_index: frame.index,
-                proxy_pixels: frame.pixels.clone(),
-                scene_cut_before: scene_cut,
-            });
-            last_proxy = Some(frame.pixels);
-            frames_since_kf = 0;
-        } else {
-            frames_since_kf += 1;
-        }
-    }
-    log::info!("Pass 1 complete: {} keyframes detected", keyframes.len());
-
-    // -----------------------------------------------------------------------
-    // Batch depth inference
-    // -----------------------------------------------------------------------
-    let batch_items: Vec<DepthBatchItem> = keyframes.iter().map(|kf| {
-        DepthBatchItem {
-            id: format!("kf_f{}", kf.frame_index),
-            pixels: kf.proxy_pixels.clone(),
-            width: proxy_w,
-            height: proxy_h,
-            max_size: args.proxy_size,
-        }
-    }).collect();
-
-    // Store depth at proxy resolution — upscale on-demand in pass 2.
-    // Full-res storage (info.width × info.height × 4 bytes × n_keyframes) can reach tens of
-    // GB for tight intervals on 4K footage; proxy storage is ~50× smaller.
-    let mut keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)> = HashMap::new();
-    for (chunk_kfs, chunk_items) in keyframes
-        .chunks(DEPTH_BATCH_SIZE)
-        .zip(batch_items.chunks(DEPTH_BATCH_SIZE))
-    {
-        let mut results = inf_server.run_depth_batch(chunk_items)
-            .unwrap_or_else(|e| {
-                log::warn!("Depth batch failed: {e} — using uniform depth 0.5");
-                chunk_items.iter().map(|it| {
-                    (it.id.clone(), vec![0.5f32; proxy_w * proxy_h], proxy_w, proxy_h)
-                }).collect()
-            });
-
-        // Guard against a malformed server response returning fewer results than requested.
-        if results.len() < chunk_items.len() {
-            log::warn!(
-                "Depth batch returned {} results for {} items — padding missing with uniform depth",
-                results.len(), chunk_items.len()
-            );
-            for it in &chunk_items[results.len()..] {
-                results.push((it.id.clone(), vec![0.5f32; proxy_w * proxy_h], proxy_w, proxy_h));
-            }
-        }
-
-        for (kf, (_, depth_raw, dw, dh)) in chunk_kfs.iter().zip(results.iter()) {
-            keyframe_depths.insert(kf.frame_index, (depth_raw.clone(), *dw, *dh));
-        }
-    }
-    log::info!("Batch depth inference complete ({} keyframes)", keyframes.len());
-
-    // Shut down inference server before pass 2 — all depths are cached in keyframe_depths.
-    // Releasing Depth Anything V2 VRAM (~1.5 GB) here avoids contention with NVENC input
-    // buffer allocation on RTX 3060 (6 GB VRAM).
-    let _ = inf_server.shutdown();
 
     // Ordered list of (frame_index, scene_cut_before) for pass-2 lerp lookup.
     let kf_index_list: Vec<(u64, bool)> = keyframes.iter()
@@ -523,226 +701,6 @@ impl Drop for PagedCalibrationStore {
     }
 }
 
-fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibration> {
-    use dorea_cal::Calibration as _Calibration;
-    use dorea_hsl::derive::{derive_hsl_corrections, HslCorrections, QualifierCorrection};
-    use dorea_hsl::{HSL_QUALIFIERS, MIN_WEIGHT};
-    use dorea_lut::apply::apply_depth_luts;
-    use dorea_lut::build::{adaptive_zone_boundaries, compute_importance, StreamingLutBuilder, N_DEPTH_ZONES};
-
-    // Use frame-count-based duration to avoid container metadata overestimating the
-    // actual decodable range (ffprobe duration_secs can exceed the last real frame).
-    let fps = info.fps.max(1.0);
-    let safe_duration = info.frame_count.saturating_sub(1) as f64 / fps;
-    let interval_secs = args.keyframe_interval as f64 / fps;
-    let n_kf = ((safe_duration / interval_secs) as usize).max(1);
-
-    log::info!("Auto-calibrating from {n_kf} keyframes...");
-
-    // Calibration runs at proxy resolution so pixels, RAUNE target, and depth all match.
-    // Max 1024px on the long edge, maintaining aspect ratio.
-    let cal_max = 1024usize;
-    let cal_scale = (cal_max as f64 / info.width.max(info.height) as f64).min(1.0);
-    let kf_w = ((info.width as f64 * cal_scale) as usize).max(1);
-    let kf_h = ((info.height as f64 * cal_scale) as usize).max(1);
-
-    let inf_cfg = build_inference_config(args);
-    let mut inf_server = InferenceServer::spawn(&inf_cfg)
-        .context("failed to spawn inference server for auto-calibration")?;
-
-    let mut store = PagedCalibrationStore::new()
-        .context("failed to create paged calibration store")?;
-
-    // --- Phase 1: collect pixel buffers (N individual ffmpeg seeks — unchanged) ---
-    log::info!("Auto-calibration: extracting {n_kf} keyframes...");
-    let mut kf_pixels: Vec<Vec<u8>> = Vec::with_capacity(n_kf);
-    for i in 0..n_kf {
-        let ts = (i as f64 + 0.5) * safe_duration / n_kf as f64;
-        let pixels = ffmpeg::extract_frame_at(&args.input, ts, kf_w, kf_h)
-            .with_context(|| format!("failed to extract keyframe at {ts:.2}s"))?;
-        kf_pixels.push(pixels);
-    }
-    log::info!("Collected {} keyframe pixels", kf_pixels.len());
-
-    // --- Phase 2: fused RAUNE+depth batch inference ---
-    // RAUNE output stays on GPU between models — no IPC round-trip for enhanced frames.
-    // Depth runs on RAUNE-enhanced frames for better zone boundaries.
-    log::info!(
-        "Fused RAUNE+depth inference ({} frames, batch_size={FUSED_BATCH_SIZE})...",
-        kf_pixels.len()
-    );
-
-    let fused_items: Vec<RauneDepthBatchItem> = kf_pixels.iter().enumerate().map(|(i, px)| {
-        RauneDepthBatchItem {
-            id: format!("kf{i:04}"),
-            pixels: px.clone(),
-            width: kf_w,
-            height: kf_h,
-            raune_max_size: kf_w.max(kf_h),
-            depth_max_size: 518,
-        }
-    }).collect();
-
-    // (enhanced_rgb_u8, depth_f32_raw, depth_w, depth_h) — id and enh_w/h stripped on push
-    let mut kf_results: Vec<(Vec<u8>, Vec<f32>, usize, usize)> = Vec::with_capacity(n_kf);
-
-    for (chunk_items, chunk_pixels) in fused_items
-        .chunks(FUSED_BATCH_SIZE)
-        .zip(kf_pixels.chunks(FUSED_BATCH_SIZE))
-    {
-        let mut results = inf_server.run_raune_depth_batch(chunk_items)
-            .unwrap_or_else(|e| {
-                log::warn!("Fused RAUNE+depth batch failed: {e} — using originals + uniform depth");
-                chunk_items.iter().zip(chunk_pixels.iter()).map(|(item, px)| {
-                    (item.id.clone(), px.clone(), kf_w, kf_h,
-                     vec![0.5f32; kf_w * kf_h], kf_w, kf_h)
-                }).collect()
-            });
-
-        if results.len() < chunk_items.len() {
-            log::warn!(
-                "Fused batch returned {} results for {} items — padding with originals",
-                results.len(), chunk_items.len()
-            );
-            let have = results.len();
-            for (item, px) in chunk_items[have..].iter().zip(chunk_pixels[have..].iter()) {
-                results.push((item.id.clone(), px.clone(), kf_w, kf_h,
-                               vec![0.5f32; kf_w * kf_h], kf_w, kf_h));
-            }
-        }
-
-        for (_, enhanced, _, _, depth_raw, dw, dh) in results {
-            kf_results.push((enhanced, depth_raw, dw, dh));
-        }
-    }
-    log::info!("Fused inference complete: {} frames", kf_results.len());
-
-    let _ = inf_server.shutdown();
-
-    // --- Phase 3: push to store ---
-    anyhow::ensure!(
-        kf_results.len() == kf_pixels.len(),
-        "fused inference produced {} results for {} keyframes — calibration aborted",
-        kf_results.len(), kf_pixels.len()
-    );
-    for (i, (pixels, (enhanced, depth_proxy, dw, dh))) in
-        kf_pixels.iter().zip(kf_results.iter()).enumerate()
-    {
-        let depth = InferenceServer::upscale_depth(depth_proxy, *dw, *dh, kf_w, kf_h);
-        store.push(pixels, enhanced, &depth, kf_w, kf_h)
-            .with_context(|| format!("failed to page frame {i} to store"))?;
-    }
-
-    store.seal().context("failed to seal calibration store")?;
-
-    // --- Pass 1: reservoir-sample depths → adaptive zone boundaries ---
-    // Avoids allocating all depth values (would be ~2 GB for 1000 frames).
-    const RESERVOIR_CAP: usize = 1_000_000;
-    let mut reservoir: Vec<f32> = Vec::with_capacity(RESERVOIR_CAP);
-    let mut total_seen: u64 = 0;
-    let mut rng: u64 = 0x853c49e6748fea9b_u64; // xorshift64
-
-    for i in 0..store.len() {
-        for d in store.depth_bytes(i).chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        {
-            total_seen += 1;
-            if reservoir.len() < RESERVOIR_CAP {
-                reservoir.push(d);
-            } else {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                let j = (rng % total_seen) as usize;
-                if j < RESERVOIR_CAP {
-                    reservoir[j] = d;
-                }
-            }
-        }
-    }
-
-    let zone_boundaries = adaptive_zone_boundaries(&reservoir, N_DEPTH_ZONES);
-    drop(reservoir);
-
-    // --- Pass 2: stream frames → build LUT (O(LUT_SIZE³) RAM for accumulators) ---
-    let mut lut_builder = StreamingLutBuilder::new(zone_boundaries);
-    for i in 0..store.len() {
-        let (w, h) = store.dims(i);
-        let (pixels_u8, target_u8) = store.pixtar_slices(i);
-        let depth = store.read_depth(i);
-        let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
-            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
-            .collect();
-        let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
-            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
-            .collect();
-        let importance = compute_importance(&depth, w, h);
-        lut_builder.add_frame(&original, &target, &depth, &importance);
-    }
-    let depth_luts = lut_builder.finish();
-
-    // --- Pass 3: stream frames → HSL corrections (LUT must be complete first) ---
-    // pixtar.bin is still hot in the OS page cache from pass 2.
-    let n_quals = HSL_QUALIFIERS.len();
-    let mut h_offset_acc    = vec![0.0_f64; n_quals];
-    let mut s_ratio_acc     = vec![0.0_f64; n_quals];
-    let mut v_offset_acc    = vec![0.0_f64; n_quals];
-    let mut active_count    = vec![0_usize;  n_quals];
-    let mut total_weight_acc = vec![0.0_f64; n_quals];
-
-    for i in 0..store.len() {
-        let (pixels_u8, target_u8) = store.pixtar_slices(i);
-        let depth = store.read_depth(i);
-        let original: Vec<[f32; 3]> = pixels_u8.chunks_exact(3)
-            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
-            .collect();
-        let target: Vec<[f32; 3]> = target_u8.chunks_exact(3)
-            .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
-            .collect();
-
-        let lut_output = apply_depth_luts(&original, &depth, &depth_luts);
-        let corrs = derive_hsl_corrections(&lut_output, &target);
-
-        for (qi, corr) in corrs.0.iter().enumerate() {
-            if corr.weight >= MIN_WEIGHT {
-                let w = corr.weight as f64;
-                h_offset_acc[qi]     += corr.h_offset as f64 * w;
-                s_ratio_acc[qi]      += corr.s_ratio  as f64 * w;
-                v_offset_acc[qi]     += corr.v_offset as f64 * w;
-                active_count[qi]     += 1;
-                total_weight_acc[qi] += w;
-            }
-        }
-    }
-
-    let mut avg_corrections: Vec<QualifierCorrection> = Vec::with_capacity(n_quals);
-    for qi in 0..n_quals {
-        let qual = &HSL_QUALIFIERS[qi];
-        if active_count[qi] > 0 {
-            let tw = total_weight_acc[qi];
-            avg_corrections.push(QualifierCorrection {
-                h_center: qual.h_center,
-                h_width:  qual.h_width,
-                h_offset: (h_offset_acc[qi] / tw) as f32,
-                s_ratio:  (s_ratio_acc[qi]  / tw) as f32,
-                v_offset: (v_offset_acc[qi] / tw) as f32,
-                weight:   tw as f32,
-            });
-        } else {
-            avg_corrections.push(QualifierCorrection {
-                h_center: qual.h_center,
-                h_width:  qual.h_width,
-                h_offset: 0.0,
-                s_ratio:  1.0,
-                v_offset: 0.0,
-                weight:   0.0,
-            });
-        }
-    }
-
-    Ok(_Calibration::new(depth_luts, HslCorrections(avg_corrections), n_kf))
-}
-
 fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
     InferenceConfig {
         python_exe: args.python.clone(),
@@ -758,35 +716,6 @@ fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn frame_mse_identical_is_zero() {
-        let a: Vec<u8> = vec![100, 150, 200, 50, 75, 125];
-        assert_eq!(frame_mse(&a, &a), 0.0);
-    }
-
-    #[test]
-    fn frame_mse_empty_is_zero() {
-        assert_eq!(frame_mse(&[], &[]), 0.0);
-    }
-
-    #[test]
-    fn frame_mse_opposite_is_one() {
-        let a: Vec<u8> = vec![0, 0, 0];
-        let b: Vec<u8> = vec![255, 255, 255];
-        let mse = frame_mse(&a, &b);
-        assert!((mse - 1.0).abs() < 1e-5, "expected ~1.0, got {mse}");
-    }
-
-    #[test]
-    fn frame_mse_known_value() {
-        // All pixels differ by 1 → MSE = 1/(255²) ≈ 0.0000154
-        let a: Vec<u8> = vec![100, 100, 100];
-        let b: Vec<u8> = vec![101, 101, 101];
-        let mse = frame_mse(&a, &b);
-        let expected = 1.0 / (255.0 * 255.0);
-        assert!((mse as f64 - expected).abs() < 1e-8, "expected {expected}, got {mse}");
-    }
 
     #[test]
     fn lerp_depth_at_zero() {
