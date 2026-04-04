@@ -680,7 +680,6 @@ impl Drop for PagedCalibrationStore {
     }
 }
 
-
 fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
     InferenceConfig {
         python_exe: args.python.clone(),
