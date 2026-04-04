@@ -16,9 +16,6 @@ use super::map_cudarc_error;
 /// Bump to 129 if 10-bit empirical testing reveals banding.
 pub const COMBINED_LUT_GRID: usize = 97;
 
-/// Maximum depth zones supported by the texture array.
-pub const MAX_ZONES: usize = 8;
-
 /// Embedded PTX for the GPU LUT build kernel.
 const BUILD_COMBINED_LUT_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/build_combined_lut.ptx"));
@@ -67,7 +64,6 @@ impl CombinedLut {
         if n_zones == 0 {
             return Err(GpuError::InvalidInput("n_zones must be >= 1".into()));
         }
-        let n_zones = n_zones.min(MAX_ZONES);
         let n = COMBINED_LUT_GRID;
         let lut_size = calibration.depth_luts.luts[0].size;
 

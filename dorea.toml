@@ -1,0 +1,30 @@
+# dorea.toml — local config for dorea pipeline
+# CLI flags always override values here.
+# Copy to ~/.config/dorea/config.toml for a user-level default.
+
+[models]
+python          = "/opt/dorea-venv/bin/python"
+raune_weights   = "/workspaces/dorea-workspace/working/sea_thru_poc/models/RAUNE-Net/pretrained/RAUNENet/test/weights_95.pth"
+raune_models_dir = "/workspaces/dorea-workspace/working/sea_thru_poc"
+depth_model     = "/workspaces/dorea-workspace/models/depth_anything_v2_small"
+
+[inference]
+proxy_size = 518              # long-edge pixels for RAUNE + depth proxy decode
+# device = "cuda"             # uncomment to force cpu/cuda; default: auto-detect
+
+[grade]
+warmth               = 1.0   # [0.0–2.0]
+strength             = 0.8   # LUT/HSL blend [0.0–1.0]
+contrast             = 1.0   # ambiance contrast [0.0–1.0]
+depth_skip_threshold = 0.005 # MSE keyframe threshold (lower = more keyframes)
+depth_max_interval   = 12    # max frames between forced keyframes
+fused_batch_size     = 16    # frames per RAUNE+depth inference batch
+depth_zones          = 8    # adaptive depth zones for calibration LUT
+
+[maxine]
+upscale_factor     = 2       # SR factor: 2, 3, or 4 (used when SR is re-enabled)
+artifact_reduction = true    # artifact reduction before upscale
+
+[preview]
+frames = 8                   # contact sheet sample count [1–20]
+# warmth/strength/contrast inherit from [grade] if unset here
