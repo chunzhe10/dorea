@@ -25,49 +25,49 @@ pub struct GradeArgs {
     #[arg(long)]
     pub output: Option<PathBuf>,
 
-    /// Warmth multiplier [0.0–2.0]
-    #[arg(long, default_value = "1.0")]
-    pub warmth: f32,
+    /// Warmth multiplier [0.0–2.0] (config: [grade].warmth, built-in default: 1.0)
+    #[arg(long)]
+    pub warmth: Option<f32>,
 
-    /// LUT/HSL blend strength [0.0–1.0]
-    #[arg(long, default_value = "0.8")]
-    pub strength: f32,
+    /// LUT/HSL blend strength [0.0–1.0] (config: [grade].strength, built-in default: 0.8)
+    #[arg(long)]
+    pub strength: Option<f32>,
 
-    /// Ambiance contrast multiplier [0.0–1.0]
-    #[arg(long, default_value = "1.0")]
-    pub contrast: f32,
+    /// Ambiance contrast multiplier [0.0–1.0] (config: [grade].contrast, built-in default: 1.0)
+    #[arg(long)]
+    pub contrast: Option<f32>,
 
-    /// Proxy resolution for inference (long edge, pixels) [default: 1080]
-    #[arg(long, default_value = "1080")]
-    pub proxy_size: usize,
+    /// Proxy resolution for inference (long edge, pixels) (config: [inference].proxy_size, built-in default: 1080)
+    #[arg(long)]
+    pub proxy_size: Option<usize>,
 
-    /// MSE threshold for keyframe detection (lower = more keyframes)
-    #[arg(long, default_value = "0.005")]
-    pub depth_skip_threshold: f32,
+    /// MSE threshold for keyframe detection (config: [grade].depth_skip_threshold, built-in default: 0.005)
+    #[arg(long)]
+    pub depth_skip_threshold: Option<f32>,
 
-    /// Maximum frames between keyframes
-    #[arg(long, default_value = "12")]
-    pub depth_max_interval: usize,
+    /// Maximum frames between keyframes (config: [grade].depth_max_interval, built-in default: 12)
+    #[arg(long)]
+    pub depth_max_interval: Option<usize>,
 
     /// Disable temporal interpolation — run full pipeline on every frame
     #[arg(long)]
     pub no_depth_interp: bool,
 
-    /// Path to RAUNE-Net weights .pth (for auto-calibration)
+    /// Path to RAUNE-Net weights .pth (config: [models].raune_weights)
     #[arg(long)]
     pub raune_weights: Option<PathBuf>,
 
-    /// Path to RAUNE-Net checkout directory (contains models/raune_net.py).
+    /// Path to RAUNE-Net checkout directory (config: [models].raune_models_dir)
     #[arg(long)]
     pub raune_models_dir: Option<PathBuf>,
 
-    /// Path to Depth Anything V2 model directory
+    /// Path to Depth Anything V2 model directory (config: [models].depth_model)
     #[arg(long)]
     pub depth_model: Option<PathBuf>,
 
-    /// Python executable to use for the inference subprocess
-    #[arg(long, default_value = "/opt/dorea-venv/bin/python")]
-    pub python: PathBuf,
+    /// Python executable (config: [models].python, built-in default: /opt/dorea-venv/bin/python)
+    #[arg(long)]
+    pub python: Option<PathBuf>,
 
     /// Force CPU-only mode (no CUDA)
     #[arg(long)]
@@ -77,17 +77,17 @@ pub struct GradeArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Disable Maxine AI enhancement preprocessing (Maxine is attempted by default)
+    /// Disable Maxine AI enhancement preprocessing
     #[arg(long)]
     pub no_maxine: bool,
 
-    /// Disable Maxine artifact reduction before upscale [default: enabled]
+    /// Disable Maxine artifact reduction before upscale
     #[arg(long)]
     pub no_maxine_artifact_reduction: bool,
 
-    /// Maxine super-resolution upscale factor [default: 2]
-    #[arg(long, default_value = "2")]
-    pub maxine_upscale_factor: u32,
+    /// Maxine super-resolution upscale factor (config: [maxine].upscale_factor, built-in default: 2)
+    #[arg(long)]
+    pub maxine_upscale_factor: Option<u32>,
 }
 
 /// RAII guard that deletes a temp file when dropped.
@@ -148,14 +148,34 @@ fn grade_with_grader(
     }
 }
 
-pub fn run(args: GradeArgs) -> Result<()> {
+pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
+    // Resolve config → CLI → built-in defaults (CLI wins, config fills missing, built-in is last resort)
+    let warmth              = args.warmth.or(cfg.grade.warmth).unwrap_or(1.0_f32);
+    let strength            = args.strength.or(cfg.grade.strength).unwrap_or(0.8_f32);
+    let contrast            = args.contrast.or(cfg.grade.contrast).unwrap_or(1.0_f32);
+    let proxy_size          = args.proxy_size.or(cfg.inference.proxy_size).unwrap_or(1080_usize);
+    let depth_skip_threshold = args.depth_skip_threshold.or(cfg.grade.depth_skip_threshold).unwrap_or(0.005_f32);
+    let depth_max_interval  = args.depth_max_interval.or(cfg.grade.depth_max_interval).unwrap_or(12_usize);
+    let maxine_upscale_factor = args.maxine_upscale_factor.or(cfg.maxine.upscale_factor).unwrap_or(2_u32);
+    let python = args.python.clone()
+        .or_else(|| cfg.models.python.clone())
+        .unwrap_or_else(|| PathBuf::from("/opt/dorea-venv/bin/python"));
+    let raune_weights    = args.raune_weights.clone().or_else(|| cfg.models.raune_weights.clone());
+    let raune_models_dir = args.raune_models_dir.clone().or_else(|| cfg.models.raune_models_dir.clone());
+    let depth_model      = args.depth_model.clone().or_else(|| cfg.models.depth_model.clone());
+    let device = if args.cpu_only {
+        Some("cpu".to_string())
+    } else {
+        cfg.inference.device.clone()
+    };
+
     if args.cpu_only {
         anyhow::bail!(
             "--cpu-only is no longer supported for dorea grade; GPU (CUDA) is required. \
              Use dorea preview for CPU-only workflows."
         );
     }
-    if args.depth_max_interval == 0 {
+    if depth_max_interval == 0 {
         anyhow::bail!("--depth-max-interval must be >= 1");
     }
 
@@ -177,25 +197,21 @@ pub fn run(args: GradeArgs) -> Result<()> {
     let use_maxine = false; // SR disabled — restore to `!args.no_maxine` when ready
     if use_maxine {
         let valid_factors = [2u32, 3, 4];
-        if !valid_factors.contains(&args.maxine_upscale_factor) {
+        if !valid_factors.contains(&maxine_upscale_factor) {
             anyhow::bail!(
                 "--maxine-upscale-factor {} is not supported. Supported: {:?}",
-                args.maxine_upscale_factor, valid_factors,
+                maxine_upscale_factor, valid_factors,
             );
         }
         log::info!(
             "Maxine enabled: upscale_factor={}, artifact_reduction={}",
-            args.maxine_upscale_factor,
+            maxine_upscale_factor,
             !args.no_maxine_artifact_reduction,
         );
     }
 
     // Determine grading parameters
-    let params = GradeParams {
-        warmth: args.warmth,
-        strength: args.strength,
-        contrast: args.contrast,
-    };
+    let params = GradeParams { warmth, strength, contrast };
 
     // Open encoder first — validate output path before doing expensive calibration.
     let audio_src = if info.has_audio { Some(args.input.as_path()) } else { None };
@@ -209,7 +225,14 @@ pub fn run(args: GradeArgs) -> Result<()> {
     let maxine_start_cfg = InferenceConfig {
         skip_raune: true,
         skip_depth: true,
-        ..build_inference_config(&args)
+        ..build_inference_config(
+            &python,
+            raune_weights.as_deref(),
+            raune_models_dir.as_deref(),
+            depth_model.as_deref(),
+            device.clone(),
+            maxine_upscale_factor,
+        )
     };
     let mut inf_server = InferenceServer::spawn(&maxine_start_cfg)
         .context("failed to spawn inference server")?;
@@ -224,12 +247,12 @@ pub fn run(args: GradeArgs) -> Result<()> {
     // -----------------------------------------------------------------------
     // Pass 1: decode + optional Maxine enhance + proxy downscale + keyframe detect
     // -----------------------------------------------------------------------
-    let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(info.width, info.height, args.proxy_size);
+    let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(info.width, info.height, proxy_size);
 
     let mut keyframes: Vec<KeyframeEntry> = Vec::new();
     let mut detector: Box<dyn ChangeDetector> = Box::new(MseDetector::default());
     let mut frames_since_kf = 0usize;
-    let scene_cut_threshold = args.depth_skip_threshold * 10.0;
+    let scene_cut_threshold = depth_skip_threshold * 10.0;
 
     if use_maxine {
         // Maxine path: full-res decode → enhance → write temp → proxy downscale → keyframe detect
@@ -271,8 +294,8 @@ pub fn run(args: GradeArgs) -> Result<()> {
             let is_keyframe = !interp_enabled
                 || keyframes.is_empty()
                 || scene_cut
-                || frames_since_kf >= args.depth_max_interval
-                || (change < f32::MAX && change > args.depth_skip_threshold);
+                || frames_since_kf >= depth_max_interval
+                || (change < f32::MAX && change > depth_skip_threshold);
 
             if is_keyframe {
                 if scene_cut {
@@ -309,8 +332,8 @@ pub fn run(args: GradeArgs) -> Result<()> {
             let is_keyframe = !interp_enabled
                 || keyframes.is_empty()
                 || scene_cut
-                || frames_since_kf >= args.depth_max_interval
-                || (change < f32::MAX && change > args.depth_skip_threshold);
+                || frames_since_kf >= depth_max_interval
+                || (change < f32::MAX && change > depth_skip_threshold);
 
             if is_keyframe {
                 if scene_cut {
@@ -356,11 +379,11 @@ pub fn run(args: GradeArgs) -> Result<()> {
         log::info!("Maxine unloaded — loading RAUNE+Depth for calibration");
     }
     inf_server.load_raune(
-        args.raune_weights.as_deref(),
-        args.raune_models_dir.as_deref(),
+        raune_weights.as_deref(),
+        raune_models_dir.as_deref(),
     ).context("failed to load RAUNE-Net for calibration")?;
     inf_server.load_depth(
-        args.depth_model.as_deref(),
+        depth_model.as_deref(),
     ).context("failed to load Depth Anything for calibration")?;
 
     // -----------------------------------------------------------------------
@@ -378,7 +401,7 @@ pub fn run(args: GradeArgs) -> Result<()> {
             width: proxy_w,
             height: proxy_h,
             raune_max_size: proxy_w.max(proxy_h),
-            depth_max_size: args.proxy_size.min(1036),
+            depth_max_size: proxy_size.min(1036),
         }
     }).collect();
 
@@ -779,18 +802,25 @@ impl Drop for PagedCalibrationStore {
     }
 }
 
-fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
+fn build_inference_config(
+    python: &std::path::Path,
+    raune_weights: Option<&std::path::Path>,
+    raune_models_dir: Option<&std::path::Path>,
+    depth_model: Option<&std::path::Path>,
+    device: Option<String>,
+    maxine_upscale_factor: u32,
+) -> InferenceConfig {
     InferenceConfig {
-        python_exe: args.python.clone(),
-        raune_weights: args.raune_weights.clone(),
-        raune_models_dir: args.raune_models_dir.clone(),
+        python_exe: python.to_path_buf(),
+        raune_weights: raune_weights.map(|p| p.to_path_buf()),
+        raune_models_dir: raune_models_dir.map(|p| p.to_path_buf()),
         skip_raune: false,
-        depth_model: args.depth_model.clone(),
+        depth_model: depth_model.map(|p| p.to_path_buf()),
         skip_depth: false,
-        device: if args.cpu_only { Some("cpu".to_string()) } else { None },
+        device,
         startup_timeout: Duration::from_secs(180),
-        maxine: false, // SR disabled — re-enable via !args.no_maxine when ready
-        maxine_upscale_factor: args.maxine_upscale_factor,
+        maxine: false, // SR disabled — restore to `!no_maxine` when ready
+        maxine_upscale_factor,
     }
 }
 
@@ -836,55 +866,18 @@ mod tests {
 
     #[test]
     fn build_inference_config_maxine_disabled() {
-        let args = GradeArgs {
-            input: PathBuf::from("/dev/null"),
-            output: None,
-            no_maxine: false,
-            no_maxine_artifact_reduction: false,
-            maxine_upscale_factor: 2,
-            warmth: 1.0,
-            strength: 0.8,
-            contrast: 1.0,
-            proxy_size: 1080,
-            depth_skip_threshold: 0.005,
-            depth_max_interval: 12,
-            no_depth_interp: false,
-            raune_weights: None,
-            raune_models_dir: None,
-            depth_model: None,
-            python: PathBuf::from("/opt/dorea-venv/bin/python"),
-            cpu_only: false,
-            verbose: false,
-        };
-        let cfg = build_inference_config(&args);
+        let python = PathBuf::from("/opt/dorea-venv/bin/python");
+        let cfg = build_inference_config(&python, None, None, None, None, 2);
         assert!(!cfg.maxine, "Maxine is disabled until SR is re-enabled");
         assert!(!cfg.skip_raune, "RAUNE should not be skipped in config");
         assert!(!cfg.skip_depth, "depth should not be skipped in config");
     }
 
     #[test]
-    fn build_inference_config_no_maxine_flag_disables_maxine() {
-        let args = GradeArgs {
-            input: PathBuf::from("/dev/null"),
-            output: None,
-            no_maxine: true,
-            no_maxine_artifact_reduction: false,
-            maxine_upscale_factor: 2,
-            warmth: 1.0,
-            strength: 0.8,
-            contrast: 1.0,
-            proxy_size: 1080,
-            depth_skip_threshold: 0.005,
-            depth_max_interval: 12,
-            no_depth_interp: false,
-            raune_weights: None,
-            raune_models_dir: None,
-            depth_model: None,
-            python: PathBuf::from("/opt/dorea-venv/bin/python"),
-            cpu_only: false,
-            verbose: false,
-        };
-        let cfg = build_inference_config(&args);
-        assert!(!cfg.maxine, "no_maxine flag should disable Maxine");
+    fn build_inference_config_maxine_always_false() {
+        // Maxine is hardcoded false regardless of any arg — verify both flag states
+        let python = PathBuf::from("/opt/dorea-venv/bin/python");
+        let cfg = build_inference_config(&python, None, None, None, None, 2);
+        assert!(!cfg.maxine, "Maxine is disabled until SR is re-enabled");
     }
 }

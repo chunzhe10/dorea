@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use dorea_cli::config::DoreaConfig;
 
 #[derive(Parser)]
 #[command(name = "dorea", about = "Automated underwater video color grading pipeline")]
@@ -36,9 +37,11 @@ fn main() -> anyhow::Result<()> {
         })
         .init();
 
+    let config = DoreaConfig::load();
+
     match cli.command {
-        Command::Calibrate(args) => dorea_cli::calibrate::run(args),
-        Command::Grade(args) => dorea_cli::grade::run(args),
-        Command::Preview(args) => dorea_cli::preview::run(args),
+        Command::Calibrate(args) => dorea_cli::calibrate::run(args, &config),
+        Command::Grade(args) => dorea_cli::grade::run(args, &config),
+        Command::Preview(args) => dorea_cli::preview::run(args, &config),
     }
 }

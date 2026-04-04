@@ -155,9 +155,9 @@ pub struct CalibrateArgs {
     #[arg(long)]
     pub depth_model: Option<PathBuf>,
 
-    /// Python executable for the inference subprocess
-    #[arg(long, default_value = "/opt/dorea-venv/bin/python")]
-    pub python: PathBuf,
+    /// Python executable (config: [models].python, built-in default: /opt/dorea-venv/bin/python)
+    #[arg(long)]
+    pub python: Option<PathBuf>,
 }
 
 /// Supported input encodings for keyframe images.
@@ -175,7 +175,7 @@ fn parse_input_encoding(s: &str) -> std::result::Result<InputEncoding, String> {
     }
 }
 
-pub fn run(args: CalibrateArgs) -> Result<()> {
+pub fn run(args: CalibrateArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     // Logging is already initialised by main() based on the verbose flag.
     log::info!("dorea calibrate — scanning keyframes in {:?}", args.keyframes);
 
@@ -184,14 +184,22 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     let mut inf_server: Option<InferenceServer> = None;
 
     if need_inference {
+        let python = args.python.clone()
+            .or_else(|| cfg.models.python.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from("/opt/dorea-venv/bin/python"));
+        let raune_weights = args.raune_weights.clone().or_else(|| cfg.models.raune_weights.clone());
+        let raune_models_dir = args.raune_models_dir.clone().or_else(|| cfg.models.raune_models_dir.clone());
+        let depth_model = args.depth_model.clone().or_else(|| cfg.models.depth_model.clone());
+        let device = if args.cpu_only { Some("cpu".to_string()) } else { cfg.inference.device.clone() };
+
         log::info!("Spawning inference subprocess for auto-generation of missing inputs...");
         let cfg = InferenceConfig {
-            python_exe: args.python.clone(),
-            raune_weights: args.raune_weights.clone(),
-            raune_models_dir: args.raune_models_dir.clone(),
+            python_exe: python,
+            raune_weights,
+            raune_models_dir,
             skip_raune: false,
-            depth_model: args.depth_model.clone(),
-            device: if args.cpu_only { Some("cpu".to_string()) } else { None },
+            depth_model,
+            device,
             startup_timeout: Duration::from_secs(180),
             maxine: false,
             maxine_upscale_factor: 2,

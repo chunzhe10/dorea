@@ -25,38 +25,37 @@ pub struct PreviewArgs {
     #[arg(long, default_value = "preview.png")]
     pub output: PathBuf,
 
-    /// Number of frames to sample [default: 8]
-    #[arg(long, default_value = "8")]
-    pub frames: usize,
+    /// Number of frames to sample (config: [preview].frames, built-in default: 8)
+    #[arg(long)]
+    pub frames: Option<usize>,
 
-    /// Warmth multiplier
-    #[arg(long, default_value = "1.0")]
-    pub warmth: f32,
+    /// Warmth multiplier (config: [preview].warmth or [grade].warmth, built-in default: 1.0)
+    #[arg(long)]
+    pub warmth: Option<f32>,
 
-    /// Blend strength
-    #[arg(long, default_value = "0.8")]
-    pub strength: f32,
+    /// Blend strength (config: [preview].strength or [grade].strength, built-in default: 0.8)
+    #[arg(long)]
+    pub strength: Option<f32>,
 
-    /// Contrast multiplier
-    #[arg(long, default_value = "1.0")]
-    pub contrast: f32,
+    /// Contrast multiplier (config: [preview].contrast or [grade].contrast, built-in default: 1.0)
+    #[arg(long)]
+    pub contrast: Option<f32>,
 
-    /// Path to RAUNE-Net weights .pth
+    /// Path to RAUNE-Net weights .pth (config: [models].raune_weights)
     #[arg(long)]
     pub raune_weights: Option<PathBuf>,
 
-    /// Path to RAUNE-Net checkout directory (contains models/raune_net.py).
-    /// Also accepts the parent sea_thru_poc dir — auto-descends to RAUNE-Net/.
+    /// Path to RAUNE-Net checkout directory (config: [models].raune_models_dir)
     #[arg(long)]
     pub raune_models_dir: Option<PathBuf>,
 
-    /// Path to Depth Anything V2 model directory
+    /// Path to Depth Anything V2 model directory (config: [models].depth_model)
     #[arg(long)]
     pub depth_model: Option<PathBuf>,
 
-    /// Python executable
-    #[arg(long, default_value = "/opt/dorea-venv/bin/python")]
-    pub python: PathBuf,
+    /// Python executable (config: [models].python, built-in default: /opt/dorea-venv/bin/python)
+    #[arg(long)]
+    pub python: Option<PathBuf>,
 
     /// Force CPU-only mode
     #[arg(long)]
@@ -67,19 +66,27 @@ pub struct PreviewArgs {
     pub verbose: bool,
 }
 
-pub fn run(args: PreviewArgs) -> Result<()> {
+pub fn run(args: PreviewArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
+    let frames   = args.frames.or(cfg.preview.frames).unwrap_or(8_usize);
+    let warmth   = args.warmth.or(cfg.preview.warmth).or(cfg.grade.warmth).unwrap_or(1.0_f32);
+    let strength = args.strength.or(cfg.preview.strength).or(cfg.grade.strength).unwrap_or(0.8_f32);
+    let contrast = args.contrast.or(cfg.preview.contrast).or(cfg.grade.contrast).unwrap_or(1.0_f32);
+    let python = args.python.clone()
+        .or_else(|| cfg.models.python.clone())
+        .unwrap_or_else(|| PathBuf::from("/opt/dorea-venv/bin/python"));
+    let raune_weights    = args.raune_weights.clone().or_else(|| cfg.models.raune_weights.clone());
+    let raune_models_dir = args.raune_models_dir.clone().or_else(|| cfg.models.raune_models_dir.clone());
+    let depth_model      = args.depth_model.clone().or_else(|| cfg.models.depth_model.clone());
+    let device = if args.cpu_only { Some("cpu".to_string()) } else { cfg.inference.device.clone() };
+
     log::info!("Generating preview for {}", args.input.display());
 
     let info = ffmpeg::probe(&args.input)
         .context("ffprobe failed")?;
     log::info!("Input: {}x{} @ {:.2}fps, {:.1}s", info.width, info.height, info.fps, info.duration_secs);
 
-    let n = args.frames.clamp(1, 20);
-    let params = GradeParams {
-        warmth: args.warmth,
-        strength: args.strength,
-        contrast: args.contrast,
-    };
+    let n = frames.clamp(1, 20);
+    let params = GradeParams { warmth, strength, contrast };
 
     // Decide preview tile size (max 512px wide per tile)
     let tile_w = info.width.min(512);
@@ -94,12 +101,12 @@ pub fn run(args: PreviewArgs) -> Result<()> {
 
     // Spawn inference server
     let inf_cfg = InferenceConfig {
-        python_exe: args.python.clone(),
-        raune_weights: args.raune_weights.clone(),
-        raune_models_dir: args.raune_models_dir.clone(),
+        python_exe: python,
+        raune_weights,
+        raune_models_dir,
         skip_raune: false,
-        depth_model: args.depth_model.clone(),
-        device: if args.cpu_only { Some("cpu".to_string()) } else { None },
+        depth_model,
+        device,
         startup_timeout: Duration::from_secs(180),
         maxine: false,
         maxine_upscale_factor: 2,
