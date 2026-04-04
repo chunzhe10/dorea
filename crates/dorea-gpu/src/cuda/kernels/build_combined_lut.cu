@@ -2,30 +2,32 @@
  * build_combined_lut.cu — GPU kernel to precompute the combined LUT.
  *
  * 1D grid: one thread per (zone × grid_point) pair.
- * Thread count = n_zones × N³  where N = COMBINED_LUT_GRID (97).
+ * Thread count = runtime_n_zones × N³  where N = COMBINED_LUT_GRID (97).
  *
  * Each thread:
- *   1. Decodes flat index → (zone, ri, gi, bi)
+ *   1. Decodes flat index → (zone, ri, gi, bi) using RUNTIME zones for output indexing
  *   2. Computes (r,g,b) = (ri/(N-1), gi/(N-1), bi/(N-1))
- *   3. Calls grade_pixel_device() at depth = zone center
+ *   3. Calls grade_pixel_device() at depth = runtime zone center, using BASE LUT for lookup
  *   4. Writes float4(r', g', b', 0.0) to output buffer
  *
- * Output layout: [n_zones][N][N][N] float4
+ * Output layout: [runtime_n_zones][N][N][N] float4
  *   Stride: zone * N*N*N * 4 floats
  *
  * Parameters:
- *   output         — float4 [n_zones × N³] device buffer (pre-allocated)
- *   luts           — float [n_zones × lut_size³ × 3]
- *   zone_boundaries— float [n_zones + 1]
- *   h_offsets      — float [6]
- *   s_ratios       — float [6]
- *   v_offsets      — float [6]
- *   weights        — float [6]
+ *   output                 — float4 [runtime_n_zones × N³] device buffer (pre-allocated)
+ *   base_luts              — float [base_n_zones × lut_size³ × 3]  (32-zone calibration LUT)
+ *   base_zone_boundaries   — float [base_n_zones + 1]               (32-zone boundaries)
+ *   base_n_zones           — int                                     (32)
+ *   runtime_zone_boundaries— float [runtime_n_zones + 1]            (8 per-keyframe zones)
+ *   runtime_n_zones        — int                                     (8)
+ *   h_offsets              — float [6]
+ *   s_ratios               — float [6]
+ *   v_offsets              — float [6]
+ *   weights                — float [6]
  *   warmth/strength/contrast — scalar GradeParams
- *   grid_size      — N (= 97)
- *   lut_size       — zone LUT grid size (e.g. 17 or 33)
- *   n_zones        — number of depth zones
- *   total_threads  — n_zones * N^3 (to guard OOB)
+ *   grid_size              — N (= 97)
+ *   lut_size               — base LUT grid size (e.g. 33)
+ *   total_threads          — runtime_n_zones * N^3 (to guard OOB)
  */
 
 #include <cuda_runtime.h>
@@ -34,14 +36,17 @@
 extern "C"
 __global__ void build_combined_lut_kernel(
     float4* __restrict__ output,
-    const float* __restrict__ luts,
-    const float* __restrict__ zone_boundaries,
+    const float* __restrict__ base_luts,
+    const float* __restrict__ base_zone_boundaries,
+    int base_n_zones,
+    const float* __restrict__ runtime_zone_boundaries,
+    int runtime_n_zones,
     const float* __restrict__ h_offsets,
     const float* __restrict__ s_ratios,
     const float* __restrict__ v_offsets,
     const float* __restrict__ weights,
     float warmth, float strength, float contrast,
-    int grid_size, int lut_size, int n_zones,
+    int grid_size, int lut_size,
     int total_threads
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -64,15 +69,16 @@ __global__ void build_combined_lut_kernel(
     float g = (float)gi / (float)(N - 1);
     float b = (float)bi / (float)(N - 1);
 
-    // Depth = center of this zone
-    float z_lo = zone_boundaries[zone];
-    float z_hi = zone_boundaries[zone + 1];
+    // Depth = center of this RUNTIME zone (8 adaptive per-keyframe zones)
+    float z_lo = runtime_zone_boundaries[zone];
+    float z_hi = runtime_zone_boundaries[zone + 1];
     float depth = 0.5f * (z_lo + z_hi);
 
+    // grade_pixel_device reads from the 32-zone BASE LUT for color-science lookup
     float3 graded = grade_pixel_device(
         r, g, b, depth,
-        luts, zone_boundaries,
-        lut_size, n_zones,
+        base_luts, base_zone_boundaries,
+        lut_size, base_n_zones,
         h_offsets, s_ratios, v_offsets, weights,
         warmth, strength, contrast
     );
