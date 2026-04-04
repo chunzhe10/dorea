@@ -73,6 +73,19 @@ pub struct DepthBatchItem {
     pub max_size: usize,
 }
 
+/// A single image for the fused raune_depth_batch IPC call.
+pub struct RauneDepthBatchItem {
+    pub id: String,
+    /// Raw RGB24 pixels, row-major.
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    /// Max long-edge for RAUNE resize (pixels).
+    pub raune_max_size: usize,
+    /// Max long-edge for depth resize (pixels, must be ≤518 for Depth Anything).
+    pub depth_max_size: usize,
+}
+
 /// Active connection to the Python inference subprocess.
 pub struct InferenceServer {
     child: Child,
@@ -379,6 +392,85 @@ impl InferenceServer {
             out.push((id, depth, w, h));
         }
 
+        Ok(out)
+    }
+
+    /// Run RAUNE then Depth Anything on a batch, with the enhanced tensor staying on GPU
+    /// between the two models. Returns enhanced RGB and depth map for each item.
+    ///
+    /// Returns `Vec<(id, enhanced_rgb_u8, enh_w, enh_h, depth_f32, depth_w, depth_h)>`.
+    #[allow(clippy::type_complexity)]
+    pub fn run_raune_depth_batch(
+        &mut self,
+        items: &[RauneDepthBatchItem],
+    ) -> Result<Vec<(String, Vec<u8>, usize, usize, Vec<f32>, usize, usize)>, InferenceError> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let json_items: Vec<serde_json::Value> = items.iter().map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "image_b64": B64.encode(&item.pixels),
+                "format": "raw_rgb",
+                "width": item.width,
+                "height": item.height,
+                "raune_max_size": item.raune_max_size,
+                "depth_max_size": item.depth_max_size,
+            })
+        }).collect();
+
+        let req = serde_json::json!({ "type": "raune_depth_batch", "items": json_items });
+        self.send_line(&req.to_string())?;
+
+        let resp = self.recv_line()?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| InferenceError::Ipc(format!("raune_depth_batch parse: {e}")))?;
+
+        if v["type"].as_str() == Some("error") {
+            return Err(InferenceError::ServerError(
+                v["message"].as_str().unwrap_or("unknown").to_string(),
+            ));
+        }
+        if v["type"].as_str() != Some("raune_depth_batch_result") {
+            return Err(InferenceError::Ipc(format!("unexpected type: {resp}")));
+        }
+
+        let results = v["results"].as_array()
+            .ok_or_else(|| InferenceError::Ipc("missing results array".to_string()))?;
+
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            let id = r["id"].as_str().unwrap_or("").to_string();
+
+            // Enhanced image (PNG-encoded)
+            let enh_w = r["enhanced_width"].as_u64().unwrap_or(0) as usize;
+            let enh_h = r["enhanced_height"].as_u64().unwrap_or(0) as usize;
+            let enh_b64 = r["image_b64"].as_str()
+                .ok_or_else(|| InferenceError::Ipc(format!("missing image_b64 for {id}")))?;
+            let enh_png = B64.decode(enh_b64)
+                .map_err(|e| InferenceError::Ipc(format!("base64 enh for {id}: {e}")))?;
+            let enh_rgb = decode_png_bytes(&enh_png)?;
+
+            // Depth map (raw f32 LE)
+            let depth_w = r["depth_width"].as_u64().unwrap_or(0) as usize;
+            let depth_h = r["depth_height"].as_u64().unwrap_or(0) as usize;
+            let depth_b64 = r["depth_f32_b64"].as_str()
+                .ok_or_else(|| InferenceError::Ipc(format!("missing depth_f32_b64 for {id}")))?;
+            let raw = B64.decode(depth_b64)
+                .map_err(|e| InferenceError::Ipc(format!("base64 depth for {id}: {e}")))?;
+            if raw.len() != depth_w * depth_h * 4 {
+                return Err(InferenceError::Ipc(format!(
+                    "depth size mismatch for {id}: got {} want {}",
+                    raw.len(), depth_w * depth_h * 4
+                )));
+            }
+            let depth: Vec<f32> = raw.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+
+            out.push((id, enh_rgb, enh_w, enh_h, depth, depth_w, depth_h));
+        }
         Ok(out)
     }
 
@@ -707,6 +799,19 @@ fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raune_depth_batch_item_fields_compile() {
+        let item = RauneDepthBatchItem {
+            id: "kf0000".to_string(),
+            pixels: vec![0u8; 60 * 80 * 3],
+            width: 80,
+            height: 60,
+            raune_max_size: 80,
+            depth_max_size: 56,
+        };
+        assert_eq!(item.id, "kf0000");
+    }
 
     #[test]
     fn upscale_depth_identity() {
