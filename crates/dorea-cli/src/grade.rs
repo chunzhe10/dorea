@@ -710,6 +710,8 @@ fn build_inference_config(args: &GradeArgs) -> InferenceConfig {
         depth_model: args.depth_model.clone(),
         device: if args.cpu_only { Some("cpu".to_string()) } else { None },
         startup_timeout: Duration::from_secs(180),
+        maxine: false,
+        maxine_upscale_factor: 2,
     }
 }
 

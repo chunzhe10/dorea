@@ -45,6 +45,10 @@ pub struct InferenceConfig {
     pub device: Option<String>,
     /// Startup timeout.
     pub startup_timeout: Duration,
+    /// Enable Maxine enhancement in the inference subprocess.
+    pub maxine: bool,
+    /// Maxine super-resolution upscale factor (default 2).
+    pub maxine_upscale_factor: u32,
 }
 
 impl Default for InferenceConfig {
@@ -57,7 +61,48 @@ impl Default for InferenceConfig {
             depth_model: None,
             device: None,
             startup_timeout: Duration::from_secs(120),
+            maxine: false,
+            maxine_upscale_factor: 2,
         }
+    }
+}
+
+impl InferenceConfig {
+    /// Build the CLI argument list for the Python inference server.
+    pub fn build_args(&self) -> Vec<String> {
+        let mut args = vec!["-m".to_string(), "dorea_inference.server".to_string()];
+
+        if self.skip_raune {
+            args.push("--no-raune".to_string());
+        } else {
+            if let Some(p) = &self.raune_weights {
+                args.push("--raune-weights".to_string());
+                args.push(p.to_str().unwrap_or("").to_string());
+            }
+        }
+
+        if let Some(p) = &self.raune_models_dir {
+            args.push("--raune-models-dir".to_string());
+            args.push(p.to_str().unwrap_or("").to_string());
+        }
+
+        if let Some(p) = &self.depth_model {
+            args.push("--depth-model".to_string());
+            args.push(p.to_str().unwrap_or("").to_string());
+        }
+
+        if let Some(d) = &self.device {
+            args.push("--device".to_string());
+            args.push(d.clone());
+        }
+
+        if self.maxine {
+            args.push("--maxine".to_string());
+            args.push("--maxine-upscale-factor".to_string());
+            args.push(self.maxine_upscale_factor.to_string());
+        }
+
+        args
     }
 }
 
@@ -100,28 +145,7 @@ impl InferenceServer {
     /// Python process does not respond to the initial ping within the deadline.
     pub fn spawn(config: &InferenceConfig) -> Result<Self, InferenceError> {
         let mut cmd = Command::new(&config.python_exe);
-        cmd.args(["-m", "dorea_inference.server"]);
-
-        if config.skip_raune {
-            cmd.arg("--no-raune");
-        } else if let Some(p) = &config.raune_weights {
-            cmd.args(["--raune-weights", p.to_str().unwrap_or("")]);
-        }
-        // raune_weights = None + skip_raune = false → no args → Python uses its default path
-
-        if let Some(p) = &config.raune_models_dir {
-            cmd.args(["--raune-models-dir", p.to_str().unwrap_or("")]);
-        }
-
-        if let Some(p) = &config.depth_model {
-            cmd.args(["--depth-model", p.to_str().unwrap_or("")]);
-        }
-        // depth_model = None means "use the Python-side default path / HF fallback"
-        // do NOT pass --no-depth unless explicitly requested
-
-        if let Some(d) = &config.device {
-            cmd.args(["--device", d]);
-        }
+        cmd.args(config.build_args());
 
         // Set PYTHONPATH to the python/ dir adjacent to the target/ build directory.
         // Binary lives at <workspace>/target/{debug,release}/dorea; python/ is a sibling of target/.
@@ -847,5 +871,28 @@ mod tests {
         // Decode should work (store-mode deflate)
         let decoded = decode_png_bytes(&png).expect("decode failed");
         assert_eq!(decoded, rgb, "roundtrip mismatch");
+    }
+
+    #[test]
+    fn spawn_command_includes_maxine_flags() {
+        let config = InferenceConfig {
+            maxine: true,
+            maxine_upscale_factor: 2,
+            ..InferenceConfig::default()
+        };
+        let args = config.build_args();
+        assert!(args.contains(&"--maxine".to_string()), "missing --maxine");
+        assert!(args.contains(&"--maxine-upscale-factor".to_string()), "missing --maxine-upscale-factor");
+        assert!(args.contains(&"2".to_string()), "missing upscale factor value");
+    }
+
+    #[test]
+    fn spawn_command_omits_maxine_when_disabled() {
+        let config = InferenceConfig {
+            maxine: false,
+            ..InferenceConfig::default()
+        };
+        let args = config.build_args();
+        assert!(!args.contains(&"--maxine".to_string()), "--maxine should be absent");
     }
 }
