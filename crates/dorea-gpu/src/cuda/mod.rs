@@ -543,6 +543,9 @@ impl AdaptiveGrader {
 
         let d_pixels_in  = dev.htod_sync_copy(pixels).map_err(map_cudarc_error)?;
         let d_depth      = dev.htod_sync_copy(depth).map_err(map_cudarc_error)?;
+        // TODO(perf): texture handles and boundaries are stable between swap_textures() calls.
+        // Cache them as device slices in AdaptiveLut and update only on prepare_keyframe/swap.
+        // Current cost: 4 × ~128 bytes per frame — negligible but worth fixing in Task 7.
         let d_textures_a = dev.htod_sync_copy(self.adaptive_lut.active_textures()).map_err(map_cudarc_error)?;
         let d_bounds_a   = dev.htod_sync_copy(self.adaptive_lut.active_boundaries()).map_err(map_cudarc_error)?;
         let d_textures_b = dev.htod_sync_copy(self.adaptive_lut.inactive_textures()).map_err(map_cudarc_error)?;
