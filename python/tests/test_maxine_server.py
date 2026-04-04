@@ -65,12 +65,13 @@ def test_enhance_handler_returns_enhance_result():
     assert len(raw) == 4 * 6 * 3
 
 
-def test_enhance_handler_without_maxine_flag_errors():
-    """enhance request without --maxine should return error (no enhancer loaded)."""
+def test_enhance_without_maxine_returns_passthrough():
+    """enhance request without --maxine should return enhance_result (passthrough mode)."""
     req = _make_enhance_req(4, 6)
     responses = _run_server_with_reqs([req])  # no --maxine
-    assert responses[0]["type"] == "error"
-    assert "not loaded" in responses[0]["message"].lower() or "maxine" in responses[0]["message"].lower()
+    assert responses[0]["type"] == "enhance_result"
+    assert responses[0]["width"] == 4
+    assert responses[0]["height"] == 6
 
 
 def test_enhance_handler_passthrough_preserves_dimensions():

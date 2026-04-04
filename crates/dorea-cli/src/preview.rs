@@ -103,6 +103,7 @@ pub fn run(args: PreviewArgs) -> Result<()> {
         startup_timeout: Duration::from_secs(180),
         maxine: false,
         maxine_upscale_factor: 2,
+        skip_depth: false,
     };
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
         .context("failed to spawn inference server")?;
