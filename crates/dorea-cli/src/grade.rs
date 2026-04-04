@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use dorea_cal::Calibration;
 use dorea_gpu::{grade_frame, GradeParams};
 use dorea_video::ffmpeg::{self, FrameEncoder};
-use dorea_video::inference::{DepthBatchItem, InferenceConfig, InferenceServer};
+use dorea_video::inference::{DepthBatchItem, RauneDepthBatchItem, InferenceConfig, InferenceServer};
 
 #[cfg(feature = "cuda")]
 use dorea_gpu::cuda::CudaGrader;
@@ -114,6 +114,10 @@ fn lerp_depth(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
 
 /// Maximum number of keyframes per depth inference batch.
 const DEPTH_BATCH_SIZE: usize = 32;
+
+/// Maximum frames per fused RAUNE+depth inference batch.
+/// Calibration images are ~1024×577; 8 frames ≈ 57 MB RAUNE input on GPU.
+const FUSED_BATCH_SIZE: usize = 8;
 
 /// A keyframe collected during the proxy-decode pass.
 struct KeyframeEntry {
@@ -542,7 +546,6 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let kf_w = ((info.width as f64 * cal_scale) as usize).max(1);
     let kf_h = ((info.height as f64 * cal_scale) as usize).max(1);
 
-    // --- Collect keyframes: inference → paged store (one frame in RAM at a time) ---
     let inf_cfg = build_inference_config(args);
     let mut inf_server = InferenceServer::spawn(&inf_cfg)
         .context("failed to spawn inference server for auto-calibration")?;
@@ -550,36 +553,86 @@ fn auto_calibrate(args: &GradeArgs, info: &ffmpeg::VideoInfo) -> Result<Calibrat
     let mut store = PagedCalibrationStore::new()
         .context("failed to create paged calibration store")?;
 
+    // --- Phase 1: collect pixel buffers (N individual ffmpeg seeks — unchanged) ---
+    log::info!("Auto-calibration: extracting {n_kf} keyframes...");
+    let mut kf_pixels: Vec<Vec<u8>> = Vec::with_capacity(n_kf);
     for i in 0..n_kf {
         let ts = (i as f64 + 0.5) * safe_duration / n_kf as f64;
         let pixels = ffmpeg::extract_frame_at(&args.input, ts, kf_w, kf_h)
             .with_context(|| format!("failed to extract keyframe at {ts:.2}s"))?;
-
-        let id = format!("kf{i:04}");
-
-        let target = match inf_server.run_raune(&id, &pixels, kf_w, kf_h, kf_w) {
-            Ok((t, _, _)) => t,
-            Err(e) => {
-                log::warn!("RAUNE-Net failed for {id}: {e} — using original as target");
-                pixels.clone()
-            }
-        };
-
-        let (depth_proxy, dw, dh) = match inf_server.run_depth(&id, &pixels, kf_w, kf_h, 518) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("Depth failed for {id}: {e} — using uniform depth 0.5");
-                (vec![0.5f32; kf_w * kf_h], kf_w, kf_h)
-            }
-        };
-
-        let depth = InferenceServer::upscale_depth(&depth_proxy, dw, dh, kf_w, kf_h);
-
-        store.push(&pixels, &target, &depth, kf_w, kf_h)
-            .with_context(|| format!("failed to page frame {i} to disk"))?;
+        kf_pixels.push(pixels);
     }
+    log::info!("Collected {} keyframe pixels", kf_pixels.len());
+
+    // --- Phase 2: fused RAUNE+depth batch inference ---
+    // RAUNE output stays on GPU between models — no IPC round-trip for enhanced frames.
+    // Depth runs on RAUNE-enhanced frames for better zone boundaries.
+    log::info!(
+        "Fused RAUNE+depth inference ({} frames, batch_size={FUSED_BATCH_SIZE})...",
+        kf_pixels.len()
+    );
+
+    let fused_items: Vec<RauneDepthBatchItem> = kf_pixels.iter().enumerate().map(|(i, px)| {
+        RauneDepthBatchItem {
+            id: format!("kf{i:04}"),
+            pixels: px.clone(),
+            width: kf_w,
+            height: kf_h,
+            raune_max_size: kf_w.max(kf_h),
+            depth_max_size: 518,
+        }
+    }).collect();
+
+    // (enhanced_rgb_u8, depth_f32_raw, depth_w, depth_h) — id and enh_w/h stripped on push
+    let mut kf_results: Vec<(Vec<u8>, Vec<f32>, usize, usize)> = Vec::with_capacity(n_kf);
+
+    for (chunk_items, chunk_pixels) in fused_items
+        .chunks(FUSED_BATCH_SIZE)
+        .zip(kf_pixels.chunks(FUSED_BATCH_SIZE))
+    {
+        let mut results = inf_server.run_raune_depth_batch(chunk_items)
+            .unwrap_or_else(|e| {
+                log::warn!("Fused RAUNE+depth batch failed: {e} — using originals + uniform depth");
+                chunk_items.iter().zip(chunk_pixels.iter()).map(|(item, px)| {
+                    (item.id.clone(), px.clone(), kf_w, kf_h,
+                     vec![0.5f32; kf_w * kf_h], kf_w, kf_h)
+                }).collect()
+            });
+
+        if results.len() < chunk_items.len() {
+            log::warn!(
+                "Fused batch returned {} results for {} items — padding with originals",
+                results.len(), chunk_items.len()
+            );
+            let have = results.len();
+            for (item, px) in chunk_items[have..].iter().zip(chunk_pixels[have..].iter()) {
+                results.push((item.id.clone(), px.clone(), kf_w, kf_h,
+                               vec![0.5f32; kf_w * kf_h], kf_w, kf_h));
+            }
+        }
+
+        for (_, enhanced, _, _, depth_raw, dw, dh) in results {
+            kf_results.push((enhanced, depth_raw, dw, dh));
+        }
+    }
+    log::info!("Fused inference complete: {} frames", kf_results.len());
 
     let _ = inf_server.shutdown();
+
+    // --- Phase 3: push to store ---
+    anyhow::ensure!(
+        kf_results.len() == kf_pixels.len(),
+        "fused inference produced {} results for {} keyframes — calibration aborted",
+        kf_results.len(), kf_pixels.len()
+    );
+    for (i, (pixels, (enhanced, depth_proxy, dw, dh))) in
+        kf_pixels.iter().zip(kf_results.iter()).enumerate()
+    {
+        let depth = InferenceServer::upscale_depth(depth_proxy, *dw, *dh, kf_w, kf_h);
+        store.push(pixels, enhanced, &depth, kf_w, kf_h)
+            .with_context(|| format!("failed to page frame {i} to store"))?;
+    }
+
     store.seal().context("failed to seal calibration store")?;
 
     // --- Pass 1: reservoir-sample depths → adaptive zone boundaries ---

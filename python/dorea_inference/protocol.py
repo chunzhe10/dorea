@@ -123,6 +123,21 @@ class DepthBatchResult:
 
 
 @dataclass
+class RauneDepthBatchResult:
+    """Fused RAUNE+depth batch response.
+
+    Each result dict contains:
+      id, image_b64 (PNG, enhanced frame), enhanced_width, enhanced_height,
+      depth_f32_b64, depth_width, depth_height
+    """
+    results: list
+    type: str = "raune_depth_batch_result"
+
+    def to_dict(self) -> dict:
+        return {"type": self.type, "results": self.results}
+
+
+@dataclass
 class ErrorResponse:
     id: Optional[str]
     message: str
