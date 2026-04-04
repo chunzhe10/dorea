@@ -30,10 +30,12 @@ from .protocol import (
     DepthResult,
     DepthBatchResult,
     RauneDepthBatchResult,
+    EnhanceResult,
     ErrorResponse,
     OkResponse,
     decode_png,
     decode_raw_rgb,
+    encode_raw_rgb,
     encode_png,
 )
 
@@ -49,6 +51,12 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument("--device", default=None, choices=["cpu", "cuda"])
     p.add_argument("--no-raune", action="store_true")
     p.add_argument("--no-depth", action="store_true")
+    p.add_argument("--maxine", action="store_true",
+                   help="Enable Maxine enhancement (requires nvvfx SDK or DOREA_MAXINE_MOCK=1)")
+    p.add_argument("--maxine-upscale-factor", type=int, default=2,
+                   help="Maxine super-resolution upscale factor (default: 2)")
+    p.add_argument("--no-maxine-artifact-reduction", action="store_true",
+                   help="Disable artifact reduction before upscale")
     return p.parse_args(argv)
 
 
@@ -95,6 +103,25 @@ def main(argv: Optional[list] = None) -> None:
             print("[dorea-inference] Depth Anything V2 loaded", file=sys.stderr, flush=True)
         except Exception as e:
             print(f"[dorea-inference] WARNING: Depth Anything V2 failed to load: {e}", file=sys.stderr, flush=True)
+
+    maxine_enhancer = None
+    if args.maxine:
+        try:
+            from .maxine_enhancer import MaxineEnhancer
+            maxine_enhancer = MaxineEnhancer(upscale_factor=args.maxine_upscale_factor)
+            print(
+                f"[dorea-inference] Maxine enhancer loaded "
+                f"(upscale_factor={args.maxine_upscale_factor}, "
+                f"artifact_reduction={not args.no_maxine_artifact_reduction})",
+                file=sys.stderr, flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[dorea-inference] FATAL: Maxine enhancer failed to load: {e}\n"
+                f"  Install nvvfx from NGC or set DOREA_MAXINE_MOCK=1 for testing.",
+                file=sys.stderr, flush=True,
+            )
+            raise
 
     print("[dorea-inference] ready", file=sys.stderr, flush=True)
 
@@ -215,7 +242,29 @@ def main(argv: Optional[list] = None) -> None:
                         "depth_height": depth_result.height,
                     })
                 resp = RauneDepthBatchResult(results=results)
+            elif req_type == "enhance":
+                if maxine_enhancer is None:
+                    raise RuntimeError(
+                        "Maxine enhancer not loaded — pass --maxine to the server"
+                    )
+                fmt = req.get("format", "raw_rgb")
+                if fmt == "raw_rgb":
+                    img = decode_raw_rgb(req["image_b64"], int(req["width"]), int(req["height"]))
+                else:
+                    img = decode_png(req["image_b64"])
+                enhanced = maxine_enhancer.enhance(
+                    img,
+                    width=int(req["width"]),
+                    height=int(req["height"]),
+                    artifact_reduce=not req.get("no_artifact_reduce", False),
+                )
+                resp = EnhanceResult.from_array(req_id, enhanced)
             elif req_type == "shutdown":
+                if maxine_enhancer is not None:
+                    print(
+                        f"[dorea-inference] {maxine_enhancer.stats()}",
+                        file=sys.stderr, flush=True,
+                    )
                 resp = OkResponse()
                 try:
                     print(json.dumps(resp.to_dict()), flush=True)

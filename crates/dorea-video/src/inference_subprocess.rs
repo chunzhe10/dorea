@@ -45,6 +45,10 @@ pub struct InferenceConfig {
     pub device: Option<String>,
     /// Startup timeout.
     pub startup_timeout: Duration,
+    /// Enable Maxine enhancement in the inference subprocess.
+    pub maxine: bool,
+    /// Maxine super-resolution upscale factor (default 2).
+    pub maxine_upscale_factor: u32,
 }
 
 impl Default for InferenceConfig {
@@ -57,7 +61,48 @@ impl Default for InferenceConfig {
             depth_model: None,
             device: None,
             startup_timeout: Duration::from_secs(120),
+            maxine: false,
+            maxine_upscale_factor: 2,
         }
+    }
+}
+
+impl InferenceConfig {
+    /// Build the CLI argument list for the Python inference server.
+    pub fn build_args(&self) -> Vec<String> {
+        let mut args = vec!["-m".to_string(), "dorea_inference.server".to_string()];
+
+        if self.skip_raune {
+            args.push("--no-raune".to_string());
+        } else {
+            if let Some(p) = &self.raune_weights {
+                args.push("--raune-weights".to_string());
+                args.push(p.to_str().unwrap_or("").to_string());
+            }
+        }
+
+        if let Some(p) = &self.raune_models_dir {
+            args.push("--raune-models-dir".to_string());
+            args.push(p.to_str().unwrap_or("").to_string());
+        }
+
+        if let Some(p) = &self.depth_model {
+            args.push("--depth-model".to_string());
+            args.push(p.to_str().unwrap_or("").to_string());
+        }
+
+        if let Some(d) = &self.device {
+            args.push("--device".to_string());
+            args.push(d.clone());
+        }
+
+        if self.maxine {
+            args.push("--maxine".to_string());
+            args.push("--maxine-upscale-factor".to_string());
+            args.push(self.maxine_upscale_factor.to_string());
+        }
+
+        args
     }
 }
 
@@ -86,6 +131,55 @@ pub struct RauneDepthBatchItem {
     pub depth_max_size: usize,
 }
 
+/// Parse an enhance_result JSON response, validating dimensions match the request.
+pub(super) fn parse_enhance_response(
+    resp: &str,
+    expected_id: &str,
+    expected_w: usize,
+    expected_h: usize,
+) -> Result<(Vec<u8>, usize, usize), InferenceError> {
+    let v: serde_json::Value = serde_json::from_str(resp)
+        .map_err(|e| InferenceError::Ipc(format!("enhance response parse: {e}")))?;
+
+    if v["type"].as_str() == Some("error") {
+        let msg = v["message"].as_str().unwrap_or("unknown error");
+        return Err(InferenceError::ServerError(msg.to_string()));
+    }
+    if v["type"].as_str() != Some("enhance_result") {
+        return Err(InferenceError::Ipc(format!(
+            "unexpected response type for enhance: {resp}"
+        )));
+    }
+
+    let w = v["width"].as_u64().unwrap_or(0) as usize;
+    let h = v["height"].as_u64().unwrap_or(0) as usize;
+
+    if w != expected_w || h != expected_h {
+        return Err(InferenceError::Ipc(format!(
+            "enhance dimension mismatch: expected {expected_w}x{expected_h}, got {w}x{h}"
+        )));
+    }
+
+    let b64_out = v["image_b64"]
+        .as_str()
+        .ok_or_else(|| InferenceError::Ipc("missing image_b64".to_string()))?;
+
+    let raw = B64
+        .decode(b64_out)
+        .map_err(|e| InferenceError::Ipc(format!("base64 decode: {e}")))?;
+
+    if raw.len() != w * h * 3 {
+        return Err(InferenceError::Ipc(format!(
+            "enhance buffer size mismatch: got {}, expected {}",
+            raw.len(),
+            w * h * 3,
+        )));
+    }
+
+    let _ = expected_id; // id correlation not enforced in response (Python echoes it back)
+    Ok((raw, w, h))
+}
+
 /// Active connection to the Python inference subprocess.
 pub struct InferenceServer {
     child: Child,
@@ -100,28 +194,7 @@ impl InferenceServer {
     /// Python process does not respond to the initial ping within the deadline.
     pub fn spawn(config: &InferenceConfig) -> Result<Self, InferenceError> {
         let mut cmd = Command::new(&config.python_exe);
-        cmd.args(["-m", "dorea_inference.server"]);
-
-        if config.skip_raune {
-            cmd.arg("--no-raune");
-        } else if let Some(p) = &config.raune_weights {
-            cmd.args(["--raune-weights", p.to_str().unwrap_or("")]);
-        }
-        // raune_weights = None + skip_raune = false → no args → Python uses its default path
-
-        if let Some(p) = &config.raune_models_dir {
-            cmd.args(["--raune-models-dir", p.to_str().unwrap_or("")]);
-        }
-
-        if let Some(p) = &config.depth_model {
-            cmd.args(["--depth-model", p.to_str().unwrap_or("")]);
-        }
-        // depth_model = None means "use the Python-side default path / HF fallback"
-        // do NOT pass --no-depth unless explicitly requested
-
-        if let Some(d) = &config.device {
-            cmd.args(["--device", d]);
-        }
+        cmd.args(config.build_args());
 
         // Set PYTHONPATH to the python/ dir adjacent to the target/ build directory.
         // Binary lives at <workspace>/target/{debug,release}/dorea; python/ is a sibling of target/.
@@ -478,6 +551,37 @@ impl InferenceServer {
             out.push((id, enh_rgb, enh_w, enh_h, depth, depth_w, depth_h));
         }
         Ok(out)
+    }
+
+    /// Send an RGB u8 frame to Maxine for enhancement.
+    /// Returns enhanced RGB u8 at the same resolution as input.
+    ///
+    /// On server-side failure the Python side returns the original frame
+    /// (passthrough), so this method only errors on IPC/protocol issues.
+    pub fn enhance(
+        &mut self,
+        id: &str,
+        image_rgb: &[u8],
+        width: usize,
+        height: usize,
+        artifact_reduce: bool,
+    ) -> Result<Vec<u8>, InferenceError> {
+        let b64 = B64.encode(image_rgb);
+
+        let req = serde_json::json!({
+            "type": "enhance",
+            "id": id,
+            "format": "raw_rgb",
+            "image_b64": b64,
+            "width": width,
+            "height": height,
+            "no_artifact_reduce": !artifact_reduce,
+        });
+
+        self.send_line(&req.to_string())?;
+        let resp = self.recv_line()?;
+        let (pixels, _w, _h) = parse_enhance_response(&resp, id, width, height)?;
+        Ok(pixels)
     }
 
     /// Bilinearly upscale a depth map from (src_w, src_h) to (dst_w, dst_h).
@@ -847,5 +951,64 @@ mod tests {
         // Decode should work (store-mode deflate)
         let decoded = decode_png_bytes(&png).expect("decode failed");
         assert_eq!(decoded, rgb, "roundtrip mismatch");
+    }
+
+    #[test]
+    fn spawn_command_includes_maxine_flags() {
+        let config = InferenceConfig {
+            maxine: true,
+            maxine_upscale_factor: 2,
+            ..InferenceConfig::default()
+        };
+        let args = config.build_args();
+        assert!(args.contains(&"--maxine".to_string()), "missing --maxine");
+        assert!(args.contains(&"--maxine-upscale-factor".to_string()), "missing --maxine-upscale-factor");
+        assert!(args.contains(&"2".to_string()), "missing upscale factor value");
+    }
+
+    #[test]
+    fn spawn_command_omits_maxine_when_disabled() {
+        let config = InferenceConfig {
+            maxine: false,
+            ..InferenceConfig::default()
+        };
+        let args = config.build_args();
+        assert!(!args.contains(&"--maxine".to_string()), "--maxine should be absent");
+    }
+
+    #[test]
+    fn enhance_parses_valid_response() {
+        let width = 4usize;
+        let height = 2usize;
+        let pixels: Vec<u8> = vec![128u8; width * height * 3];
+        let b64 = B64.encode(&pixels);
+        let resp = serde_json::json!({
+            "type": "enhance_result",
+            "id": "test_001",
+            "image_b64": b64,
+            "width": width,
+            "height": height,
+        });
+        let (result_pixels, rw, rh) =
+            parse_enhance_response(&resp.to_string(), "test_001", width, height).unwrap();
+        assert_eq!(rw, width);
+        assert_eq!(rh, height);
+        assert_eq!(result_pixels.len(), width * height * 3);
+        assert_eq!(result_pixels[0], 128);
+    }
+
+    #[test]
+    fn enhance_rejects_dimension_mismatch() {
+        let pixels: Vec<u8> = vec![0u8; 4 * 2 * 3];
+        let b64 = B64.encode(&pixels);
+        let resp = serde_json::json!({
+            "type": "enhance_result",
+            "id": "test_001",
+            "image_b64": b64,
+            "width": 8,   // mismatch: sent 4
+            "height": 4,  // mismatch: sent 2
+        });
+        let result = parse_enhance_response(&resp.to_string(), "test_001", 4, 2);
+        assert!(result.is_err(), "should reject dimension mismatch");
     }
 }

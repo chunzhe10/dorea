@@ -436,6 +436,65 @@ impl FrameEncoder {
         })
     }
 
+    /// Create a lossless ffv1/mkv encoder for temporary intermediate storage.
+    ///
+    /// Output is a lossless Matroska video (no audio, no NVENC attempt).
+    /// Intended for the Maxine-enhanced frame temp file between Pass 1 and Pass 2.
+    pub fn new_lossless_temp(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: f64,
+    ) -> Result<Self, FfmpegError> {
+        let w_s = width.to_string();
+        let h_s = height.to_string();
+        let fps_s = format!("{fps:.3}");
+        let size_s = format!("{w_s}x{h_s}");
+        let out_s = output.to_str().unwrap_or("temp.mkv");
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-f", "rawvideo",
+            "-pixel_format", "rgb24",
+            "-s", &size_s,
+            "-r", &fps_s,
+            "-i", "pipe:0",
+            "-map", "0:v",
+            "-c:v", "ffv1",
+            "-level", "3",
+            out_s,
+        ]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(FfmpegError::NotFound)?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            FfmpegError::EncodeFailed("could not open lossless encoder stdin".to_string())
+        })?;
+        let stderr = child.stderr.take();
+
+        if let Ok(Some(status)) = child.try_wait() {
+            let msg = stderr.map(|mut s| {
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            }).unwrap_or_default();
+            return Err(FfmpegError::EncodeFailed(format!(
+                "ffv1 encoder exited immediately (code {:?}): {}",
+                status.code(), msg.trim()
+            )));
+        }
+
+        Ok(Self {
+            child,
+            stdin,
+            stderr,
+            frame_bytes: width * height * 3,
+        })
+    }
+
     /// Write one RGB24 frame to the encoder.
     pub fn write_frame(&mut self, pixels: &[u8]) -> Result<(), FfmpegError> {
         if pixels.len() != self.frame_bytes {
@@ -501,7 +560,7 @@ impl FrameEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rational;
+    use super::*;
 
     #[test]
     fn rational_parse() {
@@ -509,5 +568,37 @@ mod tests {
         assert!((parse_rational("25/1") - 25.0).abs() < 0.001);
         assert!((parse_rational("24") - 24.0).abs() < 0.001);
         assert!((parse_rational("0/0") - 30.0).abs() < 0.001); // div-by-zero fallback
+    }
+
+    #[test]
+    fn lossless_temp_encoder_creates_decodable_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("dorea_test_ffv1_{}.mkv", std::process::id()));
+        let width = 8usize;
+        let height = 4usize;
+        let fps = 30.0f64;
+
+        // Write 3 frames
+        let mut enc = FrameEncoder::new_lossless_temp(&path, width, height, fps)
+            .expect("failed to create lossless encoder");
+        let frame: Vec<u8> = (0..width * height * 3).map(|i| (i % 256) as u8).collect();
+        for _ in 0..3 {
+            enc.write_frame(&frame).expect("write_frame failed");
+        }
+        enc.finish().expect("finish failed");
+
+        // File must exist and be non-empty
+        assert!(path.exists(), "output file does not exist");
+        assert!(path.metadata().unwrap().len() > 0, "output file is empty");
+
+        // Must be decodable as a video
+        let probe_result = probe(&path);
+        assert!(probe_result.is_ok(), "ffprobe failed: {:?}", probe_result);
+        let info = probe_result.unwrap();
+        assert_eq!(info.width, width);
+        assert_eq!(info.height, height);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
     }
 }

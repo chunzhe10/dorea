@@ -221,4 +221,12 @@ class RauneNetInference:
             out = self.model(batch)  # (N, 3, H, W) in [-1, 1]
 
         out = ((out + 1.0) / 2.0).clamp(0.0, 1.0)  # [0, 1], still on device
+
+        # RAUNE-Net (U-Net) may pad internally and produce output dims that differ
+        # from input dims. Force back to the expected (out_h, out_w) so the PNG
+        # we encode matches the enhanced_width/enhanced_height we report in JSON.
+        if out.shape[2] != out_h or out.shape[3] != out_w:
+            import torch.nn.functional as F
+            out = F.interpolate(out, size=(out_h, out_w), mode="bilinear", align_corners=False)
+
         return out, out_w, out_h

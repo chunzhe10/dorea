@@ -193,6 +193,8 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
             depth_model: args.depth_model.clone(),
             device: if args.cpu_only { Some("cpu".to_string()) } else { None },
             startup_timeout: Duration::from_secs(180),
+            maxine: false,
+            maxine_upscale_factor: 2,
         };
         inf_server = Some(
             InferenceServer::spawn(&cfg).context("failed to spawn inference server")?,

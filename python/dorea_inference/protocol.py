@@ -114,6 +114,31 @@ class DepthResult:
 
 
 @dataclass
+class EnhanceResult:
+    """Enhanced RGB frame returned from Maxine pipeline."""
+    id: Optional[str]
+    image_b64: str   # base64-encoded raw RGB u8 bytes
+    width: int
+    height: int
+    type: str = "enhance_result"
+
+    def to_dict(self) -> dict:
+        return {"type": self.type, "id": self.id,
+                "image_b64": self.image_b64,
+                "width": self.width, "height": self.height}
+
+    @staticmethod
+    def from_array(id: Optional[str], img: "np.ndarray") -> "EnhanceResult":
+        """Encode an HxWx3 uint8 RGB array as EnhanceResult."""
+        return EnhanceResult(
+            id=id,
+            image_b64=encode_raw_rgb(img),
+            width=img.shape[1],
+            height=img.shape[0],
+        )
+
+
+@dataclass
 class DepthBatchResult:
     results: list  # list of DepthResult.to_dict()
     type: str = "depth_batch_result"
@@ -185,6 +210,15 @@ def decode_raw_rgb(b64: str, width: int, height: int) -> "np.ndarray":
     if len(raw) != expected:
         raise ValueError(f"raw_rgb size mismatch: got {len(raw)}, expected {expected}")
     return np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
+
+
+def encode_raw_rgb(img: "np.ndarray") -> str:
+    """Encode HxWx3 RGB uint8 array to base64 raw interleaved bytes."""
+    import numpy as np
+    arr = np.ascontiguousarray(img, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"expected HxWx3 RGB, got shape {arr.shape}")
+    return base64.b64encode(arr.tobytes()).decode("ascii")
 
 
 def decode_depth_f32(b64: str, width: int, height: int) -> "np.ndarray":
