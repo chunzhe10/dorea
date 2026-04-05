@@ -84,46 +84,32 @@ def main(argv: Optional[list] = None) -> None:
     depth_model = None
 
     if not args.no_raune:
-        try:
-            from .raune_net import RauneNetInference
-            raune_model = RauneNetInference(
-                weights_path=args.raune_weights,
-                device=device,
-                raune_models_dir=args.raune_models_dir,
-            )
-            print("[dorea-inference] RAUNE-Net loaded", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[dorea-inference] WARNING: RAUNE-Net failed to load: {e}", file=sys.stderr, flush=True)
+        from .raune_net import RauneNetInference
+        raune_model = RauneNetInference(
+            weights_path=args.raune_weights,
+            device=device,
+            raune_models_dir=args.raune_models_dir,
+        )
+        print("[dorea-inference] RAUNE-Net loaded", file=sys.stderr, flush=True)
 
     if not args.no_depth:
-        try:
-            from .depth_anything import DepthAnythingInference
-            depth_model = DepthAnythingInference(
-                model_path=args.depth_model,
-                device=device,
-            )
-            print("[dorea-inference] Depth Anything V2 loaded", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[dorea-inference] WARNING: Depth Anything V2 failed to load: {e}", file=sys.stderr, flush=True)
+        from .depth_anything import DepthAnythingInference
+        depth_model = DepthAnythingInference(
+            model_path=args.depth_model,
+            device=device,
+        )
+        print("[dorea-inference] Depth Anything V2 loaded", file=sys.stderr, flush=True)
 
     maxine_enhancer = None
     if args.maxine:
-        try:
-            from .maxine_enhancer import MaxineEnhancer
-            maxine_enhancer = MaxineEnhancer(upscale_factor=args.maxine_upscale_factor)
-            print(
-                f"[dorea-inference] Maxine enhancer loaded "
-                f"(upscale_factor={args.maxine_upscale_factor}, "
-                f"artifact_reduction={not args.no_maxine_artifact_reduction})",
-                file=sys.stderr, flush=True,
-            )
-        except Exception as e:
-            print(
-                f"[dorea-inference] WARNING: Maxine enhancer failed to load: {e} "
-                f"— running without Maxine. Set DOREA_MAXINE_MOCK=1 for testing.",
-                file=sys.stderr, flush=True,
-            )
-            # maxine_enhancer remains None — enhance requests return passthrough
+        from .maxine_enhancer import MaxineEnhancer
+        maxine_enhancer = MaxineEnhancer(upscale_factor=args.maxine_upscale_factor)
+        print(
+            f"[dorea-inference] Maxine enhancer loaded "
+            f"(upscale_factor={args.maxine_upscale_factor}, "
+            f"artifact_reduction={not args.no_maxine_artifact_reduction})",
+            file=sys.stderr, flush=True,
+        )
 
     print("[dorea-inference] ready", file=sys.stderr, flush=True)
 

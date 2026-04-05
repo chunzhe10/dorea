@@ -36,7 +36,6 @@ class MaxineEnhancer:
     def __init__(self, upscale_factor: int = 2) -> None:
         self.upscale_factor = upscale_factor
         self._mock = _MOCK_MODE
-        self._passthrough_count = 0
         self._total_count = 0
         self._sr_effect = None
         self._ar_effect = None
@@ -80,7 +79,7 @@ class MaxineEnhancer:
     ) -> np.ndarray:
         """Enhance a single RGB u8 frame via VideoSuperRes. Returns RGB u8 at original resolution.
 
-        On any failure, logs the error and returns the original frame unchanged.
+        Raises on failure — callers must not swallow errors.
         Note: artifact_reduce parameter is ignored (ArtifactReduction not available in nvvfx SDK).
         """
         self._total_count += 1
@@ -88,12 +87,7 @@ class MaxineEnhancer:
         if self._mock:
             return rgb_u8
 
-        try:
-            return self._enhance_impl(rgb_u8, width, height)
-        except Exception as e:
-            self._passthrough_count += 1
-            log.warning("Maxine enhance failed (frame passthrough): %s", e)
-            return rgb_u8
+        return self._enhance_impl(rgb_u8, width, height)
 
     def _enhance_impl(
         self,
@@ -133,8 +127,4 @@ class MaxineEnhancer:
         """Return summary string for shutdown logging."""
         if self._total_count == 0:
             return "Maxine: no frames processed"
-        return (
-            f"Maxine: enhanced {self._total_count} frames"
-            + (f", {self._passthrough_count} passthrough failures"
-               if self._passthrough_count > 0 else "")
-        )
+        return f"Maxine: enhanced {self._total_count} frames"
