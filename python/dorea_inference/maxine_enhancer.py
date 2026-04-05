@@ -111,24 +111,35 @@ class MaxineEnhancer:
         if self._sr_effect is None:
             self._init_effects(width, height)
 
-        # RGB → BGRA (Maxine expects BGRA interleaved uint8)
+        # RGB → BGRA (Maxine expects BGRA interleaved, float32)
         bgr = cv2.cvtColor(rgb_u8.reshape(height, width, 3), cv2.COLOR_RGB2BGR)
         bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
 
-        tensor = torch.from_numpy(bgra).cuda()
+        # Convert uint8 → float32 for Maxine SDK
+        tensor = torch.from_numpy(bgra.astype("float32")).cuda()
 
         # Super-resolution → upscaled intermediate
         tensor = self._sr_effect.run(tensor)
 
-        # 3. Download and downsample back to original resolution
+        # Download and downsample back to original resolution
         upscaled_bgra = tensor.cpu().numpy()
+
+        # Ensure uint8 before cv2 operations
+        if upscaled_bgra.dtype != np.uint8:
+            upscaled_bgra = (np.clip(upscaled_bgra, 0, 255)).astype(np.uint8)
+
         downscaled_bgra = cv2.resize(
             upscaled_bgra, (width, height), interpolation=cv2.INTER_AREA,
         )
 
-        # BGRA → RGB
+        # BGRA → RGB, ensure uint8 output
         downscaled_bgr = cv2.cvtColor(downscaled_bgra, cv2.COLOR_BGRA2BGR)
-        return cv2.cvtColor(downscaled_bgr, cv2.COLOR_BGR2RGB)
+        result = cv2.cvtColor(downscaled_bgr, cv2.COLOR_BGR2RGB)
+
+        if result.dtype != np.uint8:
+            result = (np.clip(result, 0, 255)).astype(np.uint8)
+
+        return result
 
     def stats(self) -> str:
         """Return summary string for shutdown logging."""
