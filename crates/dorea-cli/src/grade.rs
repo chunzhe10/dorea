@@ -375,11 +375,13 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     // -----------------------------------------------------------------------
     // Model lifecycle transition: Maxine → RAUNE + Depth
     // -----------------------------------------------------------------------
-    // Always unload Maxine before fused calibration batch: RAUNE+Depth+Maxine together
-    // would OOM on 6GB VRAM, and Maxine has no role in LUT calibration.
-    inf_server.unload_maxine()
-        .unwrap_or_else(|e| log::warn!("unload_maxine failed (non-fatal): {e}"));
-    log::info!("Maxine unloaded — loading RAUNE+Depth for calibration");
+    // Unload Maxine only if Pass 1 used it (RAUNE+Maxine+Depth fits in 6GB;
+    // when use_maxine=false Maxine stays loaded for the fused RAUNE→Maxine→Depth batch).
+    if use_maxine {
+        inf_server.unload_maxine()
+            .unwrap_or_else(|e| log::warn!("unload_maxine failed (non-fatal): {e}"));
+        log::info!("Maxine unloaded — loading RAUNE+Depth for calibration");
+    }
     inf_server.load_raune(
         raune_weights.as_deref(),
         raune_models_dir.as_deref(),
