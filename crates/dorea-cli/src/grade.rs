@@ -196,9 +196,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     );
 
     let use_maxine = false; // Disable Pass 1 Maxine (full-res enhancement not needed)
-    let maxine_in_fused_batch = false; // Do NOT upscale in fused batch — LUT calibration needs
-                                       // RAUNE output at proxy resolution; Maxine 2× would return
-                                       // 4× more pixels than expected, breaking store offset arithmetic
+    let maxine_in_fused_batch = true; // RAUNE → Maxine (upscale) → Depth: higher-res depth estimation
     if use_maxine {
         let valid_factors = [2u32, 3, 4];
         if !valid_factors.contains(&maxine_upscale_factor) {
@@ -455,14 +453,20 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         for (kf, (_, enhanced, enh_w, enh_h, depth, dw, dh)) in
             chunk_kfs.iter().zip(results.into_iter())
         {
-            debug_assert_eq!(enh_w, proxy_w, "RAUNE enh_w {enh_w} != proxy_w {proxy_w}");
-            debug_assert_eq!(enh_h, proxy_h, "RAUNE enh_h {enh_h} != proxy_h {proxy_h}");
+            // enhanced may be Maxine-upscaled (e.g. 2× proxy). Downscale to proxy
+            // for LUT calibration — the LUT trains on proxy-resolution pixel pairs.
+            // The depth is kept at its native resolution (dw×dh) in kf_depths.
+            let enhanced_proxy = if enh_w == proxy_w && enh_h == proxy_h {
+                enhanced
+            } else {
+                dorea_video::resize::resize_rgb_bilinear(&enhanced, enh_w, enh_h, proxy_w, proxy_h)
+            };
             let depth_for_store = if dw == proxy_w && dh == proxy_h {
                 depth.clone()
             } else {
                 InferenceServer::upscale_depth(&depth, dw, dh, proxy_w, proxy_h)
             };
-            store.push(&kf.proxy_pixels, &enhanced, &depth_for_store, proxy_w, proxy_h)
+            store.push(&kf.proxy_pixels, &enhanced_proxy, &depth_for_store, proxy_w, proxy_h)
                 .context("failed to page fused result to store")?;
             kf_depths.insert(kf.frame_index, (depth, dw, dh));
         }
