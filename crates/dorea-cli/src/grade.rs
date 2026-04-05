@@ -196,7 +196,9 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     );
 
     let use_maxine = false; // Disable Pass 1 Maxine (full-res enhancement not needed)
-    let maxine_in_fused_batch = true; // Enable Maxine upscaling in fused RAUNE+depth batch instead
+    let maxine_in_fused_batch = false; // Do NOT upscale in fused batch — LUT calibration needs
+                                       // RAUNE output at proxy resolution; Maxine 2× would return
+                                       // 4× more pixels than expected, breaking store offset arithmetic
     if use_maxine {
         let valid_factors = [2u32, 3, 4];
         if !valid_factors.contains(&maxine_upscale_factor) {
@@ -375,11 +377,11 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     // -----------------------------------------------------------------------
     // Model lifecycle transition: Maxine → RAUNE + Depth
     // -----------------------------------------------------------------------
-    if use_maxine {
-        inf_server.unload_maxine()
-            .unwrap_or_else(|e| log::warn!("unload_maxine failed (non-fatal): {e}"));
-        log::info!("Maxine unloaded — loading RAUNE+Depth for calibration");
-    }
+    // Always unload Maxine before fused calibration batch: RAUNE+Depth+Maxine together
+    // would OOM on 6GB VRAM, and Maxine has no role in LUT calibration.
+    inf_server.unload_maxine()
+        .unwrap_or_else(|e| log::warn!("unload_maxine failed (non-fatal): {e}"));
+    log::info!("Maxine unloaded — loading RAUNE+Depth for calibration");
     inf_server.load_raune(
         raune_weights.as_deref(),
         raune_models_dir.as_deref(),
