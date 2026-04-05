@@ -57,8 +57,6 @@ class MaxineEnhancer:
 
     def _init_effects(self, width: int, height: int) -> None:
         """Lazily initialize Maxine VideoSuperRes with known input dimensions."""
-        import torch
-
         out_w = width * self.upscale_factor
         out_h = height * self.upscale_factor
 
@@ -66,8 +64,6 @@ class MaxineEnhancer:
         # Set output dimensions as properties (not constructor args)
         self._sr_effect.output_width = out_w
         self._sr_effect.output_height = out_h
-        stream = torch.cuda.current_stream()
-        self._sr_effect.set_cuda_stream(stream.cuda_stream)
         self._sr_effect.load()
 
         log.info(
