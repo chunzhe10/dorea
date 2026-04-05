@@ -95,15 +95,8 @@ pub struct GradeArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Disable Maxine AI enhancement preprocessing
-    #[arg(long)]
-    pub no_maxine: bool,
-
-    /// Disable Maxine artifact reduction before upscale
-    #[arg(long)]
-    pub no_maxine_artifact_reduction: bool,
-
-    /// Maxine super-resolution upscale factor (config: [maxine].upscale_factor, built-in default: 2)
+    /// Maxine super-resolution upscale factor for RAUNE→Maxine→Depth fused batch
+    /// (config: [maxine].upscale_factor, built-in default: 2)
     #[arg(long)]
     pub maxine_upscale_factor: Option<u32>,
 }
@@ -195,22 +188,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         info.width, info.height, info.fps, info.duration_secs, info.frame_count
     );
 
-    let use_maxine = false; // Disable Pass 1 Maxine (full-res enhancement not needed)
     let maxine_in_fused_batch = true; // RAUNE → Maxine (upscale) → Depth: higher-res depth estimation
-    if use_maxine {
-        let valid_factors = [2u32, 3, 4];
-        if !valid_factors.contains(&maxine_upscale_factor) {
-            anyhow::bail!(
-                "--maxine-upscale-factor {} is not supported. Supported: {:?}",
-                maxine_upscale_factor, valid_factors,
-            );
-        }
-        log::info!(
-            "Maxine enabled: upscale_factor={}, artifact_reduction={}",
-            maxine_upscale_factor,
-            !args.no_maxine_artifact_reduction,
-        );
-    }
 
     // Determine grading parameters
     let params = GradeParams { warmth, strength, contrast };
@@ -222,9 +200,9 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
 
     let interp_enabled = !args.no_depth_interp;
 
-    // Spawn ONE inference server for the entire run.
-    // Starts with Maxine loaded only (RAUNE+Depth loaded lazily after Pass 1).
-    let maxine_start_cfg = InferenceConfig {
+    // Spawn inference server with Maxine pre-loaded (used in fused RAUNE→Maxine→Depth batch).
+    // RAUNE and Depth are loaded lazily before the calibration batch.
+    let start_cfg = InferenceConfig {
         skip_raune: true,
         skip_depth: true,
         ..build_inference_config(
@@ -236,18 +214,11 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
             maxine_upscale_factor,
         )
     };
-    let mut inf_server = InferenceServer::spawn(&maxine_start_cfg)
+    let mut inf_server = InferenceServer::spawn(&start_cfg)
         .context("failed to spawn inference server")?;
 
-    let maxine_temp_path: Option<std::path::PathBuf> = if use_maxine {
-        Some(std::env::temp_dir().join(format!("dorea_maxine_{}.mkv", std::process::id())))
-    } else {
-        None
-    };
-    let _maxine_temp_guard = maxine_temp_path.as_ref().map(|p| TempFileGuard::new(p.clone()));
-
     // -----------------------------------------------------------------------
-    // Pass 1: decode + optional Maxine enhance + proxy downscale + keyframe detect
+    // Pass 1: proxy decode + change detection + keyframe selection
     // -----------------------------------------------------------------------
     let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(info.width, info.height, proxy_size);
 
@@ -256,109 +227,36 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     let mut frames_since_kf = 0usize;
     let scene_cut_threshold = depth_skip_threshold * 10.0;
 
-    if use_maxine {
-        // Maxine path: full-res decode → enhance → write temp → proxy downscale → keyframe detect
-        use dorea_video::resize::resize_rgb_bilinear;
+    let proxy_frames = ffmpeg::decode_frames_scaled(&args.input, &info, proxy_w, proxy_h)
+        .context("failed to spawn ffmpeg proxy decoder")?;
 
-        let temp_path = maxine_temp_path.as_ref().unwrap();
-        let mut temp_enc = FrameEncoder::new_lossless_temp(
-            temp_path, info.width, info.height, info.fps,
-        ).context("failed to create Maxine temp encoder")?;
+    for frame_result in proxy_frames {
+        let frame = frame_result.context("proxy frame decode error")?;
+        let change = detector.score(&frame.pixels);
+        let scene_cut = change < f32::MAX && change > scene_cut_threshold;
+        let is_keyframe = !interp_enabled
+            || keyframes.is_empty()
+            || scene_cut
+            || frames_since_kf >= depth_max_interval
+            || (change < f32::MAX && change > depth_skip_threshold);
 
-        let full_frames = ffmpeg::decode_frames(&args.input, &info)
-            .context("failed to spawn full-res decoder for Maxine pass")?;
-
-        for frame_result in full_frames {
-            let frame = frame_result.context("Maxine pass frame decode error")?;
-
-            let maxine_full = inf_server.enhance(
-                &frame.index.to_string(),
-                &frame.pixels,
-                frame.width,
-                frame.height,
-                !args.no_maxine_artifact_reduction,
-            ).unwrap_or_else(|e| {
-                log::warn!("enhance() IPC failed for frame {} — using original: {e}", frame.index);
-                frame.pixels.clone()
+        if is_keyframe {
+            if scene_cut {
+                log::info!("Scene cut at frame {} (change={:.6})", frame.index, change);
+                detector.reset();
+            }
+            keyframes.push(KeyframeEntry {
+                frame_index: frame.index,
+                proxy_pixels: frame.pixels.clone(),
+                scene_cut_before: scene_cut,
             });
-
-            temp_enc.write_frame(&maxine_full)
-                .context("failed to write Maxine-enhanced frame to temp file")?;
-
-            let maxine_proxy = if proxy_w == frame.width && proxy_h == frame.height {
-                maxine_full.clone()
-            } else {
-                resize_rgb_bilinear(&maxine_full, frame.width, frame.height, proxy_w, proxy_h)
-            };
-
-            let change = detector.score(&maxine_proxy);
-            let scene_cut = change < f32::MAX && change > scene_cut_threshold;
-            let is_keyframe = !interp_enabled
-                || keyframes.is_empty()
-                || scene_cut
-                || frames_since_kf >= depth_max_interval
-                || (change < f32::MAX && change > depth_skip_threshold);
-
-            if is_keyframe {
-                if scene_cut {
-                    log::info!("Scene cut at frame {} (change={:.6})", frame.index, change);
-                    detector.reset();
-                }
-                keyframes.push(KeyframeEntry {
-                    frame_index: frame.index,
-                    proxy_pixels: maxine_proxy.clone(),
-                    scene_cut_before: scene_cut,
-                });
-                detector.set_reference(&maxine_proxy);
-                frames_since_kf = 0;
-            } else {
-                frames_since_kf += 1;
-            }
+            detector.set_reference(&frame.pixels);
+            frames_since_kf = 0;
+        } else {
+            frames_since_kf += 1;
         }
-
-        temp_enc.finish().context("failed to finalize Maxine temp file")?;
-        log::info!(
-            "Maxine Pass 1 complete: {} keyframes, temp file: {}",
-            keyframes.len(),
-            temp_path.display(),
-        );
-    } else {
-        // No-Maxine path: proxy decode (existing behaviour)
-        let proxy_frames = ffmpeg::decode_frames_scaled(&args.input, &info, proxy_w, proxy_h)
-            .context("failed to spawn ffmpeg proxy decoder")?;
-
-        for frame_result in proxy_frames {
-            let frame = frame_result.context("proxy frame decode error")?;
-            let change = detector.score(&frame.pixels);
-            let scene_cut = change < f32::MAX && change > scene_cut_threshold;
-            let is_keyframe = !interp_enabled
-                || keyframes.is_empty()
-                || scene_cut
-                || frames_since_kf >= depth_max_interval
-                || (change < f32::MAX && change > depth_skip_threshold);
-
-            if is_keyframe {
-                if scene_cut {
-                    log::info!(
-                        "Scene cut at frame {} (change={:.6})",
-                        frame.index,
-                        change,
-                    );
-                    detector.reset();
-                }
-                keyframes.push(KeyframeEntry {
-                    frame_index: frame.index,
-                    proxy_pixels: frame.pixels.clone(),
-                    scene_cut_before: scene_cut,
-                });
-                detector.set_reference(&frame.pixels);
-                frames_since_kf = 0;
-            } else {
-                frames_since_kf += 1;
-            }
-        }
-        log::info!("Pass 1 complete: {} keyframes detected", keyframes.len());
     }
+    log::info!("Pass 1 complete: {} keyframes detected", keyframes.len());
 
     anyhow::ensure!(
         !keyframes.is_empty(),
@@ -368,20 +266,8 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     // -----------------------------------------------------------------------
     // Calibration + depth cache
     // -----------------------------------------------------------------------
-    // Single-server lifecycle: Maxine unloaded here, then RAUNE+Depth loaded
-    // for fused calibration batch. Server shut down after calibration; VRAM
-    // freed for Pass 2 CUDA grading.
-
-    // -----------------------------------------------------------------------
-    // Model lifecycle transition: Maxine → RAUNE + Depth
-    // -----------------------------------------------------------------------
-    // Unload Maxine only if Pass 1 used it (RAUNE+Maxine+Depth fits in 6GB;
-    // when use_maxine=false Maxine stays loaded for the fused RAUNE→Maxine→Depth batch).
-    if use_maxine {
-        inf_server.unload_maxine()
-            .unwrap_or_else(|e| log::warn!("unload_maxine failed (non-fatal): {e}"));
-        log::info!("Maxine unloaded — loading RAUNE+Depth for calibration");
-    }
+    // Load RAUNE+Depth alongside the already-loaded Maxine for the fused
+    // RAUNE→Maxine→Depth calibration batch. Server shuts down after calibration.
     inf_server.load_raune(
         raune_weights.as_deref(),
         raune_models_dir.as_deref(),
@@ -661,8 +547,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     // -----------------------------------------------------------------------
     // Pass 2: full-resolution decode + adaptive depth grading
     // -----------------------------------------------------------------------
-    let decode_source = maxine_temp_path.as_deref().unwrap_or(args.input.as_path());
-    let frames = ffmpeg::decode_frames(decode_source, &info)
+    let frames = ffmpeg::decode_frames(&args.input, &info)
         .context("failed to spawn ffmpeg full-res decoder")?;
 
     let mut kf_cursor = 0usize;
