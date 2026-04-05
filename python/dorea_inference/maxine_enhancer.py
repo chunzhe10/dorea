@@ -7,14 +7,11 @@ Set DOREA_MAXINE_MOCK=1 to enable mock mode for CI testing without the SDK.
 """
 from __future__ import annotations
 
-import logging
 import os
-from typing import Optional
+import sys
 
 import cv2
 import numpy as np
-
-log = logging.getLogger("dorea-inference")
 
 _MOCK_MODE = os.environ.get("DOREA_MAXINE_MOCK", "") == "1"
 
@@ -27,8 +24,12 @@ if not _MOCK_MODE:
         _nvvfx = None
 
 
+def _log(msg: str) -> None:
+    print(f"[dorea-inference] {msg}", file=sys.stderr, flush=True)
+
+
 class MaxineEnhancer:
-    """AI enhancement via Maxine VideoSuperRes + ArtifactReduction.
+    """AI enhancement via Maxine VideoSuperRes.
 
     If DOREA_MAXINE_MOCK=1 is set, all enhance() calls return the input unchanged.
     """
@@ -38,10 +39,9 @@ class MaxineEnhancer:
         self._mock = _MOCK_MODE
         self._total_count = 0
         self._sr_effect = None
-        self._ar_effect = None
 
         if self._mock:
-            log.info("Maxine mock mode enabled (DOREA_MAXINE_MOCK=1)")
+            _log("Maxine mock mode enabled (DOREA_MAXINE_MOCK=1)")
             return
 
         if _nvvfx is None:
@@ -50,9 +50,7 @@ class MaxineEnhancer:
                 "see docs/guides/maxine-setup.md, or unset --maxine"
             )
 
-        log.info("Maxine VideoSuperRes initialized (upscale_factor=%d)", upscale_factor)
-        # Effects are initialized lazily on first enhance() call because we need
-        # the input dimensions to configure the output size.
+        _log(f"Maxine VideoSuperRes initialized (upscale_factor={upscale_factor})")
 
     def _init_effects(self, width: int, height: int) -> None:
         """Lazily initialize Maxine VideoSuperRes with known input dimensions."""
@@ -60,15 +58,11 @@ class MaxineEnhancer:
         out_h = height * self.upscale_factor
 
         self._sr_effect = _nvvfx.VideoSuperRes()
-        # Set output dimensions as properties (not constructor args)
         self._sr_effect.output_width = out_w
         self._sr_effect.output_height = out_h
         self._sr_effect.load()
 
-        log.info(
-            "Maxine VideoSuperRes loaded: %dx%d→%dx%d",
-            width, height, out_w, out_h,
-        )
+        _log(f"Maxine VideoSuperRes loaded: {width}x{height}→{out_w}x{out_h}")
 
     def enhance(
         self,
@@ -80,11 +74,9 @@ class MaxineEnhancer:
         """Enhance a single RGB u8 frame via VideoSuperRes. Returns RGB u8 at original resolution.
 
         Raises on failure — callers must not swallow errors.
-        Note: artifact_reduce parameter is ignored (ArtifactReduction not available in nvvfx SDK).
         """
-        self._total_count += 1
-
         if self._mock:
+            self._total_count += 1
             return rgb_u8
 
         return self._enhance_impl(rgb_u8, width, height)
@@ -121,6 +113,7 @@ class MaxineEnhancer:
             upscaled_rgb, (width, height), interpolation=cv2.INTER_AREA,
         )
 
+        self._total_count += 1
         return result
 
     def stats(self) -> str:

@@ -358,10 +358,13 @@ def main(argv: Optional[list] = None) -> None:
 
             elif req_type == "shutdown":
                 if maxine_enhancer is not None:
-                    print(
-                        f"[dorea-inference] {maxine_enhancer.stats()}",
-                        file=sys.stderr, flush=True,
-                    )
+                    stats = maxine_enhancer.stats()
+                    print(f"[dorea-inference] {stats}", file=sys.stderr, flush=True)
+                    if maxine_enhancer._total_count == 0:
+                        raise RuntimeError(
+                            "Maxine was enabled but processed 0 frames — "
+                            "this indicates Maxine was never called during inference"
+                        )
                 resp = OkResponse()
                 try:
                     print(json.dumps(resp.to_dict()), flush=True)
