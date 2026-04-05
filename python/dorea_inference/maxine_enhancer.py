@@ -111,29 +111,27 @@ class MaxineEnhancer:
         if self._sr_effect is None:
             self._init_effects(width, height)
 
-        # RGB → BGRA (Maxine expects BGRA interleaved, float32)
+        # RGB → BGR (Maxine expects BGR/RGB interleaved, float32, 3 channels)
         bgr = cv2.cvtColor(rgb_u8.reshape(height, width, 3), cv2.COLOR_RGB2BGR)
-        bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
 
         # Convert uint8 → float32 for Maxine SDK
-        tensor = torch.from_numpy(bgra.astype("float32")).cuda()
+        tensor = torch.from_numpy(bgr.astype("float32")).cuda()
 
         # Super-resolution → upscaled intermediate
         tensor = self._sr_effect.run(tensor)
 
         # Download and downsample back to original resolution
-        upscaled_bgra = tensor.cpu().numpy()
+        upscaled_bgr = tensor.cpu().numpy()
 
         # Ensure uint8 before cv2 operations
-        if upscaled_bgra.dtype != np.uint8:
-            upscaled_bgra = (np.clip(upscaled_bgra, 0, 255)).astype(np.uint8)
+        if upscaled_bgr.dtype != np.uint8:
+            upscaled_bgr = (np.clip(upscaled_bgr, 0, 255)).astype(np.uint8)
 
-        downscaled_bgra = cv2.resize(
-            upscaled_bgra, (width, height), interpolation=cv2.INTER_AREA,
+        downscaled_bgr = cv2.resize(
+            upscaled_bgr, (width, height), interpolation=cv2.INTER_AREA,
         )
 
-        # BGRA → RGB, ensure uint8 output
-        downscaled_bgr = cv2.cvtColor(downscaled_bgra, cv2.COLOR_BGRA2BGR)
+        # BGR → RGB, ensure uint8 output
         result = cv2.cvtColor(downscaled_bgr, cv2.COLOR_BGR2RGB)
 
         if result.dtype != np.uint8:
