@@ -311,32 +311,13 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
             chunk_items.len(),
         );
         let mut results = inf_server.run_raune_depth_batch(chunk_items, maxine_in_fused_batch)
-            .unwrap_or_else(|e| {
-                log::warn!(
-                    "Fused RAUNE+depth batch failed: {e} — using originals + uniform depth"
-                );
-                chunk_items.iter().map(|item| {
-                    (item.id.clone(), item.pixels.clone(),
-                     item.width, item.height,
-                     vec![0.5f32; item.width * item.height],
-                     item.width, item.height)
-                }).collect()
-            });
+            .context(format!("Fused RAUNE+depth batch {}/{n_batches} failed", batch_idx + 1))?;
 
-        if results.len() < chunk_items.len() {
-            log::warn!(
-                "Fused batch returned {} results for {} items — padding with originals",
-                results.len(), chunk_items.len()
-            );
-            for item in &chunk_items[results.len()..] {
-                results.push((
-                    item.id.clone(), item.pixels.clone(),
-                    item.width, item.height,
-                    vec![0.5f32; item.width * item.height],
-                    item.width, item.height,
-                ));
-            }
-        }
+        anyhow::ensure!(
+            results.len() == chunk_items.len(),
+            "Fused batch {}/{n_batches} returned {} results for {} items — server returned incomplete results",
+            batch_idx + 1, results.len(), chunk_items.len()
+        );
 
         for (kf, (_, enhanced, enh_w, enh_h, depth, dw, dh)) in
             chunk_kfs.iter().zip(results.into_iter())

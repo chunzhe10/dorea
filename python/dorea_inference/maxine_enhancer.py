@@ -111,34 +111,25 @@ class MaxineEnhancer:
         if self._sr_effect is None:
             self._init_effects(width, height)
 
-        # RGB → BGR (Maxine expects BGR interleaved, float32, 3 channels)
-        bgr = cv2.cvtColor(rgb_u8.reshape(height, width, 3), cv2.COLOR_RGB2BGR)
+        # nvvfx SDK expects: (3, H, W) RGB float32 in [0, 1] on CUDA
+        rgb_hwc = rgb_u8.reshape(height, width, 3).astype(np.float32) / 255.0
+        rgb_chw = np.ascontiguousarray(np.transpose(rgb_hwc, (2, 0, 1)))  # (3, H, W)
+        tensor = torch.from_numpy(rgb_chw).cuda()
 
-        # Convert uint8 → float32, then (H, W, 3) → (3, H, W) for Maxine SDK
-        bgr_f32 = bgr.astype("float32")
-        bgr_chw = np.transpose(bgr_f32, (2, 0, 1))  # (3, H, W)
-        tensor = torch.from_numpy(bgr_chw).cuda()
+        # Super-resolution → returns VideoSuperResOutput with DLPack capsule
+        output = self._sr_effect.run(tensor)
 
-        # Super-resolution → upscaled intermediate
-        tensor = self._sr_effect.run(tensor)
+        # DLPack capsule → torch tensor, clone before next call invalidates it
+        upscaled = torch.from_dlpack(output.image).clone()  # (3, H', W') float32 [0, 1]
 
-        # Download and convert (3, H', W') → (H', W', 3)
-        upscaled_chw = tensor.cpu().numpy()
-        upscaled_bgr = np.transpose(upscaled_chw, (1, 2, 0))  # (H', W', 3)
+        # Convert to uint8 RGB (H', W', 3)
+        upscaled_hwc = upscaled.permute(1, 2, 0).cpu().numpy()
+        upscaled_rgb = (np.clip(upscaled_hwc, 0.0, 1.0) * 255).astype(np.uint8)
 
-        # Ensure uint8 before cv2 operations
-        if upscaled_bgr.dtype != np.uint8:
-            upscaled_bgr = (np.clip(upscaled_bgr, 0, 255)).astype(np.uint8)
-
-        downscaled_bgr = cv2.resize(
-            upscaled_bgr, (width, height), interpolation=cv2.INTER_AREA,
+        # Downsample back to original resolution
+        result = cv2.resize(
+            upscaled_rgb, (width, height), interpolation=cv2.INTER_AREA,
         )
-
-        # BGR → RGB, ensure uint8 output
-        result = cv2.cvtColor(downscaled_bgr, cv2.COLOR_BGR2RGB)
-
-        if result.dtype != np.uint8:
-            result = (np.clip(result, 0, 255)).astype(np.uint8)
 
         return result
 
