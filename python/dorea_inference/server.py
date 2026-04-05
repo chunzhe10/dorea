@@ -23,6 +23,8 @@ import sys
 import traceback
 from typing import Optional
 
+import numpy as np
+
 from . import __version__
 from .protocol import (
     PongResponse,
@@ -206,6 +208,8 @@ def main(argv: Optional[list] = None) -> None:
                 if depth_model is None:
                     raise RuntimeError("Depth Anything not loaded — pass --depth-model")
 
+                import torch
+
                 items = req.get("items", [])
                 imgs = []
                 for item in items:
@@ -218,55 +222,76 @@ def main(argv: Optional[list] = None) -> None:
                 raune_max = int(items[0].get("raune_max_size", 1080)) if items else 1080
                 depth_max = int(items[0].get("depth_max_size", 518)) if items else 518
 
-                # RAUNE → enhanced tensors stay on GPU
-                enhanced_batch, enh_w, enh_h = raune_model.infer_batch_gpu(imgs, max_size=raune_max)
+                # Sub-batch to avoid GPU OOM: process in smaller chunks even if the request is larger
+                # RTX 3060 6GB: safe limit ~4-6 images per batch at 1024p
+                sub_batch_size = 4
 
-                # Maxine upscale (optional) — insert between RAUNE and Depth
-                enable_maxine = req.get("enable_maxine", False)
-                if enable_maxine:
-                    if maxine_enhancer is None:
-                        raise RuntimeError(
-                            "Maxine upscaling requested but enhancer failed to load — "
-                            "check NVIDIA CUDA, VFX SDK, and dependencies"
+                # Process RAUNE + Depth in sub-batches, accumulate results
+                all_enhanced_np = []
+                all_depths = []
+                enh_w, enh_h = 0, 0
+
+                for batch_start in range(0, len(imgs), sub_batch_size):
+                    batch_end = min(batch_start + sub_batch_size, len(imgs))
+                    imgs_chunk = imgs[batch_start:batch_end]
+
+                    # RAUNE → enhanced tensors stay on GPU
+                    enhanced_batch, enh_w, enh_h = raune_model.infer_batch_gpu(imgs_chunk, max_size=raune_max)
+
+                    # Maxine upscale (optional) — insert between RAUNE and Depth
+                    enable_maxine = req.get("enable_maxine", False)
+                    if enable_maxine:
+                        if maxine_enhancer is None:
+                            raise RuntimeError(
+                                "Maxine upscaling requested but enhancer failed to load — "
+                                "check NVIDIA CUDA, VFX SDK, and dependencies"
+                            )
+                        # Convert batch to uint8 RGB for Maxine (dtoh)
+                        enhanced_np = (
+                            enhanced_batch.permute(0, 2, 3, 1).cpu().numpy() * 255
+                        ).astype("uint8")  # (N, H, W, 3)
+
+                        # Frame-by-frame Maxine enhance (single-frame API) — propagate errors
+                        for i in range(enhanced_np.shape[0]):
+                            # Call _enhance_impl directly to avoid silent error swallowing
+                            try:
+                                enhanced_np[i] = maxine_enhancer._enhance_impl(
+                                    enhanced_np[i],
+                                    width=enh_w,
+                                    height=enh_h,
+                                )
+                            except Exception as e:
+                                raise RuntimeError(
+                                    f"Maxine enhance failed on frame {batch_start + i}/{len(imgs)}: {e}"
+                                ) from e
+
+                        # Convert back to float32 tensor on GPU (htod)
+                        enhanced_batch = (
+                            torch.from_numpy(enhanced_np.transpose(0, 3, 1, 2) / 255.0)
+                            .float()
+                            .cuda()
                         )
-                    # Convert batch to uint8 RGB for Maxine (dtoh)
-                    import torch
+                        # Note: enh_w, enh_h remain unchanged (Maxine returns same resolution)
+
+                    # Depth on enhanced tensors — no dtoh between models
+                    depth_maps = depth_model.infer_batch_from_tensors(enhanced_batch, depth_max_size=depth_max)
+                    all_depths.extend(depth_maps)
+
+                    # dtoh enhanced frames for output
                     enhanced_np = (
                         enhanced_batch.permute(0, 2, 3, 1).cpu().numpy() * 255
                     ).astype("uint8")  # (N, H, W, 3)
+                    all_enhanced_np.append(enhanced_np)
 
-                    # Frame-by-frame Maxine enhance (single-frame API) — propagate errors
-                    for i in range(enhanced_np.shape[0]):
-                        # Call _enhance_impl directly to avoid silent error swallowing
-                        try:
-                            enhanced_np[i] = maxine_enhancer._enhance_impl(
-                                enhanced_np[i],
-                                width=enh_w,
-                                height=enh_h,
-                            )
-                        except Exception as e:
-                            raise RuntimeError(
-                                f"Maxine enhance failed on frame {i}/{enhanced_np.shape[0]}: {e}"
-                            ) from e
+                    # Free GPU memory before next iteration
+                    del enhanced_batch
+                    torch.cuda.empty_cache()
 
-                    # Convert back to float32 tensor on GPU (htod)
-                    enhanced_batch = (
-                        torch.from_numpy(enhanced_np.transpose(0, 3, 1, 2) / 255.0)
-                        .float()
-                        .cuda()
-                    )
-                    # Note: enh_w, enh_h remain unchanged (Maxine returns same resolution)
-
-                # Depth on enhanced tensors — no dtoh between models
-                depth_maps = depth_model.infer_batch_from_tensors(enhanced_batch, depth_max_size=depth_max)
-
-                # dtoh enhanced frames for output
-                enhanced_np = (
-                    enhanced_batch.permute(0, 2, 3, 1).cpu().numpy() * 255
-                ).astype("uint8")  # (N, H, W, 3)
+                # Concatenate all sub-batches
+                enhanced_np = np.concatenate(all_enhanced_np, axis=0)
 
                 results = []
-                for i, (item, depth) in enumerate(zip(items, depth_maps)):
+                for i, (item, depth) in enumerate(zip(items, all_depths)):
                     depth_result = DepthResult.from_array(item.get("id"), depth)
                     results.append({
                         "id": item.get("id"),
