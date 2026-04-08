@@ -327,4 +327,38 @@ mod tests {
         assert!(!cfg.skip_raune, "RAUNE should not be skipped in config");
         assert!(!cfg.skip_depth, "depth should not be skipped in config");
     }
+
+    #[test]
+    fn default_encoding_for_8bit_h264() {
+        use dorea_video::ffmpeg::{InputEncoding, OutputCodec, VideoInfo};
+        let info = VideoInfo {
+            width: 1920, height: 1080, fps: 30.0, duration_secs: 10.0,
+            frame_count: 300, has_audio: true,
+            codec_name: "h264".to_string(),
+            pix_fmt: "yuv420p".to_string(),
+            bits_per_component: 8,
+        };
+        let enc = InputEncoding::auto_detect(&info, std::path::Path::new("clip.mp4"));
+        assert_eq!(enc, InputEncoding::Srgb);
+        assert!(!enc.is_10bit());
+        let codec = if enc.is_10bit() { OutputCodec::ProRes } else { OutputCodec::H264 };
+        assert_eq!(codec, OutputCodec::H264);
+    }
+
+    #[test]
+    fn default_encoding_for_10bit_hevc() {
+        use dorea_video::ffmpeg::{InputEncoding, OutputCodec, VideoInfo};
+        let info = VideoInfo {
+            width: 3840, height: 2160, fps: 29.97, duration_secs: 3.0,
+            frame_count: 90, has_audio: true,
+            codec_name: "hevc".to_string(),
+            pix_fmt: "yuv420p10le".to_string(),
+            bits_per_component: 10,
+        };
+        let enc = InputEncoding::auto_detect(&info, std::path::Path::new("clip.mp4"));
+        assert_eq!(enc, InputEncoding::DLogM);
+        assert!(enc.is_10bit());
+        let codec = if enc.is_10bit() { OutputCodec::ProRes } else { OutputCodec::H264 };
+        assert_eq!(codec, OutputCodec::ProRes);
+    }
 }
