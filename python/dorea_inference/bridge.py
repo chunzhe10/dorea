@@ -180,8 +180,8 @@ def run_raune_depth_batch_cpu(
                 .cuda()
             )
 
-        # Depth on enhanced tensors — no dtoh between RAUNE and Depth
-        depth_maps = _depth_model.infer_batch_from_tensors(enhanced_batch, depth_max_size=depth_max_size)
+        # Depth on ORIGINAL frames — RAUNE enhancement distorts depth estimation
+        depth_maps = _depth_model.infer_batch(imgs_chunk, max_size=depth_max_size)
 
         # dtoh enhanced frames
         enhanced_np = (

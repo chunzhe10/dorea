@@ -269,8 +269,8 @@ def main(argv: Optional[list] = None) -> None:
                         )
                         # Note: enh_w, enh_h remain unchanged (Maxine returns same resolution)
 
-                    # Depth on enhanced tensors — no dtoh between models
-                    depth_maps = depth_model.infer_batch_from_tensors(enhanced_batch, depth_max_size=depth_max)
+                    # Depth on ORIGINAL frames — RAUNE enhancement distorts depth estimation
+                    depth_maps = depth_model.infer_batch(imgs_chunk, max_size=depth_max)
                     all_depths.extend(depth_maps)
 
                     # dtoh enhanced frames for output
