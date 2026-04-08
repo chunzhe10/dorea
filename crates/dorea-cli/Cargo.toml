@@ -15,6 +15,7 @@ dorea-cal = { workspace = true }
 dorea-gpu = { workspace = true }
 dorea-video = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
 image = "0.25"
 anyhow = { workspace = true }
 log = { workspace = true }
