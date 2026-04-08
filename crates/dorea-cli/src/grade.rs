@@ -176,7 +176,6 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         maxine_upscale_factor,
         interp_enabled: !args.no_depth_interp,
         maxine_in_fused_batch: true,
-        inference_config: inf_cfg.clone(),
     };
 
     // -----------------------------------------------------------------------

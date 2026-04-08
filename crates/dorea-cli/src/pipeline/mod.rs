@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use dorea_gpu::GradeParams;
-use dorea_video::inference::InferenceConfig;
 
 /// Resolved pipeline configuration — all CLI/config/defaults merged.
 /// Passed to each stage by reference.
@@ -33,7 +32,6 @@ pub struct PipelineConfig {
     pub maxine_upscale_factor: u32,
     pub interp_enabled: bool,
     pub maxine_in_fused_batch: bool,
-    pub inference_config: InferenceConfig,
 }
 
 impl PipelineConfig {
@@ -58,8 +56,6 @@ pub struct FeatureStageOutput {
     pub store: feature::PagedCalibrationStore,
     pub keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)>,
     pub keyframes: Vec<keyframe::KeyframeEntry>,
-    pub proxy_w: usize,
-    pub proxy_h: usize,
 }
 
 /// Output of CalibrationStage → input of GradingStage.

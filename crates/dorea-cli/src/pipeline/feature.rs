@@ -196,7 +196,5 @@ pub fn run_feature_stage(
         store,
         keyframe_depths: kf_depths,
         keyframes,
-        proxy_w,
-        proxy_h,
     })
 }

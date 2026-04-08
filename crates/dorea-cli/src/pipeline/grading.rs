@@ -80,6 +80,7 @@ pub fn run_grading_stage(
 
     let mut kf_cursor = 0usize;
     let mut frame_count = 0u64;
+    #[cfg(feature = "cuda")]
     let mut current_segment = kf_to_segment.first().copied().unwrap_or(0);
 
     for frame_result in frames {
