@@ -183,6 +183,8 @@ pub fn grade_frame_with_adaptive_grader(
     depth: &[f32],
     width: usize,
     height: usize,
+    depth_w: usize,
+    depth_h: usize,
     blend_t: f32,
 ) -> Result<Vec<u8>, GpuError> {
     if pixels.len() != width * height * 3 {
@@ -192,12 +194,5 @@ pub fn grade_frame_with_adaptive_grader(
             width * height * 3
         )));
     }
-    if depth.len() != width * height {
-        return Err(GpuError::InvalidInput(format!(
-            "depth length {} != width*height {}",
-            depth.len(),
-            width * height
-        )));
-    }
-    grader.grade_frame_blended(pixels, depth, width, height, blend_t)
+    grader.grade_frame_blended(pixels, depth, width, height, depth_w, depth_h, blend_t)
 }

@@ -30,7 +30,12 @@ __global__ void combined_lut_kernel(
     unsigned char*       __restrict__ pixels_out,
     int n_pixels,
     int n_zones,
-    int grid_size
+    int grid_size,
+    // Depth map dimensions (may differ from frame — kernel does bilinear sampling)
+    int frame_w,
+    int frame_h,
+    int depth_w,
+    int depth_h
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_pixels) return;
@@ -38,7 +43,27 @@ __global__ void combined_lut_kernel(
     float r = pixels_in[idx * 3 + 0] * (1.0f / 255.0f);
     float g = pixels_in[idx * 3 + 1] * (1.0f / 255.0f);
     float b = pixels_in[idx * 3 + 2] * (1.0f / 255.0f);
-    float d = depth[idx];
+
+    // Bilinear sample depth at proxy resolution — avoids blocky upscale artifacts.
+    float d;
+    if (depth_w == frame_w && depth_h == frame_h) {
+        d = depth[idx];
+    } else {
+        int px = idx % frame_w;
+        int py = idx / frame_w;
+        float sx = (float)px * (float)(depth_w - 1) / (float)(frame_w - 1);
+        float sy = (float)py * (float)(depth_h - 1) / (float)(frame_h - 1);
+        int x0 = (int)sx;
+        int y0 = (int)sy;
+        int x1 = min(x0 + 1, depth_w - 1);
+        int y1 = min(y0 + 1, depth_h - 1);
+        float fx = sx - (float)x0;
+        float fy = sy - (float)y0;
+        d = depth[y0 * depth_w + x0] * (1.0f - fx) * (1.0f - fy)
+          + depth[y0 * depth_w + x1] * fx * (1.0f - fy)
+          + depth[y1 * depth_w + x0] * (1.0f - fx) * fy
+          + depth[y1 * depth_w + x1] * fx * fy;
+    }
     float gs = (float)(grid_size - 1);
 
     // --- Sample texture set A ---

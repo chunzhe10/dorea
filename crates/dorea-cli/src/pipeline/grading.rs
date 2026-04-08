@@ -201,11 +201,9 @@ pub fn run_grading_stage(
                     prev_depth_proxy.clone()
                 };
 
-                let depth = if dpw == frame.width && dph == frame.height {
-                    depth_proxy
-                } else {
-                    InferenceServer::upscale_depth(&depth_proxy, dpw, dph, frame.width, frame.height)
-                };
+                // Pass depth at its native resolution — the CUDA kernel samples it
+                // with bilinear interpolation, avoiding blocky upscale artifacts.
+                let depth = depth_proxy;
 
                 let blend_t = if fi == prev_kf_idx {
                     0.0_f32
@@ -219,7 +217,7 @@ pub fn run_grading_stage(
 
                 #[cfg(feature = "cuda")]
                 let graded = adaptive_grader.grade_frame_blended(
-                    &frame.pixels, &depth, frame.width, frame.height, blend_t,
+                    &frame.pixels, &depth, frame.width, frame.height, dpw, dph, blend_t,
                 ).map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?;
 
                 #[cfg(not(feature = "cuda"))]

@@ -168,20 +168,35 @@ impl CudaGrader {
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
+            let blend_t_val = 0.0f32;
+            let n_i32 = n as i32;
+            let nz_i32 = self.combined_lut.n_zones as i32;
+            let gs_i32 = self.combined_lut.grid_size as i32;
+            let fw_i32 = width as i32;
+            let fh_i32 = height as i32;
+            // CudaGrader: depth is same res as frame
+            let dw_i32 = width as i32;
+            let dh_i32 = height as i32;
+            use cudarc::driver::DeviceRepr;
+            let mut args: [*mut std::ffi::c_void; 15] = [
+                (&bufs.d_pixels_in).as_kernel_param(),
+                (&bufs.d_depth).as_kernel_param(),
+                (&self.d_textures).as_kernel_param(),
+                (&self.d_boundaries).as_kernel_param(),
+                (&self.d_textures).as_kernel_param(),
+                (&self.d_boundaries).as_kernel_param(),
+                blend_t_val.as_kernel_param(),
+                (&bufs.d_pixels_out).as_kernel_param(),
+                n_i32.as_kernel_param(),
+                nz_i32.as_kernel_param(),
+                gs_i32.as_kernel_param(),
+                fw_i32.as_kernel_param(),
+                fh_i32.as_kernel_param(),
+                dw_i32.as_kernel_param(),
+                dh_i32.as_kernel_param(),
+            ];
             unsafe {
-                func.launch(cfg, (
-                    &bufs.d_pixels_in,
-                    &bufs.d_depth,
-                    &self.d_textures,       // textures_a (cached)
-                    &self.d_boundaries,     // zone_boundaries_a (cached)
-                    &self.d_textures,       // textures_b (same — never sampled when blend_t=0)
-                    &self.d_boundaries,     // zone_boundaries_b (same)
-                    0.0f32,                 // blend_t = 0.0
-                    &bufs.d_pixels_out,
-                    n as i32,
-                    self.combined_lut.n_zones as i32,
-                    self.combined_lut.grid_size as i32,
-                ))
+                func.launch(cfg, &mut args[..])
             }.map_err(map_cudarc_error)?;
         }
 
@@ -627,6 +642,8 @@ impl AdaptiveGrader {
         depth: &[f32],
         width: usize,
         height: usize,
+        depth_w: usize,
+        depth_h: usize,
         blend_t: f32,
     ) -> Result<Vec<u8>, GpuError> {
         let n = width.checked_mul(height).ok_or_else(|| {
@@ -637,9 +654,12 @@ impl AdaptiveGrader {
                 "pixels len {} != {}*3", pixels.len(), n
             )));
         }
-        if depth.len() != n {
+        let dn = depth_w.checked_mul(depth_h).ok_or_else(|| {
+            GpuError::InvalidInput("depth dimensions overflow usize".into())
+        })?;
+        if depth.len() != dn {
             return Err(GpuError::InvalidInput(format!(
-                "depth len {} != {}", depth.len(), n
+                "depth len {} != depth_w*depth_h {}", depth.len(), dn
             )));
         }
         let dev = &self.device;
@@ -653,8 +673,10 @@ impl AdaptiveGrader {
             }
             let bufs = slot.as_mut().expect("frame_bufs allocated above");
             dev.htod_sync_copy_into(pixels, &mut bufs.d_pixels_in).map_err(map_cudarc_error)?;
-            dev.htod_sync_copy_into(depth, &mut bufs.d_depth).map_err(map_cudarc_error)?;
         }
+
+        // Upload depth separately — may be at different resolution than frame.
+        let d_depth = dev.htod_sync_copy(depth).map_err(map_cudarc_error)?;
 
         // Determine which cached device slices correspond to the current active/inactive sets.
         // d_textures_a/d_bounds_a always correspond to sets[0], d_textures_b/d_bounds_b to sets[1].
@@ -680,20 +702,33 @@ impl AdaptiveGrader {
                 shared_mem_bytes: 0,
             };
 
+            let n_i32 = n as i32;
+            let nz_i32 = self.adaptive_lut.runtime_n_zones as i32;
+            let gs_i32 = self.adaptive_lut.grid_size as i32;
+            let fw_i32 = width as i32;
+            let fh_i32 = height as i32;
+            let dw_i32 = depth_w as i32;
+            let dh_i32 = depth_h as i32;
+            use cudarc::driver::DeviceRepr;
+            let mut args: [*mut std::ffi::c_void; 15] = [
+                (&bufs.d_pixels_in).as_kernel_param(),
+                (&d_depth).as_kernel_param(),
+                d_tex_active.as_kernel_param(),
+                (&*bounds_a).as_kernel_param(),
+                d_tex_inactive.as_kernel_param(),
+                (&*bounds_b).as_kernel_param(),
+                blend_t.as_kernel_param(),
+                (&bufs.d_pixels_out).as_kernel_param(),
+                n_i32.as_kernel_param(),
+                nz_i32.as_kernel_param(),
+                gs_i32.as_kernel_param(),
+                fw_i32.as_kernel_param(),
+                fh_i32.as_kernel_param(),
+                dw_i32.as_kernel_param(),
+                dh_i32.as_kernel_param(),
+            ];
             unsafe {
-                func.launch(cfg, (
-                    &bufs.d_pixels_in,
-                    &bufs.d_depth,
-                    d_tex_active,
-                    &*bounds_a,
-                    d_tex_inactive,
-                    &*bounds_b,
-                    blend_t,
-                    &bufs.d_pixels_out,
-                    n as i32,
-                    self.adaptive_lut.runtime_n_zones as i32,
-                    self.adaptive_lut.grid_size as i32,
-                ))
+                func.launch(cfg, &mut args[..])
             }.map_err(map_cudarc_error)?;
         }
 
