@@ -106,7 +106,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
     let depth_skip_threshold = args.depth_skip_threshold.or(cfg.grade.depth_skip_threshold).unwrap_or(0.005_f32);
     let depth_max_interval  = args.depth_max_interval.or(cfg.grade.depth_max_interval).unwrap_or(12_usize);
     let fused_batch_size    = args.fused_batch_size.or(cfg.grade.fused_batch_size).unwrap_or(32_usize);
-    let depth_zones         = args.depth_zones.or(cfg.grade.depth_zones).unwrap_or(16_usize);
+    let depth_zones         = args.depth_zones.or(cfg.grade.depth_zones).unwrap_or(32_usize);
     let base_lut_zones      = args.base_lut_zones.or(cfg.grade.base_lut_zones).unwrap_or(32_usize);
     let scene_threshold     = args.scene_threshold.or(cfg.grade.scene_threshold).unwrap_or(0.15_f32);
     let min_segment_kfs     = cfg.grade.min_segment_keyframes.unwrap_or(5_usize);

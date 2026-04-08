@@ -42,6 +42,8 @@ __global__ void combined_lut_kernel(
     float gs = (float)(grid_size - 1);
 
     // --- Sample texture set A ---
+    // Zone blending: each zone's influence extends 2x its width (overlaps neighbors).
+    // This prevents hard color discontinuities at zone boundaries.
     float total_w_a = 0.0f;
     float4 blended_a = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int z = 0; z < n_zones; z++) {
@@ -51,7 +53,9 @@ __global__ void combined_lut_kernel(
         if (z_width < 1e-6f) continue;
         float z_center = 0.5f * (z_lo + z_hi);
         float dist = fabsf(d - z_center);
-        float w = fmaxf(1.0f - dist / z_width, 0.0f);
+        float blend_radius = z_width * 2.0f;  // 2x overlap for smooth transitions
+        float w = fmaxf(1.0f - dist / blend_radius, 0.0f);
+        w = w * w;  // squared falloff for smoother transitions than linear
         if (w < 1e-6f) continue;
         cudaTextureObject_t tex = (cudaTextureObject_t)textures_a[z];
         float4 s = tex3D<float4>(tex, r * gs, g * gs, b * gs);
@@ -85,7 +89,9 @@ __global__ void combined_lut_kernel(
             if (z_width < 1e-6f) continue;
             float z_center = 0.5f * (z_lo + z_hi);
             float dist = fabsf(d - z_center);
-            float w = fmaxf(1.0f - dist / z_width, 0.0f);
+            float blend_radius = z_width * 2.0f;
+            float w = fmaxf(1.0f - dist / blend_radius, 0.0f);
+            w = w * w;
             if (w < 1e-6f) continue;
             cudaTextureObject_t tex = (cudaTextureObject_t)textures_b[z];
             float4 s = tex3D<float4>(tex, r * gs, g * gs, b * gs);
