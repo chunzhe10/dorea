@@ -16,6 +16,8 @@ enum Command {
     Grade(dorea_cli::grade::GradeArgs),
     /// Generate a before/after contact sheet (5-10 frames)
     Preview(dorea_cli::preview::PreviewArgs),
+    /// Detect container, codec, bit depth, and suggest flags
+    Probe(dorea_cli::probe::ProbeArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -27,6 +29,7 @@ fn main() -> anyhow::Result<()> {
         Command::Calibrate(a) => a.verbose,
         Command::Grade(a) => a.verbose,
         Command::Preview(a) => a.verbose,
+        Command::Probe(_) => false,
     };
 
     env_logger::Builder::from_env(env_logger::Env::default())
@@ -43,5 +46,6 @@ fn main() -> anyhow::Result<()> {
         Command::Calibrate(args) => dorea_cli::calibrate::run(args, &config),
         Command::Grade(args) => dorea_cli::grade::run(args, &config),
         Command::Preview(args) => dorea_cli::preview::run(args, &config),
+        Command::Probe(args) => dorea_cli::probe::run(args),
     }
 }

@@ -5,3 +5,4 @@ pub mod grade;
 pub mod optical_flow;
 pub mod pipeline;
 pub mod preview;
+pub mod probe;
