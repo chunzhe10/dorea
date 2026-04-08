@@ -24,6 +24,8 @@ base_lut_zones       = 32    # base LUT zones per scene segment (color science)
 scene_threshold      = 0.15  # Wasserstein-1 depth distance to split scene segments [0.0–1.0]
 min_segment_keyframes = 3    # merge segments shorter than this into the previous one
 zone_smoothing_window = 3    # moving-average window for per-KF zone boundary smoothing
+# input_encoding = "auto"    # auto-detect from container/codec; options: dlog-m, ilog, srgb
+# output_codec = "auto"      # auto: prores for 10-bit, h264 for 8-bit; options: prores, hevc10, h264
 
 [maxine]
 upscale_factor     = 2       # SR factor: 2, 3, or 4 (used when SR is re-enabled)
