@@ -84,6 +84,60 @@ impl std::str::FromStr for InputEncoding {
 }
 
 // ---------------------------------------------------------------------------
+// OutputCodec — codec family for the encoded output
+// ---------------------------------------------------------------------------
+
+/// Codec family for the encoded output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputCodec {
+    /// Apple ProRes 422 HQ (10-bit, .mov).
+    ProRes,
+    /// HEVC / H.265 Main 10 profile (10-bit, .mp4 / .mov).
+    Hevc10,
+    /// H.264 (8-bit, .mp4).
+    H264,
+}
+
+impl OutputCodec {
+    /// Returns `true` for codecs that carry 10-bit colour data.
+    pub fn is_10bit(&self) -> bool {
+        matches!(self, Self::ProRes | Self::Hevc10)
+    }
+
+    /// Bytes per pixel in the raw frame buffer consumed by this codec's encoder.
+    ///
+    /// - 8-bit RGB (H264): 3 bytes/pixel
+    /// - 16-bit RGB48 (ProRes, Hevc10): 6 bytes/pixel
+    pub fn bytes_per_pixel(&self) -> usize {
+        if self.is_10bit() { 6 } else { 3 }
+    }
+}
+
+impl std::fmt::Display for OutputCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProRes => write!(f, "prores"),
+            Self::Hevc10 => write!(f, "hevc10"),
+            Self::H264 => write!(f, "h264"),
+        }
+    }
+}
+
+impl std::str::FromStr for OutputCodec {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "prores" | "prores_ks" => Ok(Self::ProRes),
+            "hevc10" | "hevc" | "h265" | "h265_10" => Ok(Self::Hevc10),
+            "h264" | "avc" => Ok(Self::H264),
+            other => Err(format!(
+                "unknown codec '{other}'; expected prores, hevc10, or h264"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VideoInfo
 // ---------------------------------------------------------------------------
 
@@ -756,6 +810,143 @@ impl FrameEncoder {
         })
     }
 
+    /// Spawn a 10-bit encoder subprocess.
+    ///
+    /// Accepts `rgb48le` raw frames (6 bytes/pixel) from `write_frame_16`.
+    /// Codec selection:
+    /// - `OutputCodec::ProRes` → `prores_ks -profile:v 3 -pix_fmt yuv422p10le`
+    /// - `OutputCodec::Hevc10` → `hevc_nvenc -profile:v main10` (fallback: `libx265 -profile:v main10`)
+    /// - `OutputCodec::H264`  → standard H.264 (ffmpeg down-converts rgb48le → yuv420p)
+    pub fn new_10bit(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: f64,
+        codec: OutputCodec,
+        input_for_audio: Option<&Path>,
+    ) -> Result<Self, FfmpegError> {
+        if let Some(parent) = output.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                return Err(FfmpegError::EncodeFailed(format!(
+                    "output directory does not exist: {}",
+                    parent.display()
+                )));
+            }
+        }
+
+        let fps_s = format!("{fps:.3}");
+        let size_s = format!("{width}x{height}");
+        let out_s = output.to_str().unwrap_or("output.mov");
+
+        let bytes_per_pixel = codec.bytes_per_pixel();
+        // For rgb48le the pixel_format name ffmpeg understands:
+        let input_pix_fmt = if codec.is_10bit() { "rgb48le" } else { "rgb24" };
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-f", "rawvideo",
+            "-pixel_format", input_pix_fmt,
+            "-s", &size_s,
+            "-r", &fps_s,
+            "-i", "pipe:0",
+        ]);
+
+        if let Some(audio_src) = input_for_audio {
+            cmd.args(["-i", audio_src.to_str().unwrap_or("")]);
+            cmd.args(["-map", "0:v", "-map", "1:a", "-c:a", "copy"]);
+        } else {
+            cmd.args(["-map", "0:v"]);
+        }
+
+        match codec {
+            OutputCodec::ProRes => {
+                cmd.args([
+                    "-c:v", "prores_ks",
+                    "-profile:v", "3",        // ProRes 422 HQ
+                    "-pix_fmt", "yuv422p10le",
+                ]);
+            }
+            OutputCodec::Hevc10 => {
+                // Cache HEVC NVENC availability separately from H.264 NVENC.
+                static HEVC_NVENC_AVAILABLE: OnceLock<bool> = OnceLock::new();
+                let hevc_nvenc = *HEVC_NVENC_AVAILABLE.get_or_init(|| {
+                    Command::new("ffmpeg")
+                        .args(["-hide_banner", "-encoders"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).contains("hevc_nvenc"))
+                        .unwrap_or(false)
+                });
+
+                if hevc_nvenc {
+                    cmd.args([
+                        "-c:v", "hevc_nvenc",
+                        "-profile:v", "main10",
+                        "-pix_fmt", "p010le",
+                    ]);
+                } else {
+                    cmd.args([
+                        "-c:v", "libx265",
+                        "-profile:v", "main10",
+                        "-pix_fmt", "yuv420p10le",
+                        "-crf", "18",
+                        "-preset", "fast",
+                    ]);
+                }
+            }
+            OutputCodec::H264 => {
+                // ffmpeg will handle the rgb48le → yuv420p downconversion.
+                static NVENC_AVAILABLE_10: OnceLock<bool> = OnceLock::new();
+                let nvenc = *NVENC_AVAILABLE_10.get_or_init(|| {
+                    Command::new("ffmpeg")
+                        .args(["-hide_banner", "-encoders"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_nvenc"))
+                        .unwrap_or(false)
+                });
+
+                if nvenc {
+                    cmd.args(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18"]);
+                } else {
+                    cmd.args(["-c:v", "libx264", "-crf", "18", "-preset", "fast"]);
+                }
+            }
+        }
+
+        cmd.arg(out_s);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(FfmpegError::NotFound)?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            FfmpegError::EncodeFailed("could not open 10-bit encoder stdin".to_string())
+        })?;
+        let stderr = child.stderr.take();
+
+        if let Ok(Some(status)) = child.try_wait() {
+            let msg = stderr
+                .map(|mut s| {
+                    let mut buf = String::new();
+                    let _ = s.read_to_string(&mut buf);
+                    buf
+                })
+                .unwrap_or_default();
+            return Err(FfmpegError::EncodeFailed(format!(
+                "10-bit ffmpeg encoder exited immediately (code {:?}): {}",
+                status.code(),
+                msg.trim()
+            )));
+        }
+
+        Ok(Self {
+            child,
+            stdin,
+            stderr,
+            frame_bytes: width * height * bytes_per_pixel,
+        })
+    }
+
     /// Write one RGB24 frame to the encoder.
     pub fn write_frame(&mut self, pixels: &[u8]) -> Result<(), FfmpegError> {
         if pixels.len() != self.frame_bytes {
@@ -767,6 +958,41 @@ impl FrameEncoder {
         }
         if let Err(e) = self.stdin.write_all(pixels) {
             // Broken pipe means ffmpeg exited — check its stderr for a real error message.
+            let stderr_msg = self.stderr.as_mut().map(|s| {
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            }).unwrap_or_default();
+            let exit_code = self.child.try_wait().ok().flatten()
+                .and_then(|s| s.code())
+                .map(|c| format!(" (exit code {c})"))
+                .unwrap_or_default();
+            let detail = if stderr_msg.trim().is_empty() {
+                format!("{e}{exit_code}")
+            } else {
+                format!("{}{exit_code}: {}", e, stderr_msg.trim())
+            };
+            return Err(FfmpegError::EncodeFailed(format!("ffmpeg encoder died: {detail}")));
+        }
+        Ok(())
+    }
+
+    /// Write one RGB48 frame (as `&[u16]`) to a 10-bit encoder.
+    ///
+    /// Converts the u16 slice to little-endian bytes and forwards to the encoder stdin.
+    /// The slice length must equal `width * height * 3`.
+    pub fn write_frame_16(&mut self, pixels: &[u16]) -> Result<(), FfmpegError> {
+        // 2 bytes per u16
+        let expected_u16 = self.frame_bytes / 2;
+        if pixels.len() != expected_u16 {
+            return Err(FfmpegError::EncodeFailed(format!(
+                "frame16 size mismatch: expected {} u16 values, got {}",
+                expected_u16,
+                pixels.len()
+            )));
+        }
+        let bytes: Vec<u8> = pixels.iter().flat_map(|&v| v.to_le_bytes()).collect();
+        if let Err(e) = self.stdin.write_all(&bytes) {
             let stderr_msg = self.stderr.as_mut().map(|s| {
                 let mut buf = String::new();
                 let _ = s.read_to_string(&mut buf);
@@ -943,6 +1169,39 @@ mod tests {
         assert_eq!(eight[0], 0xFF);
         assert_eq!(eight[1], 0x80);
         assert_eq!(eight[2], 0x01);
+    }
+
+    // ---- Task 7 tests ----
+
+    #[test]
+    fn output_codec_is_10bit() {
+        assert!(OutputCodec::ProRes.is_10bit());
+        assert!(OutputCodec::Hevc10.is_10bit());
+        assert!(!OutputCodec::H264.is_10bit());
+    }
+
+    #[test]
+    fn output_codec_bytes_per_pixel() {
+        assert_eq!(OutputCodec::ProRes.bytes_per_pixel(), 6);
+        assert_eq!(OutputCodec::Hevc10.bytes_per_pixel(), 6);
+        assert_eq!(OutputCodec::H264.bytes_per_pixel(), 3);
+    }
+
+    #[test]
+    fn output_codec_parse() {
+        assert_eq!("prores".parse::<OutputCodec>(), Ok(OutputCodec::ProRes));
+        assert_eq!("hevc10".parse::<OutputCodec>(), Ok(OutputCodec::Hevc10));
+        assert_eq!("hevc".parse::<OutputCodec>(), Ok(OutputCodec::Hevc10));
+        assert_eq!("h264".parse::<OutputCodec>(), Ok(OutputCodec::H264));
+        assert_eq!("avc".parse::<OutputCodec>(), Ok(OutputCodec::H264));
+        assert!("unknown".parse::<OutputCodec>().is_err());
+    }
+
+    #[test]
+    fn output_codec_display() {
+        assert_eq!(OutputCodec::ProRes.to_string(), "prores");
+        assert_eq!(OutputCodec::Hevc10.to_string(), "hevc10");
+        assert_eq!(OutputCodec::H264.to_string(), "h264");
     }
 
     #[test]
