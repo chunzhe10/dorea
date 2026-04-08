@@ -8,7 +8,7 @@ use std::time::Duration;
 use clap::Args;
 use anyhow::{Context, Result};
 
-use dorea_video::ffmpeg::{self, FrameEncoder};
+use dorea_video::ffmpeg::{self, FrameEncoder, InputEncoding, OutputCodec};
 use dorea_video::inference::{InferenceConfig, InferenceServer};
 
 use crate::pipeline::{self, PipelineConfig};
@@ -95,6 +95,14 @@ pub struct GradeArgs {
     /// (config: [maxine].upscale_factor, built-in default: 2)
     #[arg(long)]
     pub maxine_upscale_factor: Option<u32>,
+
+    /// Input encoding: dlog-m, ilog, srgb (default: auto-detect from container)
+    #[arg(long)]
+    pub input_encoding: Option<String>,
+
+    /// Output codec: prores, hevc10, h264 (default: auto for source bit depth)
+    #[arg(long)]
+    pub output_codec: Option<String>,
 }
 
 pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
@@ -135,13 +143,6 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         anyhow::bail!("--depth-max-interval must be >= 1");
     }
 
-    let output = args.output.clone().unwrap_or_else(|| {
-        let stem = args.input.file_stem().unwrap_or_default().to_string_lossy();
-        args.input.with_file_name(format!("{stem}_graded.mp4"))
-    });
-
-    log::info!("Grading: {} → {}", args.input.display(), output.display());
-
     // Probe input
     let info = ffmpeg::probe(&args.input)
         .context("ffprobe failed — is ffmpeg installed?")?;
@@ -150,10 +151,41 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         info.width, info.height, info.fps, info.duration_secs, info.frame_count
     );
 
+    // Resolve input encoding: CLI flag → config → auto-detect
+    let input_encoding = args.input_encoding.as_deref()
+        .or(cfg.grade.input_encoding.as_deref())
+        .map(|s| s.parse::<InputEncoding>().map_err(|e| anyhow::anyhow!("invalid --input-encoding: {e}")))
+        .transpose()?
+        .unwrap_or_else(|| InputEncoding::auto_detect(&info, &args.input));
+
+    // Resolve output codec: CLI flag → config → auto based on input encoding
+    let output_codec = args.output_codec.as_deref()
+        .or(cfg.grade.output_codec.as_deref())
+        .map(|s| s.parse::<OutputCodec>().map_err(|e| anyhow::anyhow!("invalid --output-codec: {e}")))
+        .transpose()?
+        .unwrap_or_else(|| {
+            if input_encoding.is_10bit() { OutputCodec::ProRes } else { OutputCodec::H264 }
+        });
+
+    log::info!("Encoding: input={input_encoding}, output={output_codec}, 10-bit={}", output_codec.is_10bit());
+
+    let output = args.output.clone().unwrap_or_else(|| {
+        let stem = args.input.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = if output_codec == OutputCodec::ProRes { "mov" } else { "mp4" };
+        args.input.with_file_name(format!("{stem}_graded.{ext}"))
+    });
+
+    log::info!("Grading: {} → {}", args.input.display(), output.display());
+
     // Open encoder first — validate output path before doing expensive calibration.
     let audio_src = if info.has_audio { Some(args.input.as_path()) } else { None };
-    let encoder = FrameEncoder::new(&output, info.width, info.height, info.fps, audio_src)
-        .context("failed to spawn ffmpeg encoder")?;
+    let encoder = if output_codec.is_10bit() {
+        FrameEncoder::new_10bit(&output, info.width, info.height, info.fps, output_codec, audio_src)
+            .context("failed to spawn 10-bit ffmpeg encoder")?
+    } else {
+        FrameEncoder::new(&output, info.width, info.height, info.fps, audio_src)
+            .context("failed to spawn ffmpeg encoder")?
+    };
 
     let inf_cfg = build_inference_config(
         &python, raune_weights.as_deref(), raune_models_dir.as_deref(),
@@ -177,6 +209,8 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         maxine_upscale_factor,
         interp_enabled: !args.no_depth_interp,
         maxine_in_fused_batch: false, // Maxine disabled — SDK not available in devcontainer
+        input_encoding,
+        output_codec,
     };
 
     // -----------------------------------------------------------------------
@@ -289,7 +323,7 @@ mod tests {
     fn build_inference_config_defaults() {
         let python = PathBuf::from("/opt/dorea-venv/bin/python");
         let cfg = build_inference_config(&python, None, None, None, None, 2);
-        assert!(cfg.maxine, "Maxine should be enabled for fused batch upscaling");
+        assert!(!cfg.maxine, "Maxine should be disabled — SDK not available in devcontainer");
         assert!(!cfg.skip_raune, "RAUNE should not be skipped in config");
         assert!(!cfg.skip_depth, "depth should not be skipped in config");
     }

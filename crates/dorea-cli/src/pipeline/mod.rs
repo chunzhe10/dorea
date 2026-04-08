@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use dorea_gpu::GradeParams;
+use dorea_video::ffmpeg::{InputEncoding, OutputCodec};
 use crate::optical_flow::MotionField;
 
 /// Resolved pipeline configuration — all CLI/config/defaults merged.
@@ -33,6 +34,8 @@ pub struct PipelineConfig {
     pub maxine_upscale_factor: u32,
     pub interp_enabled: bool,
     pub maxine_in_fused_batch: bool,
+    pub input_encoding: InputEncoding,
+    pub output_codec: OutputCodec,
 }
 
 impl PipelineConfig {

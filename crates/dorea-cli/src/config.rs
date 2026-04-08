@@ -73,6 +73,10 @@ pub struct GradeDefaults {
     pub min_segment_keyframes: Option<usize>,
     /// Zone boundary smoothing window width; 1 = no smoothing (default: 3)
     pub zone_smoothing_window: Option<usize>,
+    /// Input encoding override (default: auto-detect from container/codec)
+    pub input_encoding: Option<String>,
+    /// Output codec (default: "h264" for 8-bit, "prores" for 10-bit)
+    pub output_codec: Option<String>,
 }
 
 /// Maxine VFX SDK defaults (used when Maxine is re-enabled).
