@@ -117,6 +117,18 @@ __global__ void combined_lut_kernel(
         b_out = b_a * inv_t + b_b * blend_t;
     }
 
+    // Depth-dependent strength: reduce correction at distance.
+    // Near camera (d→1.0): full correction. Far away (d→0.0): reduced.
+    // This prevents aggressive red over-correction in the far water column
+    // where SNR is low and correction magnitudes are largest.
+    float depth_strength = 0.3f + 0.7f * d;  // range [0.3, 1.0] — never fully zero
+
+    // Also clamp per-channel correction to prevent extreme shifts on dark pixels.
+    float max_shift = 0.15f;  // max ±0.15 per channel (±38/255)
+    r_out = r + fminf(fmaxf(r_out - r, -max_shift), max_shift) * depth_strength;
+    g_out = g + fminf(fmaxf(g_out - g, -max_shift), max_shift) * depth_strength;
+    b_out = b + fminf(fmaxf(b_out - b, -max_shift), max_shift) * depth_strength;
+
     pixels_out[idx * 3 + 0] = (unsigned char)(__float2uint_rn(fminf(fmaxf(r_out, 0.0f), 1.0f) * 255.0f));
     pixels_out[idx * 3 + 1] = (unsigned char)(__float2uint_rn(fminf(fmaxf(g_out, 0.0f), 1.0f) * 255.0f));
     pixels_out[idx * 3 + 2] = (unsigned char)(__float2uint_rn(fminf(fmaxf(b_out, 0.0f), 1.0f) * 255.0f));
