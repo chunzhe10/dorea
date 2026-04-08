@@ -71,6 +71,17 @@ __global__ void combined_lut_kernel(
           + depth[y1 * depth_w + x1] * fx * fy;
     }
 
+    // Depth dithering: add sub-zone noise to break up banding at zone transitions.
+    // Uses a simple hash of pixel position for spatially-stable noise (no temporal flicker).
+    {
+        unsigned int hash = (unsigned int)(idx * 2654435761u);  // Knuth multiplicative hash
+        float noise = ((float)(hash & 0xFFFF) / 65535.0f - 0.5f);  // [-0.5, +0.5]
+        // Scale noise to half a zone width — enough to smooth transitions but not shift zones
+        float avg_zone_width = 1.0f / (float)n_zones;
+        d += noise * avg_zone_width * 0.5f;
+        d = fminf(fmaxf(d, 0.0f), 1.0f);
+    }
+
     // If YOLO-seg mask available and this pixel is a diver, override depth with
     // the uniform diver_depth. This gives all diver pixels the same color correction,
     // eliminating banding and temporal flicker on the subject.
@@ -172,6 +183,30 @@ __global__ void combined_lut_kernel(
     r_out = r + fminf(fmaxf(r_out - r, -max_shift), max_shift) * depth_strength;
     g_out = g + fminf(fmaxf(g_out - g, -max_shift), max_shift) * depth_strength;
     b_out = b + fminf(fmaxf(b_out - b, -max_shift), max_shift) * depth_strength;
+
+    // Output dithering: add ±0.5/255 triangular-PDF noise per channel to break up
+    // LUT quantization banding. Uses spatially-stable hash (no temporal flicker).
+    // Triangular PDF: sum of two uniform → concentrates near zero, less visible than uniform.
+    {
+        unsigned int h1 = (unsigned int)(idx * 2654435761u);
+        unsigned int h2 = (unsigned int)(idx * 340573321u + 1013904223u);
+        float u1 = (float)(h1 & 0xFFFF) / 65536.0f;  // [0, 1)
+        float u2 = (float)(h2 & 0xFFFF) / 65536.0f;
+        float tri = (u1 + u2 - 1.0f);  // triangular PDF in [-1, +1]
+        float dither = tri / 255.0f;    // ±1/255 max
+        r_out += dither;
+        // Different hash per channel to avoid correlated dither
+        unsigned int h3 = h1 ^ (h2 << 13);
+        unsigned int h4 = h2 ^ (h1 >> 7);
+        float u3 = (float)(h3 & 0xFFFF) / 65536.0f;
+        float u4 = (float)(h4 & 0xFFFF) / 65536.0f;
+        g_out += (u3 + u4 - 1.0f) / 255.0f;
+        unsigned int h5 = h1 ^ (h2 >> 5) ^ 0xDEADBEEF;
+        unsigned int h6 = h2 ^ (h1 << 11) ^ 0xCAFEBABE;
+        float u5 = (float)(h5 & 0xFFFF) / 65536.0f;
+        float u6 = (float)(h6 & 0xFFFF) / 65536.0f;
+        b_out += (u5 + u6 - 1.0f) / 255.0f;
+    }
 
     pixels_out[idx * 3 + 0] = (unsigned char)(__float2uint_rn(fminf(fmaxf(r_out, 0.0f), 1.0f) * 255.0f));
     pixels_out[idx * 3 + 1] = (unsigned char)(__float2uint_rn(fminf(fmaxf(g_out, 0.0f), 1.0f) * 255.0f));
