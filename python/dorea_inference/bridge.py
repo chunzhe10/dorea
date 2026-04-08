@@ -134,6 +134,69 @@ def run_raune_cpu(frame_rgb: np.ndarray, max_size: int = 1080) -> np.ndarray:
     return _raune_model.infer(frame_rgb, max_size=max_size)
 
 
+def run_raune_depth_batch_cpu(
+    imgs: "list[np.ndarray]",
+    raune_max_size: int = 1080,
+    depth_max_size: int = 518,
+    enable_maxine: bool = False,
+) -> "list[tuple[np.ndarray, np.ndarray]]":
+    """Run fused RAUNE + Depth batch inference.
+
+    For each image: RAUNE enhancement → (optional Maxine upscale) → Depth estimation.
+    Returns list of (enhanced_u8, depth_f32) numpy array pairs.
+
+    Uses sub-batching (4 frames) to fit within 6 GB VRAM.
+    """
+    import torch
+
+    if _raune_model is None:
+        raise RuntimeError("RAUNE-Net model not loaded — call load_raune_model() first")
+    if _depth_model is None:
+        raise RuntimeError("Depth model not loaded — call load_depth_model() first")
+
+    sub_batch_size = 4
+    results: list[tuple[np.ndarray, np.ndarray]] = []
+
+    for batch_start in range(0, len(imgs), sub_batch_size):
+        imgs_chunk = imgs[batch_start:batch_start + sub_batch_size]
+
+        # RAUNE → enhanced tensors stay on GPU
+        enhanced_batch, enh_w, enh_h = _raune_model.infer_batch_gpu(imgs_chunk, max_size=raune_max_size)
+
+        # Maxine upscale (optional) — insert between RAUNE and Depth
+        if enable_maxine and _maxine_model is not None:
+            enhanced_np = (
+                enhanced_batch.permute(0, 2, 3, 1).cpu().numpy() * 255
+            ).astype("uint8")  # (N, H, W, 3)
+
+            for i in range(enhanced_np.shape[0]):
+                enhanced_np[i] = _maxine_model._enhance_impl(
+                    enhanced_np[i], width=enh_w, height=enh_h,
+                )
+
+            enhanced_batch = (
+                torch.from_numpy(enhanced_np.transpose(0, 3, 1, 2) / 255.0)
+                .float()
+                .cuda()
+            )
+
+        # Depth on enhanced tensors — no dtoh between RAUNE and Depth
+        depth_maps = _depth_model.infer_batch_from_tensors(enhanced_batch, depth_max_size=depth_max_size)
+
+        # dtoh enhanced frames
+        enhanced_np = (
+            enhanced_batch.permute(0, 2, 3, 1).cpu().numpy() * 255
+        ).astype("uint8")  # (N, H, W, 3)
+
+        for i in range(len(imgs_chunk)):
+            results.append((enhanced_np[i], depth_maps[i]))
+
+        del enhanced_batch
+        torch.cuda.empty_cache()
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Model lifecycle
 # ---------------------------------------------------------------------------
