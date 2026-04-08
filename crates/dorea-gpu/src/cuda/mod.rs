@@ -44,7 +44,9 @@ struct FrameBuffers {
 
 #[cfg(feature = "cuda")]
 fn alloc_frame_buffers(dev: &Arc<CudaDevice>, width: usize, height: usize) -> Result<FrameBuffers, GpuError> {
-    let n = width * height;
+    let n = width.checked_mul(height).ok_or_else(|| {
+        GpuError::InvalidInput("frame dimensions overflow usize".into())
+    })?;
     Ok(FrameBuffers {
         width,
         height,
@@ -138,19 +140,15 @@ impl CudaGrader {
         }
         let dev = &self.device;
 
-        // Ensure frame buffers exist at the correct resolution.
+        // Ensure frame buffers exist at the correct resolution, then upload per-frame data.
+        // Single borrow_mut scope: check/allocate + copy-into (no per-frame cudaMalloc).
         {
             let mut slot = self.frame_bufs.borrow_mut();
             let needs = slot.as_ref().map_or(true, |b| b.width != width || b.height != height);
             if needs {
                 *slot = Some(alloc_frame_buffers(dev, width, height)?);
             }
-        }
-
-        // Upload per-frame data into pre-allocated buffers (copy only, no cudaMalloc).
-        {
-            let mut slot = self.frame_bufs.borrow_mut();
-            let bufs = slot.as_mut().unwrap();
+            let bufs = slot.as_mut().expect("frame_bufs allocated above");
             dev.htod_sync_copy_into(pixels, &mut bufs.d_pixels_in).map_err(map_cudarc_error)?;
             dev.htod_sync_copy_into(depth, &mut bufs.d_depth).map_err(map_cudarc_error)?;
         }
@@ -160,7 +158,7 @@ impl CudaGrader {
         // d_textures and d_boundaries are cached from construction — no per-frame upload.
         {
             let slot = self.frame_bufs.borrow();
-            let bufs = slot.as_ref().unwrap();
+            let bufs = slot.as_ref().expect("frame_bufs allocated above");
             let func = dev.get_func("combined_lut", "combined_lut_kernel")
                 .ok_or_else(|| GpuError::ModuleLoad("combined_lut_kernel not found".into()))?;
             let cfg = LaunchConfig {
@@ -187,7 +185,7 @@ impl CudaGrader {
 
         // Download result
         let slot = self.frame_bufs.borrow();
-        let bufs = slot.as_ref().unwrap();
+        let bufs = slot.as_ref().expect("frame_bufs allocated above");
         let result = dev.dtoh_sync_copy(&bufs.d_pixels_out).map_err(map_cudarc_error)?;
         Ok(result)
     }
@@ -565,19 +563,22 @@ impl AdaptiveGrader {
     ///
     /// Re-uploads the inactive set's boundary device slice (boundaries change per keyframe).
     /// Texture handles remain stable — only the 3D array content is rebuilt.
+    /// `runtime_n_zones` is fixed at construction, so boundary slice size is constant.
     pub fn prepare_keyframe(&mut self, runtime_boundaries: &[f32]) -> Result<(), GpuError> {
         let inactive = 1 - self.adaptive_lut.active_index();
         self.adaptive_lut.rebuild_set(&self.device, inactive, runtime_boundaries)?;
 
-        // Re-upload the inactive set's boundaries (they just changed).
-        let new_bounds = self.device.htod_sync_copy(
-            self.adaptive_lut.inactive_boundaries()
-        ).map_err(map_cudarc_error)?;
-        if inactive == 0 {
-            *self.d_bounds_a.borrow_mut() = new_bounds;
+        // Re-upload the inactive set's boundaries into the existing device slice
+        // (copy only, no cudaMalloc — boundary size is constant: runtime_n_zones + 1).
+        // Uses get_mut() since we have &mut self — skips runtime borrow check.
+        let bounds = if inactive == 0 {
+            self.d_bounds_a.get_mut()
         } else {
-            *self.d_bounds_b.borrow_mut() = new_bounds;
-        }
+            self.d_bounds_b.get_mut()
+        };
+        self.device.htod_sync_copy_into(
+            self.adaptive_lut.inactive_boundaries(), bounds
+        ).map_err(map_cudarc_error)?;
         Ok(())
     }
 
@@ -591,6 +592,16 @@ impl AdaptiveGrader {
     }
 
     /// Load new segment base LUT + HSL corrections.
+    ///
+    /// # Invariant
+    ///
+    /// After calling `load_segment`, both texture sets must be rebuilt via
+    /// `prepare_keyframe` + `swap_textures` before the next `grade_frame_blended`.
+    /// This is because `load_segment` updates the base LUT data used by
+    /// `rebuild_set`, but does NOT re-upload cached boundary device slices or
+    /// texture handles. The cached `d_textures_a/b` remain valid (texture handles
+    /// are stable across rebuilds — only the 3D array content changes), but
+    /// `d_bounds_a/b` will be stale until `prepare_keyframe` re-uploads them.
     pub fn load_segment(
         &mut self,
         base_luts_flat: &[f32],
@@ -616,7 +627,9 @@ impl AdaptiveGrader {
         height: usize,
         blend_t: f32,
     ) -> Result<Vec<u8>, GpuError> {
-        let n = width * height;
+        let n = width.checked_mul(height).ok_or_else(|| {
+            GpuError::InvalidInput("frame dimensions overflow usize".into())
+        })?;
         if pixels.len() != n * 3 {
             return Err(GpuError::InvalidInput(format!(
                 "pixels len {} != {}*3", pixels.len(), n
@@ -629,19 +642,14 @@ impl AdaptiveGrader {
         }
         let dev = &self.device;
 
-        // Ensure frame buffers exist at the correct resolution.
+        // Ensure frame buffers exist at the correct resolution, then upload per-frame data.
         {
             let mut slot = self.frame_bufs.borrow_mut();
             let needs = slot.as_ref().map_or(true, |b| b.width != width || b.height != height);
             if needs {
                 *slot = Some(alloc_frame_buffers(dev, width, height)?);
             }
-        }
-
-        // Upload per-frame data into pre-allocated buffers.
-        {
-            let mut slot = self.frame_bufs.borrow_mut();
-            let bufs = slot.as_mut().unwrap();
+            let bufs = slot.as_mut().expect("frame_bufs allocated above");
             dev.htod_sync_copy_into(pixels, &mut bufs.d_pixels_in).map_err(map_cudarc_error)?;
             dev.htod_sync_copy_into(depth, &mut bufs.d_depth).map_err(map_cudarc_error)?;
         }
@@ -655,9 +663,10 @@ impl AdaptiveGrader {
             (&self.d_textures_b, &self.d_bounds_b, &self.d_textures_a, &self.d_bounds_a)
         };
 
+        // Three distinct RefCells borrowed concurrently — safe because they are independent fields.
         {
             let slot = self.frame_bufs.borrow();
-            let bufs = slot.as_ref().unwrap();
+            let bufs = slot.as_ref().expect("frame_bufs allocated above");
             let bounds_a = d_bounds_active.borrow();
             let bounds_b = d_bounds_inactive.borrow();
 
@@ -688,7 +697,7 @@ impl AdaptiveGrader {
 
         // Download result
         let slot = self.frame_bufs.borrow();
-        let bufs = slot.as_ref().unwrap();
+        let bufs = slot.as_ref().expect("frame_bufs allocated above");
         let result = dev.dtoh_sync_copy(&bufs.d_pixels_out).map_err(map_cudarc_error)?;
         Ok(result)
     }
