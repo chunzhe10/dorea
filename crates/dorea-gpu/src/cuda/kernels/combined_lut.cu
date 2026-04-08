@@ -35,7 +35,13 @@ __global__ void combined_lut_kernel(
     int frame_w,
     int frame_h,
     int depth_w,
-    int depth_h
+    int depth_h,
+    // Class mask (0=water, 1=diver) at mask resolution. NULL if no YOLO-seg.
+    const unsigned char* __restrict__ class_mask,
+    int mask_w,
+    int mask_h,
+    // Median diver depth — all diver pixels use this value for uniform correction.
+    float diver_depth
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_pixels) return;
@@ -64,6 +70,21 @@ __global__ void combined_lut_kernel(
           + depth[y1 * depth_w + x0] * (1.0f - fx) * fy
           + depth[y1 * depth_w + x1] * fx * fy;
     }
+
+    // If YOLO-seg mask available and this pixel is a diver, override depth with
+    // the uniform diver_depth. This gives all diver pixels the same color correction,
+    // eliminating banding and temporal flicker on the subject.
+    if (class_mask != 0) {
+        int px = idx % frame_w;
+        int py = idx / frame_w;
+        float mx = (float)px * (float)(mask_w - 1) / (float)(frame_w - 1);
+        float my = (float)py * (float)(mask_h - 1) / (float)(frame_h - 1);
+        int mi = min((int)my, mask_h - 1) * mask_w + min((int)mx, mask_w - 1);
+        if (class_mask[mi] > 0) {
+            d = diver_depth;
+        }
+    }
+
     float gs = (float)(grid_size - 1);
 
     // --- Sample texture set A ---

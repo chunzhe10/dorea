@@ -46,6 +46,7 @@ pub fn run_grading_stage(
         keyframe_depths,
         kf_index_list,
         store_len,
+        keyframe_masks,
     } = cal_out;
 
     let params = cfg.grade_params();
@@ -216,8 +217,40 @@ pub fn run_grading_stage(
                 };
 
                 #[cfg(feature = "cuda")]
+                // Look up the nearest keyframe's class mask for diver detection.
+                let (class_mask_slice, mask_w, mask_h, diver_depth) = match keyframe_masks.get(&prev_kf_idx) {
+                    Some((mask, mw, mh)) => {
+                        // Compute median depth of diver pixels for uniform correction.
+                        let diver_d = {
+                            let mut diver_depths: Vec<f32> = Vec::new();
+                            for (mi, &class_id) in mask.iter().enumerate() {
+                                if class_id > 0 {
+                                    // Sample depth at mask coordinates
+                                    let mx = mi % mw;
+                                    let my = mi / mw;
+                                    let dx = mx as f32 * (dpw as f32 - 1.0) / (*mw as f32 - 1.0).max(1.0);
+                                    let dy = my as f32 * (dph as f32 - 1.0) / (*mh as f32 - 1.0).max(1.0);
+                                    let di = (dy as usize).min(dph - 1) * dpw + (dx as usize).min(dpw - 1);
+                                    if di < depth.len() {
+                                        diver_depths.push(depth[di]);
+                                    }
+                                }
+                            }
+                            if diver_depths.is_empty() {
+                                0.5 // fallback
+                            } else {
+                                diver_depths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                diver_depths[diver_depths.len() / 2] // median
+                            }
+                        };
+                        (Some(mask.as_slice()), *mw, *mh, diver_d)
+                    }
+                    None => (None, 0, 0, 0.5),
+                };
+
                 let graded = adaptive_grader.grade_frame_blended(
                     &frame.pixels, &depth, frame.width, frame.height, dpw, dph, blend_t,
+                    class_mask_slice, mask_w, mask_h, diver_depth,
                 ).map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?;
 
                 #[cfg(not(feature = "cuda"))]

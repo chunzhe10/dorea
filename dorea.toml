@@ -19,7 +19,7 @@ contrast             = 1.0   # ambiance contrast [0.0–1.0]
 depth_skip_threshold = 0.005 # MSE keyframe threshold (lower = more keyframes)
 depth_max_interval   = 12    # max frames between forced keyframes
 fused_batch_size     = 32    # frames per RAUNE+depth inference batch
-depth_zones          = 32    # runtime adaptive zones per keyframe (more = smoother transitions)
+depth_zones          = 16    # runtime adaptive zones per keyframe (16 + smooth blending = no banding)
 base_lut_zones       = 32    # base LUT zones per scene segment (color science)
 scene_threshold      = 0.15  # Wasserstein-1 depth distance to split scene segments [0.0–1.0]
 min_segment_keyframes = 3    # merge segments shorter than this into the previous one

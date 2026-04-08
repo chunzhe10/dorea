@@ -21,7 +21,7 @@ pub fn run_calibration_stage(
     cfg: &PipelineConfig,
     feat_out: FeatureStageOutput,
 ) -> Result<CalibrationStageOutput> {
-    let FeatureStageOutput { store, keyframe_depths, keyframes } = feat_out;
+    let FeatureStageOutput { store, keyframe_depths, keyframes, keyframe_masks } = feat_out;
 
     // Step 1: Collect per-keyframe depth maps from store
     let kf_depths_store: Vec<Vec<f32>> = (0..store.len())
@@ -158,5 +158,6 @@ pub fn run_calibration_stage(
         keyframe_depths,
         kf_index_list,
         store_len,
+        keyframe_masks,
     })
 }

@@ -194,5 +194,5 @@ pub fn grade_frame_with_adaptive_grader(
             width * height * 3
         )));
     }
-    grader.grade_frame_blended(pixels, depth, width, height, depth_w, depth_h, blend_t)
+    grader.grade_frame_blended(pixels, depth, width, height, depth_w, depth_h, blend_t, None, 0, 0, 0.5)
 }

@@ -216,8 +216,35 @@ pub fn run_feature_stage(
             .context("failed to page result to store")?;
         kf_depths.insert(kf.frame_index, (depth.clone(), dw, dh));
     }
-    log::info!("Fused inference complete ({} keyframes)", keyframes.len());
+    log::info!("Inference complete ({} keyframes)", keyframes.len());
     debug_assert_eq!(store.len(), keyframes.len(), "store/keyframes length diverged");
+
+    // --- YOLO-seg on proxy keyframes (diver detection) ---
+    // Runs after depth — uses freed VRAM from RAUNE unload.
+    log::info!("Running YOLO-seg on {} keyframes for diver detection...", keyframes.len());
+    let mut kf_masks: HashMap<u64, (Vec<u8>, usize, usize)> = HashMap::new();
+    use dorea_video::inference::YoloSegBatchItem;
+    let yolo_items: Vec<YoloSegBatchItem> = keyframes.iter().map(|kf| {
+        YoloSegBatchItem {
+            id: format!("kf_f{}", kf.frame_index),
+            pixels: kf.proxy_pixels.clone(),
+            width: proxy_w,
+            height: proxy_h,
+        }
+    }).collect();
+    match inf_server.run_yolo_seg_batch(&yolo_items) {
+        Ok(results) => {
+            for (i, (_, mask, mw, mh)) in results.into_iter().enumerate() {
+                kf_masks.insert(keyframes[i].frame_index, (mask, mw, mh));
+            }
+            log::info!("YOLO-seg complete: {} masks", kf_masks.len());
+        }
+        Err(e) => {
+            // YOLO-seg is optional — degrade gracefully if model not available
+            log::warn!("YOLO-seg failed ({}), proceeding without diver masks", e);
+        }
+    }
+
     let _ = inf_server.shutdown();
 
     store.seal().context("failed to seal calibration store")?;
@@ -226,5 +253,6 @@ pub fn run_feature_stage(
         store,
         keyframe_depths: kf_depths,
         keyframes,
+        keyframe_masks: kf_masks,
     })
 }

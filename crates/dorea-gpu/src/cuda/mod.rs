@@ -178,7 +178,10 @@ impl CudaGrader {
             let dw_i32 = width as i32;
             let dh_i32 = height as i32;
             use cudarc::driver::DeviceRepr;
-            let mut args: [*mut std::ffi::c_void; 15] = [
+            let null_mask: u64 = 0;  // no YOLO-seg mask for CudaGrader
+            let zero_i32: i32 = 0;
+            let default_depth: f32 = 0.5;
+            let mut args: [*mut std::ffi::c_void; 19] = [
                 (&bufs.d_pixels_in).as_kernel_param(),
                 (&bufs.d_depth).as_kernel_param(),
                 (&self.d_textures).as_kernel_param(),
@@ -194,6 +197,10 @@ impl CudaGrader {
                 fh_i32.as_kernel_param(),
                 dw_i32.as_kernel_param(),
                 dh_i32.as_kernel_param(),
+                null_mask.as_kernel_param(),
+                zero_i32.as_kernel_param(),
+                zero_i32.as_kernel_param(),
+                default_depth.as_kernel_param(),
             ];
             unsafe {
                 func.launch(cfg, &mut args[..])
@@ -645,6 +652,10 @@ impl AdaptiveGrader {
         depth_w: usize,
         depth_h: usize,
         blend_t: f32,
+        class_mask: Option<&[u8]>,
+        mask_w: usize,
+        mask_h: usize,
+        diver_depth: f32,
     ) -> Result<Vec<u8>, GpuError> {
         let n = width.checked_mul(height).ok_or_else(|| {
             GpuError::InvalidInput("frame dimensions overflow usize".into())
@@ -709,8 +720,20 @@ impl AdaptiveGrader {
             let fh_i32 = height as i32;
             let dw_i32 = depth_w as i32;
             let dh_i32 = depth_h as i32;
-            use cudarc::driver::DeviceRepr;
-            let mut args: [*mut std::ffi::c_void; 15] = [
+            let mw_i32 = mask_w as i32;
+            let mh_i32 = mask_h as i32;
+            use cudarc::driver::{DeviceRepr, DevicePtr};
+
+            // Upload class mask if available, otherwise pass null device pointer
+            let d_mask: Option<CudaSlice<u8>> = class_mask.map(|m| {
+                dev.htod_sync_copy(m).expect("mask upload failed")
+            });
+            let mask_ptr: u64 = match &d_mask {
+                Some(s) => *s.device_ptr() as u64,
+                None => 0u64,
+            };
+
+            let mut args: [*mut std::ffi::c_void; 19] = [
                 (&bufs.d_pixels_in).as_kernel_param(),
                 (&d_depth).as_kernel_param(),
                 d_tex_active.as_kernel_param(),
@@ -726,6 +749,10 @@ impl AdaptiveGrader {
                 fh_i32.as_kernel_param(),
                 dw_i32.as_kernel_param(),
                 dh_i32.as_kernel_param(),
+                mask_ptr.as_kernel_param(),
+                mw_i32.as_kernel_param(),
+                mh_i32.as_kernel_param(),
+                diver_depth.as_kernel_param(),
             ];
             unsafe {
                 func.launch(cfg, &mut args[..])

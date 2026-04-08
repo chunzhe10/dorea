@@ -59,6 +59,8 @@ pub struct FeatureStageOutput {
     pub store: feature::PagedCalibrationStore,
     pub keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)>,
     pub keyframes: Vec<keyframe::KeyframeEntry>,
+    /// Per-keyframe YOLO-seg class masks (0=water, 1=diver). Keyed by frame_index.
+    pub keyframe_masks: HashMap<u64, (Vec<u8>, usize, usize)>,
 }
 
 /// Output of CalibrationStage → input of GradingStage.
@@ -69,4 +71,6 @@ pub struct CalibrationStageOutput {
     pub keyframe_depths: HashMap<u64, (Vec<f32>, usize, usize)>,
     pub kf_index_list: Vec<(u64, bool)>,
     pub store_len: usize,
+    /// Per-keyframe class masks from YOLO-seg. Keyed by frame_index.
+    pub keyframe_masks: HashMap<u64, (Vec<u8>, usize, usize)>,
 }
