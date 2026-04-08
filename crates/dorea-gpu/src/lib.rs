@@ -109,9 +109,8 @@ pub fn grade_frame(
 
     #[cfg(not(feature = "cuda"))]
     {
-        Err(GpuError::CudaFail(
-            "dorea grade requires CUDA. Rebuild with GPU support (build.rs auto-detects nvcc).".to_string()
-        ))
+        cpu::grade_frame_cpu(pixels, depth, width, height, calibration, params)
+            .map_err(GpuError::CudaFail)
     }
 }
 

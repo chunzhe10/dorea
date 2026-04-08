@@ -623,6 +623,26 @@ impl InferenceServer {
         Ok(())
     }
 
+    /// Unload RAUNE-Net and free its VRAM without stopping the server.
+    pub fn unload_raune(&mut self) -> Result<(), InferenceError> {
+        let req = serde_json::json!({"type": "unload_raune"});
+        self.send_line(&req.to_string())?;
+        let resp = self.recv_line()?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| InferenceError::Ipc(format!("unload_raune response parse: {e}")))?;
+        if v["type"].as_str() == Some("error") {
+            return Err(InferenceError::ServerError(
+                v["message"].as_str().unwrap_or("unknown error").to_string(),
+            ));
+        }
+        if v["type"].as_str() != Some("ok") {
+            return Err(InferenceError::Ipc(format!(
+                "unexpected response type for unload_raune: {resp}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Load RAUNE-Net into the running server (after it was started without it).
     pub fn load_raune(
         &mut self,

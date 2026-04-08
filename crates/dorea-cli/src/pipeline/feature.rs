@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use anyhow::{Context, Result};
 
-use dorea_video::inference::{InferenceServer, RauneDepthBatchItem};
+use dorea_video::inference::InferenceServer;
 
 use super::{PipelineConfig, KeyframeStageOutput, FeatureStageOutput};
 
@@ -120,71 +120,101 @@ impl Drop for PagedCalibrationStore {
 }
 
 /// Run the feature extraction stage: fused RAUNE+depth inference, paged store.
+///
+/// RAUNE runs on proxy-resolution frames (for LUT training).
+/// Depth runs on original frames (higher resolution → better depth maps).
 pub fn run_feature_stage(
     cfg: &PipelineConfig,
+    info: &dorea_video::ffmpeg::VideoInfo,
     mut inf_server: InferenceServer,
     kf_out: KeyframeStageOutput,
 ) -> Result<FeatureStageOutput> {
     let KeyframeStageOutput { keyframes, proxy_w, proxy_h, .. } = kf_out;
-    let proxy_size = cfg.proxy_size;
 
     log::info!(
-        "Auto-calibrating from {} keyframes (fused RAUNE+depth)",
+        "Auto-calibrating from {} keyframes (parallel RAUNE+depth)",
         keyframes.len()
     );
 
-    let fused_items: Vec<RauneDepthBatchItem> = keyframes.iter().map(|kf| {
-        RauneDepthBatchItem {
-            id: format!("kf_f{}", kf.frame_index),
-            pixels: kf.proxy_pixels.clone(),
-            width: proxy_w,
-            height: proxy_h,
-            raune_max_size: proxy_w.max(proxy_h),
-            depth_max_size: proxy_size.min(1036),
-        }
-    }).collect();
+    // Depth runs on full-res keyframes for better depth quality.
+    // The depth model internally resizes to max_size, but starting from 4K source
+    // preserves more detail than starting from proxy (518px).
+    // After RAUNE completes and is unloaded, depth can use the freed VRAM for 1036px.
+    let depth_max_size = 1036;
+    log::info!(
+        "Extracting {} keyframes at full resolution for depth (max_size={})",
+        keyframes.len(), depth_max_size,
+    );
+    let mut fullres_pixels: Vec<Vec<u8>> = Vec::with_capacity(keyframes.len());
+    for kf in &keyframes {
+        let ts = kf.frame_index as f64 / info.fps.max(1.0);
+        let pixels = dorea_video::ffmpeg::extract_frame_at(&cfg.input, ts, info.width, info.height)
+            .with_context(|| format!("failed to extract full-res keyframe at frame {}", kf.frame_index))?;
+        fullres_pixels.push(pixels);
+    }
 
     let mut store = PagedCalibrationStore::new()
         .context("failed to create paged calibration store")?;
     let mut kf_depths: HashMap<u64, (Vec<f32>, usize, usize)> = HashMap::new();
 
-    let n_batches = keyframes.chunks(cfg.fused_batch_size).count();
-    for (batch_idx, (chunk_kfs, chunk_items)) in keyframes
-        .chunks(cfg.fused_batch_size)
-        .zip(fused_items.chunks(cfg.fused_batch_size))
-        .enumerate()
-    {
-        log::info!(
-            "RAUNE+depth batch {}/{n_batches} ({} frames)",
-            batch_idx + 1,
-            chunk_items.len(),
-        );
-        let results = inf_server.run_raune_depth_batch(chunk_items, cfg.maxine_in_fused_batch)
-            .context(format!("Fused RAUNE+depth batch {}/{n_batches} failed", batch_idx + 1))?;
+    // --- RAUNE on proxy pixels (for LUT training) ---
+    log::info!("Running RAUNE on {} keyframes (proxy {}x{})", keyframes.len(), proxy_w, proxy_h);
+    let mut raune_enhanced: Vec<(Vec<u8>, usize, usize)> = Vec::with_capacity(keyframes.len());
+    for (i, kf) in keyframes.iter().enumerate() {
+        let (enhanced, ew, eh) = inf_server.run_raune(
+            &format!("kf_f{}", kf.frame_index),
+            &kf.proxy_pixels, proxy_w, proxy_h,
+            proxy_w.max(proxy_h),
+        ).with_context(|| format!("RAUNE failed for keyframe {i}"))?;
+        raune_enhanced.push((enhanced, ew, eh));
+    }
+    log::info!("RAUNE complete");
 
-        anyhow::ensure!(
-            results.len() == chunk_items.len(),
-            "Fused batch {}/{n_batches} returned {} results for {} items",
-            batch_idx + 1, results.len(), chunk_items.len()
-        );
+    // --- Depth on full-res pixels (better depth quality) ---
+    // Unload RAUNE first to free ~500MB VRAM for higher-res depth inference.
+    inf_server.unload_raune().context("failed to unload RAUNE")?;
+    log::info!("RAUNE unloaded — VRAM freed for depth at {}px", depth_max_size);
+    log::info!("Running depth on {} keyframes (full-res, max_size={})", keyframes.len(), depth_max_size);
+    use dorea_video::inference::DepthBatchItem;
+    let mut depth_results: Vec<(String, Vec<f32>, usize, usize)> = Vec::with_capacity(keyframes.len());
+    // Sub-batch depth to avoid OOM: 4 full-res frames at a time
+    let depth_sub_batch = 4;
+    for chunk_start in (0..keyframes.len()).step_by(depth_sub_batch) {
+        let chunk_end = (chunk_start + depth_sub_batch).min(keyframes.len());
+        let depth_items: Vec<DepthBatchItem> = (chunk_start..chunk_end).map(|i| {
+            DepthBatchItem {
+                id: format!("kf_f{}", keyframes[i].frame_index),
+                pixels: fullres_pixels[i].clone(),
+                width: info.width,
+                height: info.height,
+                max_size: depth_max_size,
+            }
+        }).collect();
+        let batch_results = inf_server.run_depth_batch(&depth_items)
+            .with_context(|| format!("Depth sub-batch {}/{} failed", chunk_start / depth_sub_batch + 1,
+                (keyframes.len() + depth_sub_batch - 1) / depth_sub_batch))?;
+        depth_results.extend(batch_results);
+    }
+    log::info!("Depth complete");
 
-        for (kf, (_, enhanced, enh_w, enh_h, depth, dw, dh)) in
-            chunk_kfs.iter().zip(results.into_iter())
-        {
-            let enhanced_proxy = if enh_w == proxy_w && enh_h == proxy_h {
-                enhanced
-            } else {
-                dorea_video::resize::resize_rgb_bilinear(&enhanced, enh_w, enh_h, proxy_w, proxy_h)
-            };
-            let depth_for_store = if dw == proxy_w && dh == proxy_h {
-                depth.clone()
-            } else {
-                InferenceServer::upscale_depth(&depth, dw, dh, proxy_w, proxy_h)
-            };
-            store.push(&kf.proxy_pixels, &enhanced_proxy, &depth_for_store, proxy_w, proxy_h)
-                .context("failed to page fused result to store")?;
-            kf_depths.insert(kf.frame_index, (depth, dw, dh));
-        }
+    // --- Combine RAUNE + depth results ---
+    for (i, kf) in keyframes.iter().enumerate() {
+        let (enhanced, enh_w, enh_h) = &raune_enhanced[i];
+        let enhanced_proxy = if *enh_w == proxy_w && *enh_h == proxy_h {
+            enhanced.clone()
+        } else {
+            dorea_video::resize::resize_rgb_bilinear(enhanced, *enh_w, *enh_h, proxy_w, proxy_h)
+        };
+
+        let (_, ref depth, dw, dh) = depth_results[i];
+        let depth_for_store = if dw == proxy_w && dh == proxy_h {
+            depth.clone()
+        } else {
+            InferenceServer::upscale_depth(depth, dw, dh, proxy_w, proxy_h)
+        };
+        store.push(&kf.proxy_pixels, &enhanced_proxy, &depth_for_store, proxy_w, proxy_h)
+            .context("failed to page result to store")?;
+        kf_depths.insert(kf.frame_index, (depth.clone(), dw, dh));
     }
     log::info!("Fused inference complete ({} keyframes)", keyframes.len());
     debug_assert_eq!(store.len(), keyframes.len(), "store/keyframes length diverged");

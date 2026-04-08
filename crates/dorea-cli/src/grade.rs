@@ -124,6 +124,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         cfg.inference.device.clone()
     };
 
+    #[cfg(feature = "cuda")]
     if args.cpu_only {
         anyhow::bail!(
             "--cpu-only is no longer supported for dorea grade; GPU (CUDA) is required. \
@@ -175,7 +176,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         zone_smoothing_w,
         maxine_upscale_factor,
         interp_enabled: !args.no_depth_interp,
-        maxine_in_fused_batch: true,
+        maxine_in_fused_batch: false, // Maxine disabled — SDK not available in devcontainer
     };
 
     // -----------------------------------------------------------------------
@@ -200,7 +201,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         depth_model.as_deref(),
     ).context("failed to load Depth Anything for calibration")?;
 
-    let feat_out = pipeline::feature::run_feature_stage(&pipeline_cfg, inf_server, kf_out)?;
+    let feat_out = pipeline::feature::run_feature_stage(&pipeline_cfg, &info, inf_server, kf_out)?;
 
     // -----------------------------------------------------------------------
     // Stage 3: Calibration (zones → segments → LUT build → HSL → grader init)
@@ -240,7 +241,7 @@ fn build_inference_config(
         skip_depth: false,
         device,
         startup_timeout: Duration::from_secs(180),
-        maxine: true,
+        maxine: false, // Maxine requires NVIDIA VFX SDK — disabled when not available
         maxine_upscale_factor,
     }
 }

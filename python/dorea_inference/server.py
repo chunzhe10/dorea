@@ -326,6 +326,16 @@ def main(argv: Optional[list] = None) -> None:
                     pass
                 print("[dorea-inference] Maxine unloaded — VRAM freed", file=sys.stderr, flush=True)
                 resp = OkResponse()
+            elif req_type == "unload_raune":
+                raune_model = None
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+                print("[dorea-inference] RAUNE unloaded — VRAM freed", file=sys.stderr, flush=True)
+                resp = OkResponse()
 
             elif req_type == "load_raune":
                 # Unload existing model first to avoid OOM on 6 GB VRAM budget
