@@ -67,6 +67,19 @@ impl Default for InferenceConfig {
     }
 }
 
+/// A single image item for fused RAUNE + Depth batch inference.
+pub struct RauneDepthBatchItem {
+    pub id: String,
+    /// Raw RGB24 pixels, row-major.
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    /// Max long-edge for RAUNE resize (pixels).
+    pub raune_max_size: usize,
+    /// Max long-edge for depth resize (pixels, must be ≤518 for Depth Anything).
+    pub depth_max_size: usize,
+}
+
 /// A single image item for batch depth inference.
 pub struct DepthBatchItem {
     /// Unique identifier (e.g. "kf_000042") returned in the response for correlation.
@@ -395,6 +408,112 @@ impl InferenceServer {
                     .map_err(|e| InferenceError::Ipc(format!("extract depth[{i}]: {e}")))?;
 
                 out.push((item.id.clone(), depth_data, out_w, out_h));
+            }
+
+            Ok(out)
+        })
+    }
+
+    /// Run fused RAUNE + Depth inference on a batch of images.
+    ///
+    /// For each item: RAUNE enhancement → (optional Maxine upscale) → depth estimation.
+    /// Returns `Vec<(id, enhanced_rgb_u8, enh_w, enh_h, depth_f32, depth_w, depth_h)>`.
+    ///
+    /// `enable_maxine`: if true, Maxine super-resolution runs between RAUNE and Depth.
+    #[allow(clippy::type_complexity)]
+    pub fn run_raune_depth_batch(
+        &mut self,
+        items: &[RauneDepthBatchItem],
+        enable_maxine: bool,
+    ) -> Result<Vec<(String, Vec<u8>, usize, usize, Vec<f32>, usize, usize)>, InferenceError> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+
+        Python::with_gil(|py| {
+            let bridge = self.bridge.bind(py);
+
+            // Build Python list of (H, W, 3) numpy arrays
+            let py_list = pyo3::types::PyList::empty_bound(py);
+            for item in items {
+                let np_flat = numpy::PyArray1::from_slice_bound(py, &item.pixels);
+                let np_reshaped = np_flat
+                    .call_method1("reshape", ((item.height, item.width, 3),))
+                    .map_err(|e| InferenceError::Ipc(format!("reshape for id={}: {e}", item.id)))?;
+                py_list
+                    .append(np_reshaped)
+                    .map_err(|e| InferenceError::Ipc(format!("list append for id={}: {e}", item.id)))?;
+            }
+
+            let raune_max = items[0].raune_max_size;
+            let depth_max = items[0].depth_max_size;
+
+            // Call bridge.run_raune_depth_batch_cpu(imgs, raune_max, depth_max, enable_maxine)
+            let result = bridge
+                .call_method1(
+                    "run_raune_depth_batch_cpu",
+                    (py_list, raune_max, depth_max, enable_maxine),
+                )
+                .map_err(|e| Self::map_python_error(py, e))?;
+
+            // Result is a Python list of (enhanced_np, depth_np) tuples
+            let result_list = result
+                .downcast::<pyo3::types::PyList>()
+                .map_err(|e| InferenceError::Ipc(format!(
+                    "run_raune_depth_batch_cpu result not a list: {e}"
+                )))?;
+
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let pair = result_list
+                    .get_item(i)
+                    .map_err(|e| InferenceError::Ipc(format!("get result[{i}]: {e}")))?;
+
+                let pair_tuple = pair
+                    .downcast::<pyo3::types::PyTuple>()
+                    .map_err(|e| InferenceError::Ipc(format!("result[{i}] not a tuple: {e}")))?;
+
+                // Enhanced RGB u8 array (H, W, 3)
+                let enhanced_arr = pair_tuple.get_item(0)
+                    .map_err(|e| InferenceError::Ipc(format!("get enhanced[{i}]: {e}")))?;
+                let enh_shape: Vec<usize> = enhanced_arr.getattr("shape")
+                    .map_err(|e| InferenceError::Ipc(format!("enhanced shape[{i}]: {e}")))?
+                    .extract()
+                    .map_err(|e| InferenceError::Ipc(format!("extract enhanced shape[{i}]: {e}")))?;
+                let enh_h = enh_shape[0];
+                let enh_w = enh_shape[1];
+                let enhanced_flat = enhanced_arr
+                    .call_method1("reshape", ((-1_i32,),))
+                    .map_err(|e| InferenceError::Ipc(format!("flatten enhanced[{i}]: {e}")))?;
+                let enhanced_data: Vec<u8> = enhanced_flat
+                    .call_method0("tolist")
+                    .map_err(|e| InferenceError::Ipc(format!("tolist enhanced[{i}]: {e}")))?
+                    .extract()
+                    .map_err(|e| InferenceError::Ipc(format!("extract enhanced[{i}]: {e}")))?;
+
+                // Depth f32 array (H, W)
+                let depth_arr = pair_tuple.get_item(1)
+                    .map_err(|e| InferenceError::Ipc(format!("get depth[{i}]: {e}")))?;
+                let depth_shape: Vec<usize> = depth_arr.getattr("shape")
+                    .map_err(|e| InferenceError::Ipc(format!("depth shape[{i}]: {e}")))?
+                    .extract()
+                    .map_err(|e| InferenceError::Ipc(format!("extract depth shape[{i}]: {e}")))?;
+                let depth_h = depth_shape[0];
+                let depth_w = depth_shape[1];
+                let depth_flat = depth_arr
+                    .call_method1("reshape", ((-1_i32,),))
+                    .map_err(|e| InferenceError::Ipc(format!("flatten depth[{i}]: {e}")))?;
+                let depth_data: Vec<f32> = depth_flat
+                    .call_method0("tolist")
+                    .map_err(|e| InferenceError::Ipc(format!("tolist depth[{i}]: {e}")))?
+                    .extract()
+                    .map_err(|e| InferenceError::Ipc(format!("extract depth[{i}]: {e}")))?;
+
+                out.push((
+                    item.id.clone(),
+                    enhanced_data, enh_w, enh_h,
+                    depth_data, depth_w, depth_h,
+                ));
             }
 
             Ok(out)
