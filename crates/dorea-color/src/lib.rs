@@ -2,6 +2,7 @@ pub mod dlog_m;
 pub mod hsv;
 pub mod ilog;
 pub mod lab;
+pub mod lut_transfer;
 
 /// Camera log curve abstraction. Implementations decode/encode between
 /// a camera-specific log encoding and scene-linear light.
@@ -18,3 +19,4 @@ pub trait TransferFunction {
 
 pub use dlog_m::DLogM;
 pub use ilog::ILog;
+pub use lut_transfer::LutBased;
