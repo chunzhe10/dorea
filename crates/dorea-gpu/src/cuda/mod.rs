@@ -58,6 +58,31 @@ fn alloc_frame_buffers(dev: &Arc<CudaDevice>, width: usize, height: usize) -> Re
     })
 }
 
+/// Pre-allocated device buffers for 16-bit (u16) pixel I/O.
+/// Like `FrameBuffers` but with `CudaSlice<u16>` for pixel data.
+/// No `d_depth` field — depth is uploaded separately at proxy resolution
+/// (may differ from frame resolution) in `grade_frame_blended_16`.
+#[cfg(feature = "cuda")]
+struct FrameBuffers16 {
+    width: usize,
+    height: usize,
+    d_pixels_in: CudaSlice<u16>,    // n * 3
+    d_pixels_out: CudaSlice<u16>,   // n * 3
+}
+
+#[cfg(feature = "cuda")]
+fn alloc_frame_buffers_16(dev: &Arc<CudaDevice>, width: usize, height: usize) -> Result<FrameBuffers16, GpuError> {
+    let n = width.checked_mul(height).ok_or_else(|| {
+        GpuError::InvalidInput("frame dimensions overflow usize".into())
+    })?;
+    Ok(FrameBuffers16 {
+        width,
+        height,
+        d_pixels_in: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
+        d_pixels_out: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
+    })
+}
+
 /// CUDA grader: holds a device handle and the precomputed combined LUT textures.
 ///
 /// Create once via `CudaGrader::new(calibration, params)`, reuse across frames.
@@ -94,7 +119,7 @@ impl CudaGrader {
         device.load_ptx(
             Ptx::from_src(COMBINED_LUT_PTX),
             "combined_lut",
-            &["combined_lut_kernel"],
+            &["combined_lut_kernel", "combined_lut_kernel_16"],
         ).map_err(|e| GpuError::ModuleLoad(format!("load combined_lut PTX: {e}")))?;
 
         // Build combined LUT textures (GPU build kernel runs here, ~<1ms)
@@ -517,7 +542,8 @@ pub struct AdaptiveGrader {
     d_textures_b: CudaSlice<u64>,             // inactive texture handles (constant after allocate)
     d_bounds_a:   RefCell<CudaSlice<f32>>,    // active boundaries (updated on swap/rebuild)
     d_bounds_b:   RefCell<CudaSlice<f32>>,    // inactive boundaries (updated on swap/rebuild)
-    frame_bufs:   RefCell<Option<FrameBuffers>>, // resolution-keyed
+    frame_bufs:   RefCell<Option<FrameBuffers>>,   // resolution-keyed (u8 path)
+    frame_bufs_16: RefCell<Option<FrameBuffers16>>, // resolution-keyed (u16 path)
     device:       Arc<CudaDevice>,            // dropped last — destroys CUDA context
     _not_send:    std::marker::PhantomData<*const ()>,
 }
@@ -544,7 +570,7 @@ impl AdaptiveGrader {
         device.load_ptx(
             Ptx::from_src(COMBINED_LUT_PTX),
             "combined_lut",
-            &["combined_lut_kernel"],
+            &["combined_lut_kernel", "combined_lut_kernel_16"],
         ).map_err(|e| GpuError::ModuleLoad(format!("load combined_lut PTX: {e}")))?;
 
         device.load_ptx(
@@ -578,6 +604,7 @@ impl AdaptiveGrader {
             d_bounds_a: RefCell::new(d_bounds_a),
             d_bounds_b: RefCell::new(d_bounds_b),
             frame_bufs: RefCell::new(None),
+            frame_bufs_16: RefCell::new(None),
             device,
             _not_send: std::marker::PhantomData,
         })
@@ -762,6 +789,132 @@ impl AdaptiveGrader {
         // Download result
         let slot = self.frame_bufs.borrow();
         let bufs = slot.as_ref().expect("frame_bufs allocated above");
+        let result = dev.dtoh_sync_copy(&bufs.d_pixels_out).map_err(map_cudarc_error)?;
+        Ok(result)
+    }
+
+    /// Grade one frame with dual-texture temporal blending — 16-bit (u16) I/O variant.
+    ///
+    /// Identical to `grade_frame_blended` but reads/writes `u16` pixel data instead of `u8`.
+    /// Uses `combined_lut_kernel_16` which normalises to [0, 65535].
+    pub fn grade_frame_blended_16(
+        &self,
+        pixels: &[u16],
+        depth: &[f32],
+        width: usize,
+        height: usize,
+        depth_w: usize,
+        depth_h: usize,
+        blend_t: f32,
+        class_mask: Option<&[u8]>,
+        mask_w: usize,
+        mask_h: usize,
+        diver_depth: f32,
+    ) -> Result<Vec<u16>, GpuError> {
+        let n = width.checked_mul(height).ok_or_else(|| {
+            GpuError::InvalidInput("frame dimensions overflow usize".into())
+        })?;
+        if pixels.len() != n * 3 {
+            return Err(GpuError::InvalidInput(format!(
+                "pixels len {} != {}*3", pixels.len(), n
+            )));
+        }
+        let dn = depth_w.checked_mul(depth_h).ok_or_else(|| {
+            GpuError::InvalidInput("depth dimensions overflow usize".into())
+        })?;
+        if depth.len() != dn {
+            return Err(GpuError::InvalidInput(format!(
+                "depth len {} != depth_w*depth_h {}", depth.len(), dn
+            )));
+        }
+        let dev = &self.device;
+
+        // Ensure 16-bit frame buffers exist at the correct resolution, then upload per-frame data.
+        {
+            let mut slot = self.frame_bufs_16.borrow_mut();
+            let needs = slot.as_ref().map_or(true, |b| b.width != width || b.height != height);
+            if needs {
+                *slot = Some(alloc_frame_buffers_16(dev, width, height)?);
+            }
+            let bufs = slot.as_mut().expect("frame_bufs_16 allocated above");
+            dev.htod_sync_copy_into(pixels, &mut bufs.d_pixels_in).map_err(map_cudarc_error)?;
+        }
+
+        // Upload depth separately — may be at different resolution than frame.
+        let d_depth = dev.htod_sync_copy(depth).map_err(map_cudarc_error)?;
+
+        // Determine which cached device slices correspond to the current active/inactive sets.
+        let active_idx = self.adaptive_lut.active_index();
+        let (d_tex_active, d_bounds_active, d_tex_inactive, d_bounds_inactive) = if active_idx == 0 {
+            (&self.d_textures_a, &self.d_bounds_a, &self.d_textures_b, &self.d_bounds_b)
+        } else {
+            (&self.d_textures_b, &self.d_bounds_b, &self.d_textures_a, &self.d_bounds_a)
+        };
+
+        // Three distinct RefCells borrowed concurrently — safe because they are independent fields.
+        {
+            let slot = self.frame_bufs_16.borrow();
+            let bufs = slot.as_ref().expect("frame_bufs_16 allocated above");
+            let bounds_a = d_bounds_active.borrow();
+            let bounds_b = d_bounds_inactive.borrow();
+
+            let func = dev.get_func("combined_lut", "combined_lut_kernel_16")
+                .ok_or_else(|| GpuError::ModuleLoad("combined_lut_kernel_16 not found".into()))?;
+            let cfg = LaunchConfig {
+                grid_dim: (div_ceil(n as u32, 256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            let n_i32 = n as i32;
+            let nz_i32 = self.adaptive_lut.runtime_n_zones as i32;
+            let gs_i32 = self.adaptive_lut.grid_size as i32;
+            let fw_i32 = width as i32;
+            let fh_i32 = height as i32;
+            let dw_i32 = depth_w as i32;
+            let dh_i32 = depth_h as i32;
+            let mw_i32 = mask_w as i32;
+            let mh_i32 = mask_h as i32;
+            use cudarc::driver::{DeviceRepr, DevicePtr};
+
+            // Upload class mask if available, otherwise pass null device pointer
+            let d_mask: Option<CudaSlice<u8>> = class_mask.map(|m| {
+                dev.htod_sync_copy(m).expect("mask upload failed")
+            });
+            let mask_ptr: u64 = match &d_mask {
+                Some(s) => *s.device_ptr() as u64,
+                None => 0u64,
+            };
+
+            let mut args: [*mut std::ffi::c_void; 19] = [
+                (&bufs.d_pixels_in).as_kernel_param(),
+                (&d_depth).as_kernel_param(),
+                d_tex_active.as_kernel_param(),
+                (&*bounds_a).as_kernel_param(),
+                d_tex_inactive.as_kernel_param(),
+                (&*bounds_b).as_kernel_param(),
+                blend_t.as_kernel_param(),
+                (&bufs.d_pixels_out).as_kernel_param(),
+                n_i32.as_kernel_param(),
+                nz_i32.as_kernel_param(),
+                gs_i32.as_kernel_param(),
+                fw_i32.as_kernel_param(),
+                fh_i32.as_kernel_param(),
+                dw_i32.as_kernel_param(),
+                dh_i32.as_kernel_param(),
+                mask_ptr.as_kernel_param(),
+                mw_i32.as_kernel_param(),
+                mh_i32.as_kernel_param(),
+                diver_depth.as_kernel_param(),
+            ];
+            unsafe {
+                func.launch(cfg, &mut args[..])
+            }.map_err(map_cudarc_error)?;
+        }
+
+        // Download result
+        let slot = self.frame_bufs_16.borrow();
+        let bufs = slot.as_ref().expect("frame_bufs_16 allocated above");
         let result = dev.dtoh_sync_copy(&bufs.d_pixels_out).map_err(map_cudarc_error)?;
         Ok(result)
     }

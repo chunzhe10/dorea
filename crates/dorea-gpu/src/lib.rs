@@ -196,3 +196,28 @@ pub fn grade_frame_with_adaptive_grader(
     }
     grader.grade_frame_blended(pixels, depth, width, height, depth_w, depth_h, blend_t, None, 0, 0, 0.5)
 }
+
+/// Grade a single 16-bit frame using an existing `AdaptiveGrader` with dual-texture blending.
+///
+/// Identical to `grade_frame_with_adaptive_grader` but reads/writes `u16` pixel data.
+/// Uses `combined_lut_kernel_16` which normalises to [0, 65535].
+#[cfg(feature = "cuda")]
+pub fn grade_frame_with_adaptive_grader_16(
+    grader: &cuda::AdaptiveGrader,
+    pixels: &[u16],
+    depth: &[f32],
+    width: usize,
+    height: usize,
+    depth_w: usize,
+    depth_h: usize,
+    blend_t: f32,
+) -> Result<Vec<u16>, GpuError> {
+    if pixels.len() != width * height * 3 {
+        return Err(GpuError::InvalidInput(format!(
+            "pixels length {} != width*height*3 {}",
+            pixels.len(),
+            width * height * 3
+        )));
+    }
+    grader.grade_frame_blended_16(pixels, depth, width, height, depth_w, depth_h, blend_t, None, 0, 0, 0.5)
+}
