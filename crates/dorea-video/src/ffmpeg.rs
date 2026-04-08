@@ -20,6 +20,73 @@ pub enum FfmpegError {
     InvalidMetadata(String),
 }
 
+// ---------------------------------------------------------------------------
+// InputEncoding — log-curve / gamma family of the source footage
+// ---------------------------------------------------------------------------
+
+/// Log-curve / colour-science family of the source footage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEncoding {
+    /// DJI D-Log M (DJI Mini 4 Pro, Osmo Action 4/5, …).
+    DLogM,
+    /// Insta360 Log (X5, X4, …).
+    ILog,
+    /// Standard sRGB / Rec.709 gamma.
+    Srgb,
+}
+
+impl InputEncoding {
+    /// Heuristic: infer encoding from `VideoInfo` and the file path extension.
+    pub fn auto_detect(info: &VideoInfo, path: &std::path::Path) -> Self {
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if info.codec_name == "prores" || ext == "mov" {
+            return Self::ILog;
+        }
+        if info.bits_per_component >= 10
+            && (info.codec_name == "hevc" || info.codec_name == "h265")
+        {
+            return Self::DLogM;
+        }
+        Self::Srgb
+    }
+
+    /// Returns `true` for encodings that carry 10-bit (or higher) colour data.
+    pub fn is_10bit(&self) -> bool {
+        matches!(self, Self::DLogM | Self::ILog)
+    }
+}
+
+impl std::fmt::Display for InputEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DLogM => write!(f, "dlog-m"),
+            Self::ILog => write!(f, "ilog"),
+            Self::Srgb => write!(f, "srgb"),
+        }
+    }
+}
+
+impl std::str::FromStr for InputEncoding {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "dlog-m" | "dlogm" | "dlog_m" => Ok(Self::DLogM),
+            "ilog" | "i-log" => Ok(Self::ILog),
+            "srgb" | "rec709" => Ok(Self::Srgb),
+            other => Err(format!(
+                "unknown encoding '{other}'; expected dlog-m, ilog, or srgb"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VideoInfo
+// ---------------------------------------------------------------------------
+
 /// Video metadata returned by `probe`.
 #[derive(Debug, Clone)]
 pub struct VideoInfo {
@@ -633,6 +700,85 @@ mod tests {
         assert_eq!(info.bits_per_component, 10);
         assert_eq!(info.codec_name, "hevc");
         assert_eq!(info.pix_fmt, "yuv420p10le");
+    }
+
+    // ---- Task 5 tests ----
+
+    #[test]
+    fn input_encoding_auto_detect_dji_hevc_10bit() {
+        let info = VideoInfo {
+            width: 3840,
+            height: 2160,
+            fps: 29.97,
+            duration_secs: 10.0,
+            frame_count: 300,
+            has_audio: false,
+            codec_name: "hevc".to_string(),
+            pix_fmt: "yuv420p10le".to_string(),
+            bits_per_component: 10,
+        };
+        let path = std::path::Path::new("DJI_0001.MP4");
+        assert_eq!(InputEncoding::auto_detect(&info, path), InputEncoding::DLogM);
+    }
+
+    #[test]
+    fn input_encoding_auto_detect_prores_mov() {
+        let info = VideoInfo {
+            width: 3840,
+            height: 2160,
+            fps: 29.97,
+            duration_secs: 10.0,
+            frame_count: 300,
+            has_audio: false,
+            codec_name: "prores".to_string(),
+            pix_fmt: "yuv422p10le".to_string(),
+            bits_per_component: 10,
+        };
+        let path = std::path::Path::new("clip.mov");
+        assert_eq!(InputEncoding::auto_detect(&info, path), InputEncoding::ILog);
+    }
+
+    #[test]
+    fn input_encoding_auto_detect_srgb_h264() {
+        let info = VideoInfo {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            duration_secs: 5.0,
+            frame_count: 150,
+            has_audio: false,
+            codec_name: "h264".to_string(),
+            pix_fmt: "yuv420p".to_string(),
+            bits_per_component: 8,
+        };
+        let path = std::path::Path::new("clip.mp4");
+        assert_eq!(InputEncoding::auto_detect(&info, path), InputEncoding::Srgb);
+    }
+
+    #[test]
+    fn input_encoding_parse() {
+        assert_eq!("dlog-m".parse::<InputEncoding>(), Ok(InputEncoding::DLogM));
+        assert_eq!("dlogm".parse::<InputEncoding>(), Ok(InputEncoding::DLogM));
+        assert_eq!("dlog_m".parse::<InputEncoding>(), Ok(InputEncoding::DLogM));
+        assert_eq!("ilog".parse::<InputEncoding>(), Ok(InputEncoding::ILog));
+        assert_eq!("i-log".parse::<InputEncoding>(), Ok(InputEncoding::ILog));
+        assert_eq!("srgb".parse::<InputEncoding>(), Ok(InputEncoding::Srgb));
+        assert_eq!("rec709".parse::<InputEncoding>(), Ok(InputEncoding::Srgb));
+        assert!("unknown".parse::<InputEncoding>().is_err());
+    }
+
+    #[test]
+    fn input_encoding_is_10bit() {
+        assert!(InputEncoding::DLogM.is_10bit());
+        assert!(InputEncoding::ILog.is_10bit());
+        assert!(!InputEncoding::Srgb.is_10bit());
+    }
+
+    #[test]
+    fn input_encoding_display() {
+        assert_eq!(InputEncoding::DLogM.to_string(), "dlog-m");
+        assert_eq!(InputEncoding::ILog.to_string(), "ilog");
+        assert_eq!(InputEncoding::Srgb.to_string(), "srgb");
     }
 
     #[test]
