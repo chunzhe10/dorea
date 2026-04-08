@@ -337,6 +337,12 @@ def main(argv: Optional[list] = None) -> None:
                 print("[dorea-inference] RAUNE unloaded — VRAM freed", file=sys.stderr, flush=True)
                 resp = OkResponse()
 
+            elif req_type == "load_yolo_seg":
+                model_path = req.get("model_path")
+                from .yolo_seg import YoloSegInference
+                yolo_seg_model = YoloSegInference(model_path=model_path, device=device)
+                print("[dorea-inference] YOLO-seg loaded (on demand)", file=sys.stderr, flush=True)
+                resp = OkResponse()
             elif req_type == "load_raune":
                 # Unload existing model first to avoid OOM on 6 GB VRAM budget
                 if raune_model is not None:

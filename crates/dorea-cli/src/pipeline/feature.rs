@@ -140,7 +140,7 @@ pub fn run_feature_stage(
     // The depth model internally resizes to max_size, but starting from 4K source
     // preserves more detail than starting from proxy (518px).
     // After RAUNE completes and is unloaded, depth can use the freed VRAM for 1036px.
-    let depth_max_size = 1518; // max depth res — RAUNE unloaded first to free VRAM
+    let depth_max_size = 518; // conservative — zombie GPU procs eating VRAM, bump to 1036+ when clean
     log::info!(
         "Extracting {} keyframes at full resolution for depth (max_size={})",
         keyframes.len(), depth_max_size,
@@ -221,6 +221,10 @@ pub fn run_feature_stage(
 
     // --- YOLO-seg on proxy keyframes (diver detection) ---
     // Runs after depth — uses freed VRAM from RAUNE unload.
+    log::info!("Loading YOLO-seg for diver detection...");
+    if let Err(e) = inf_server.load_yolo_seg(None) {
+        log::warn!("Failed to load YOLO-seg ({}), proceeding without diver masks", e);
+    }
     log::info!("Running YOLO-seg on {} keyframes for diver detection...", keyframes.len());
     let mut kf_masks: HashMap<u64, (Vec<u8>, usize, usize)> = HashMap::new();
     use dorea_video::inference::YoloSegBatchItem;

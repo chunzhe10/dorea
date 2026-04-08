@@ -643,6 +643,26 @@ impl InferenceServer {
         Ok(())
     }
 
+    /// Load YOLO-seg model into the running server.
+    pub fn load_yolo_seg(&mut self, model_path: Option<&std::path::Path>) -> Result<(), InferenceError> {
+        let py_model_path = model_path.and_then(|p| p.to_str()).unwrap_or("");
+        let req = if py_model_path.is_empty() {
+            serde_json::json!({"type": "load_yolo_seg"})
+        } else {
+            serde_json::json!({"type": "load_yolo_seg", "model_path": py_model_path})
+        };
+        self.send_line(&req.to_string())?;
+        let resp = self.recv_line()?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| InferenceError::Ipc(format!("load_yolo_seg response parse: {e}")))?;
+        if v["type"].as_str() == Some("error") {
+            return Err(InferenceError::ServerError(
+                v["message"].as_str().unwrap_or("unknown error").to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Load RAUNE-Net into the running server (after it was started without it).
     pub fn load_raune(
         &mut self,
