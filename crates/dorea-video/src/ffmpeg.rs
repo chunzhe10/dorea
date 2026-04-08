@@ -443,6 +443,153 @@ pub fn extract_frame_at(
     Ok(output.stdout[..expected].to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// Frame16 (16-bit / 10-bit decode path)
+// ---------------------------------------------------------------------------
+
+/// A decoded 16-bit video frame (RGB48, little-endian u16 per channel).
+///
+/// Each pixel is three consecutive `u16` values: R, G, B.
+/// The full buffer length is `width * height * 3` u16 values.
+#[derive(Debug)]
+pub struct Frame16 {
+    pub index: u64,
+    pub pixels: Vec<u16>, // RGB48: width * height * 3
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Frame16 {
+    /// Down-convert to 8-bit by keeping the high byte of each u16.
+    pub fn to_8bit(&self) -> Vec<u8> {
+        self.pixels.iter().map(|&v| (v >> 8) as u8).collect()
+    }
+}
+
+/// Decode all frames from a video file as 16-bit RGB48 (little-endian u16).
+///
+/// Instructs ffmpeg to output `rgb48le`. Suitable for 10-bit and 12-bit sources.
+/// The resulting `Frame16::pixels` contains raw u16 values in the range 0–65535.
+pub fn decode_frames_16bit(
+    input: &Path,
+    info: &VideoInfo,
+) -> Result<impl Iterator<Item = Result<Frame16, FfmpegError>>, FfmpegError> {
+    let child = spawn_decoder_16bit(input, info)?;
+    Ok(FrameReader16::new(child, info.width, info.height))
+}
+
+fn spawn_decoder_16bit(input: &Path, info: &VideoInfo) -> Result<Child, FfmpegError> {
+    let input_str = input.to_str().unwrap_or("");
+    let size_str = format!("{}x{}", info.width, info.height);
+
+    // Try hardware decode first, fall back to software
+    let hw_result = Command::new("ffmpeg")
+        .args([
+            "-hwaccel", "nvdec",
+            "-i", input_str,
+            "-vf", &format!("scale={size_str}"),
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb48le",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Ok(child) = hw_result {
+        return Ok(child);
+    } else if let Err(ref e) = hw_result {
+        log::debug!("nvdec 16-bit spawn failed ({e}), falling back to software decode");
+    }
+
+    // Software fallback
+    Command::new("ffmpeg")
+        .args([
+            "-i", input_str,
+            "-vf", &format!("scale={size_str}"),
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb48le",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(FfmpegError::NotFound)
+}
+
+struct FrameReader16 {
+    child: Child,
+    frame_index: u64,
+    width: usize,
+    height: usize,
+    /// Number of bytes per frame (width * height * 3 * 2).
+    frame_bytes: usize,
+    done: bool,
+}
+
+impl FrameReader16 {
+    fn new(child: Child, width: usize, height: usize) -> Self {
+        Self {
+            child,
+            frame_index: 0,
+            width,
+            height,
+            frame_bytes: width * height * 3 * 2, // 6 bytes per pixel (rgb48le)
+            done: false,
+        }
+    }
+}
+
+impl Drop for FrameReader16 {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Iterator for FrameReader16 {
+    type Item = Result<Frame16, FfmpegError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        let mut raw = vec![0u8; self.frame_bytes];
+        let stdout = self.child.stdout.as_mut()?;
+
+        match read_exact(stdout, &mut raw) {
+            Ok(0) | Err(_) => {
+                self.done = true;
+                return None;
+            }
+            Ok(_) => {}
+        }
+
+        // Convert LE byte pairs → u16
+        let n_pixels = self.width * self.height * 3;
+        let mut pixels = Vec::with_capacity(n_pixels);
+        for chunk in raw.chunks_exact(2) {
+            pixels.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+
+        let frame = Frame16 {
+            index: self.frame_index,
+            pixels,
+            width: self.width,
+            height: self.height,
+        };
+        self.frame_index += 1;
+        Some(Ok(frame))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FrameEncoder
+// ---------------------------------------------------------------------------
+
 /// Encoder for streaming frames to an output video file.
 pub struct FrameEncoder {
     child: Child,
@@ -779,6 +926,23 @@ mod tests {
         assert_eq!(InputEncoding::DLogM.to_string(), "dlog-m");
         assert_eq!(InputEncoding::ILog.to_string(), "ilog");
         assert_eq!(InputEncoding::Srgb.to_string(), "srgb");
+    }
+
+    // ---- Task 6 tests ----
+
+    #[test]
+    fn frame16_to_8bit() {
+        // u16 value 0xFF00 should downshift to 0xFF.
+        let frame = Frame16 {
+            index: 0,
+            pixels: vec![0xFF00u16, 0x8000u16, 0x0100u16],
+            width: 1,
+            height: 1,
+        };
+        let eight = frame.to_8bit();
+        assert_eq!(eight[0], 0xFF);
+        assert_eq!(eight[1], 0x80);
+        assert_eq!(eight[2], 0x01);
     }
 
     #[test]
