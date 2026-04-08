@@ -140,7 +140,7 @@ pub fn run_feature_stage(
     // The depth model internally resizes to max_size, but starting from 4K source
     // preserves more detail than starting from proxy (518px).
     // After RAUNE completes and is unloaded, depth can use the freed VRAM for 1036px.
-    let depth_max_size = 518; // conservative — zombie GPU procs eating VRAM, bump to 1036+ when clean
+    let depth_max_size = 1036;
     log::info!(
         "Extracting {} keyframes at full resolution for depth (max_size={})",
         keyframes.len(), depth_max_size,
