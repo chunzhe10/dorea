@@ -1,5 +1,6 @@
 pub mod dlog_m;
 pub mod hsv;
+pub mod ilog;
 pub mod lab;
 
 /// Camera log curve abstraction. Implementations decode/encode between
@@ -16,3 +17,4 @@ pub trait TransferFunction {
 }
 
 pub use dlog_m::DLogM;
+pub use ilog::ILog;
