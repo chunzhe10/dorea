@@ -57,6 +57,29 @@ pub fn linear_to_dlog_m(x: f32) -> f32 {
     encoded.clamp(0.0, 1.0) as f32
 }
 
+use crate::TransferFunction;
+
+/// D-Log M transfer function (DJI Action 4).
+pub struct DLogM;
+
+impl TransferFunction for DLogM {
+    fn to_linear(&self, encoded: f32) -> f32 {
+        dlog_m_to_linear(encoded)
+    }
+
+    fn from_linear(&self, linear: f32) -> f32 {
+        linear_to_dlog_m(linear)
+    }
+
+    fn shoulder(&self) -> f32 {
+        0.85
+    }
+
+    fn name(&self) -> &'static str {
+        "D-Log M"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +105,15 @@ mod tests {
             (linear - 0.18).abs() < 0.02,
             "Middle grey decode: expected ~0.18, got {linear}"
         );
+    }
+
+    #[test]
+    fn test_dlog_m_as_trait_object() {
+        let tf: Box<dyn crate::TransferFunction> = Box::new(super::DLogM);
+        let encoded = tf.from_linear(0.18);
+        let decoded = tf.to_linear(encoded);
+        assert!((decoded - 0.18).abs() < 1e-4, "Trait round-trip: expected ~0.18, got {decoded}");
+        assert_eq!(tf.shoulder(), 0.85);
+        assert_eq!(tf.name(), "D-Log M");
     }
 }
