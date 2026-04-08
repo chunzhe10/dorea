@@ -75,7 +75,7 @@ impl TransferFunction for DLogM {
         0.85
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "D-Log M"
     }
 }

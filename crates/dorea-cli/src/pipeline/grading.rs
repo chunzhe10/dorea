@@ -527,18 +527,11 @@ fn run_grading_stage_16bit(
                 ).map_err(|e| anyhow::anyhow!("16-bit grading failed for frame {fi}: {e}"))?;
 
                 #[cfg(not(feature = "cuda"))]
-                let graded = {
-                    use dorea_cal::Calibration;
-                    use dorea_gpu::grade_frame_with_adaptive_grader_16;
-                    let seg_idx = kf_to_segment.get(kf_cursor).copied().unwrap_or(0);
-                    let cal = &segment_calibrations[seg_idx];
-                    let calibration = Calibration::new(
-                        cal.depth_luts.clone(), cal.hsl_corrections.clone(), 0,
+                {
+                    anyhow::bail!(
+                        "10-bit grading requires CUDA. Build with --features cuda or use --output-codec h264 for 8-bit CPU grading."
                     );
-                    grade_frame_with_adaptive_grader_16(
-                        &frame.pixels, &depth, frame.width, frame.height, &calibration, &params,
-                    ).map_err(|e| anyhow::anyhow!("16-bit grading failed for frame {fi}: {e}"))?
-                };
+                }
 
                 if graded_tx.send(graded).is_err() {
                     break;

@@ -752,9 +752,9 @@ impl AdaptiveGrader {
             use cudarc::driver::{DeviceRepr, DevicePtr};
 
             // Upload class mask if available, otherwise pass null device pointer
-            let d_mask: Option<CudaSlice<u8>> = class_mask.map(|m| {
-                dev.htod_sync_copy(m).expect("mask upload failed")
-            });
+            let d_mask: Option<CudaSlice<u8>> = class_mask
+                .map(|m| dev.htod_sync_copy(m).map_err(map_cudarc_error))
+                .transpose()?;
             let mask_ptr: u64 = match &d_mask {
                 Some(s) => *s.device_ptr() as u64,
                 None => 0u64,
@@ -878,9 +878,9 @@ impl AdaptiveGrader {
             use cudarc::driver::{DeviceRepr, DevicePtr};
 
             // Upload class mask if available, otherwise pass null device pointer
-            let d_mask: Option<CudaSlice<u8>> = class_mask.map(|m| {
-                dev.htod_sync_copy(m).expect("mask upload failed")
-            });
+            let d_mask: Option<CudaSlice<u8>> = class_mask
+                .map(|m| dev.htod_sync_copy(m).map_err(map_cudarc_error))
+                .transpose()?;
             let mask_ptr: u64 = match &d_mask {
                 Some(s) => *s.device_ptr() as u64,
                 None => 0u64,

@@ -85,9 +85,8 @@ impl TransferFunction for LutBased {
         self.shoulder
     }
 
-    fn name(&self) -> &'static str {
-        // Leak to get 'static. LutBased lives for the pipeline duration.
-        Box::leak(self.name.clone().into_boxed_str())
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 

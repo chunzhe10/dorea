@@ -37,12 +37,8 @@ pub enum InputEncoding {
 
 impl InputEncoding {
     /// Heuristic: infer encoding from `VideoInfo` and the file path extension.
-    pub fn auto_detect(info: &VideoInfo, path: &std::path::Path) -> Self {
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        if info.codec_name == "prores" || ext == "mov" {
+    pub fn auto_detect(info: &VideoInfo, _path: &std::path::Path) -> Self {
+        if info.codec_name == "prores" {
             return Self::ILog;
         }
         if info.bits_per_component >= 10
@@ -578,8 +574,7 @@ struct FrameReader16 {
     frame_index: u64,
     width: usize,
     height: usize,
-    /// Number of bytes per frame (width * height * 3 * 2).
-    frame_bytes: usize,
+    read_buf: Vec<u8>,
     done: bool,
 }
 
@@ -590,7 +585,7 @@ impl FrameReader16 {
             frame_index: 0,
             width,
             height,
-            frame_bytes: width * height * 3 * 2, // 6 bytes per pixel (rgb48le)
+            read_buf: vec![0u8; width * height * 6],
             done: false,
         }
     }
@@ -611,10 +606,9 @@ impl Iterator for FrameReader16 {
             return None;
         }
 
-        let mut raw = vec![0u8; self.frame_bytes];
         let stdout = self.child.stdout.as_mut()?;
 
-        match read_exact(stdout, &mut raw) {
+        match read_exact(stdout, &mut self.read_buf) {
             Ok(0) | Err(_) => {
                 self.done = true;
                 return None;
@@ -625,7 +619,7 @@ impl Iterator for FrameReader16 {
         // Convert LE byte pairs → u16
         let n_pixels = self.width * self.height * 3;
         let mut pixels = Vec::with_capacity(n_pixels);
-        for chunk in raw.chunks_exact(2) {
+        for chunk in self.read_buf.chunks_exact(2) {
             pixels.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
 
@@ -650,6 +644,7 @@ pub struct FrameEncoder {
     stdin: ChildStdin,
     stderr: Option<ChildStderr>,
     frame_bytes: usize,
+    write_buf: Vec<u8>,
 }
 
 impl FrameEncoder {
@@ -745,6 +740,7 @@ impl FrameEncoder {
             stdin,
             stderr,
             frame_bytes: width * height * 3,
+            write_buf: Vec::new(),
         })
     }
 
@@ -807,6 +803,7 @@ impl FrameEncoder {
             stdin,
             stderr,
             frame_bytes: width * height * 3,
+            write_buf: Vec::new(),
         })
     }
 
@@ -944,6 +941,7 @@ impl FrameEncoder {
             stdin,
             stderr,
             frame_bytes: width * height * bytes_per_pixel,
+            write_buf: Vec::new(),
         })
     }
 
@@ -982,17 +980,19 @@ impl FrameEncoder {
     /// Converts the u16 slice to little-endian bytes and forwards to the encoder stdin.
     /// The slice length must equal `width * height * 3`.
     pub fn write_frame_16(&mut self, pixels: &[u16]) -> Result<(), FfmpegError> {
-        // 2 bytes per u16
-        let expected_u16 = self.frame_bytes / 2;
-        if pixels.len() != expected_u16 {
+        let expected_bytes = pixels.len() * 2;
+        if expected_bytes != self.frame_bytes {
             return Err(FfmpegError::EncodeFailed(format!(
-                "frame16 size mismatch: expected {} u16 values, got {}",
-                expected_u16,
-                pixels.len()
+                "16-bit frame size mismatch: expected {} bytes, got {}",
+                self.frame_bytes, expected_bytes
             )));
         }
-        let bytes: Vec<u8> = pixels.iter().flat_map(|&v| v.to_le_bytes()).collect();
-        if let Err(e) = self.stdin.write_all(&bytes) {
+        self.write_buf.clear();
+        self.write_buf.reserve(expected_bytes);
+        for &v in pixels {
+            self.write_buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Err(e) = self.stdin.write_all(&self.write_buf) {
             let stderr_msg = self.stderr.as_mut().map(|s| {
                 let mut buf = String::new();
                 let _ = s.read_to_string(&mut buf);

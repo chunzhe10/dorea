@@ -14,7 +14,7 @@ pub trait TransferFunction {
     /// Highlight rolloff shoulder (0.0–1.0). Higher = later compression.
     fn shoulder(&self) -> f32;
     /// Human-readable name (e.g. "D-Log M").
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 }
 
 pub use dlog_m::DLogM;

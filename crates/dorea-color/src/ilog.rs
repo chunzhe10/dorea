@@ -60,7 +60,7 @@ impl TransferFunction for ILog {
         0.88
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "I-Log"
     }
 }
