@@ -92,6 +92,14 @@ pub struct DepthBatchItem {
     pub max_size: usize,
 }
 
+/// A single image item for YOLO-seg batch inference.
+pub struct YoloSegBatchItem {
+    pub id: String,
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+}
+
 /// Guard that prevents Python's GC from reclaiming a GPU tensor while Rust
 /// holds the device pointer. Drop this guard when Rust is done with the pointer.
 pub struct DepthTensorGuard {
@@ -514,6 +522,58 @@ impl InferenceServer {
                     enhanced_data, enh_w, enh_h,
                     depth_data, depth_w, depth_h,
                 ));
+            }
+
+            Ok(out)
+        })
+    }
+
+    /// Run YOLO-seg binary segmentation on a batch of frames via PyO3.
+    pub fn run_yolo_seg_batch(
+        &mut self,
+        items: &[YoloSegBatchItem],
+    ) -> Result<Vec<(String, Vec<u8>, usize, usize)>, InferenceError> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+
+        Python::with_gil(|py| {
+            let bridge = self.bridge.bind(py);
+
+            let py_list = pyo3::types::PyList::empty_bound(py);
+            for item in items {
+                let np_flat = numpy::PyArray1::from_slice_bound(py, &item.pixels);
+                let np_reshaped = np_flat
+                    .call_method1("reshape", ((item.height, item.width, 3),))
+                    .map_err(|e| InferenceError::Ipc(format!("reshape for id={}: {e}", item.id)))?;
+                py_list
+                    .append(np_reshaped)
+                    .map_err(|e| InferenceError::Ipc(format!("list append for id={}: {e}", item.id)))?;
+            }
+
+            let result = bridge
+                .call_method1("run_yolo_seg_batch_cpu", (py_list,))
+                .map_err(|e| Self::map_python_error(py, e))?;
+
+            let result_list = result
+                .downcast::<pyo3::types::PyList>()
+                .map_err(|e| InferenceError::Ipc(format!("result not a list: {e}")))?;
+
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let arr = result_list.get_item(i)
+                    .map_err(|e| InferenceError::Ipc(format!("get result[{i}]: {e}")))?;
+                let shape: Vec<usize> = arr.getattr("shape")
+                    .map_err(|e| InferenceError::Ipc(format!("shape[{i}]: {e}")))?
+                    .extract()
+                    .map_err(|e| InferenceError::Ipc(format!("extract shape[{i}]: {e}")))?;
+                let h = shape[0];
+                let w = shape[1];
+                let flat = arr.call_method0("tobytes")
+                    .map_err(|e| InferenceError::Ipc(format!("tobytes[{i}]: {e}")))?;
+                let mask_data: Vec<u8> = flat.extract()
+                    .map_err(|e| InferenceError::Ipc(format!("extract mask[{i}]: {e}")))?;
+                out.push((item.id.clone(), mask_data, w, h));
             }
 
             Ok(out)

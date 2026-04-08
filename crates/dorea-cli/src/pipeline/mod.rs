@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use dorea_gpu::GradeParams;
+use crate::optical_flow::MotionField;
 
 /// Resolved pipeline configuration — all CLI/config/defaults merged.
 /// Passed to each stage by reference.
@@ -49,6 +50,8 @@ pub struct KeyframeStageOutput {
     pub keyframes: Vec<keyframe::KeyframeEntry>,
     pub proxy_w: usize,
     pub proxy_h: usize,
+    /// Per-frame motion vectors from optical flow (None for first frame).
+    pub motion_fields: Vec<Option<MotionField>>,
 }
 
 /// Output of FeatureStage → input of CalibrationStage.

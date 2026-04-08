@@ -59,6 +59,8 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
                    help="Maxine super-resolution upscale factor (default: 2)")
     p.add_argument("--no-maxine-artifact-reduction", action="store_true",
                    help="Disable artifact reduction before upscale")
+    p.add_argument("--yolo-seg", action="store_true", help="Enable YOLO-seg diver detection")
+    p.add_argument("--yolo-seg-model", type=str, default=None, help="Path to YOLO-seg model weights")
     return p.parse_args(argv)
 
 
@@ -100,6 +102,8 @@ def main(argv: Optional[list] = None) -> None:
         )
         print("[dorea-inference] Depth Anything V2 loaded", file=sys.stderr, flush=True)
 
+    yolo_seg_model = None
+
     maxine_enhancer = None
     if args.maxine:
         from .maxine_enhancer import MaxineEnhancer
@@ -110,6 +114,12 @@ def main(argv: Optional[list] = None) -> None:
             f"artifact_reduction={not args.no_maxine_artifact_reduction})",
             file=sys.stderr, flush=True,
         )
+
+    # Load YOLO-seg if requested
+    if args.yolo_seg:
+        from .yolo_seg import YoloSegInference
+        yolo_seg_model = YoloSegInference(model_path=args.yolo_seg_model, device=device)
+        print("[dorea-inference] YOLO-seg loaded (binary diver/water)", file=sys.stderr, flush=True)
 
     print("[dorea-inference] ready", file=sys.stderr, flush=True)
 
@@ -355,6 +365,34 @@ def main(argv: Optional[list] = None) -> None:
                 )
                 print("[dorea-inference] Depth Anything V2 loaded (on demand)", file=sys.stderr, flush=True)
                 resp = OkResponse()
+
+            elif req_type == "yolo_seg_batch":
+                if yolo_seg_model is None:
+                    raise RuntimeError("YOLO-seg model not loaded — pass --yolo-seg")
+
+                items = req.get("items", [])
+                imgs = []
+                for item in items:
+                    fmt = item.get("format", "png")
+                    if fmt == "raw_rgb":
+                        imgs.append(decode_raw_rgb(item["image_b64"], int(item["width"]), int(item["height"])))
+                    else:
+                        imgs.append(decode_png(item["image_b64"]))
+
+                masks = yolo_seg_model.infer_batch(imgs)
+                results = []
+                for item, mask in zip(items, masks):
+                    mask_bytes = mask.tobytes()
+                    results.append({
+                        "id": item.get("id"),
+                        "mask_b64": __import__("base64").b64encode(mask_bytes).decode(),
+                        "width": mask.shape[1],
+                        "height": mask.shape[0],
+                    })
+                resp_line = json.dumps({"type": "yolo_seg_batch_result", "results": results})
+                sys.stdout.write(resp_line + "\n")
+                sys.stdout.flush()
+                continue
 
             elif req_type == "shutdown":
                 if maxine_enhancer is not None:

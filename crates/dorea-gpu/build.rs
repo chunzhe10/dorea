@@ -67,6 +67,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda/kernels/grade_pixel.cuh");
     println!("cargo:rerun-if-changed=src/cuda/kernels/build_combined_lut.cu");
     println!("cargo:rerun-if-changed=src/cuda/kernels/combined_lut.cu");
+    println!("cargo:rerun-if-changed=src/cuda/kernels/guided_filter.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=PATH");
@@ -80,7 +81,7 @@ fn main() {
     println!("cargo:warning=Found nvcc at {}", nvcc.display());
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let kernel_names = ["build_combined_lut", "combined_lut"];
+    let kernel_names = ["build_combined_lut", "combined_lut", "guided_filter"];
 
     let cuda_include = nvcc.parent()
         .and_then(|p| p.parent())

@@ -125,7 +125,7 @@ pub fn run_feature_stage(
     mut inf_server: InferenceServer,
     kf_out: KeyframeStageOutput,
 ) -> Result<FeatureStageOutput> {
-    let KeyframeStageOutput { keyframes, proxy_w, proxy_h } = kf_out;
+    let KeyframeStageOutput { keyframes, proxy_w, proxy_h, .. } = kf_out;
     let proxy_size = cfg.proxy_size;
 
     log::info!(

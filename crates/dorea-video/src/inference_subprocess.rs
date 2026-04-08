@@ -137,6 +137,14 @@ pub struct RauneDepthBatchItem {
     pub depth_max_size: usize,
 }
 
+/// A single image item for YOLO-seg batch inference.
+pub struct YoloSegBatchItem {
+    pub id: String,
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+}
+
 /// Parse an enhance_result JSON response, validating dimensions match the request.
 pub(super) fn parse_enhance_response(
     resp: &str,
@@ -667,6 +675,67 @@ impl InferenceServer {
             )));
         }
         Ok(())
+    }
+
+    /// Run YOLO-seg binary segmentation on a batch of frames.
+    ///
+    /// Returns `Vec<(id, class_mask_u8, width, height)>` where class_mask is
+    /// 0=water, 1=diver at the input frame's resolution.
+    pub fn run_yolo_seg_batch(
+        &mut self,
+        items: &[YoloSegBatchItem],
+    ) -> Result<Vec<(String, Vec<u8>, usize, usize)>, InferenceError> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let json_items: Vec<serde_json::Value> = items.iter().map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "image_b64": B64.encode(&item.pixels),
+                "format": "raw_rgb",
+                "width": item.width,
+                "height": item.height,
+            })
+        }).collect();
+
+        let request = serde_json::json!({
+            "type": "yolo_seg_batch",
+            "items": json_items,
+        });
+
+        self.send_line(&request.to_string())?;
+        let response = self.recv_line()?;
+        let v: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|e| InferenceError::Ipc(format!("yolo_seg_batch response parse: {e}")))?;
+
+        if v["type"].as_str() == Some("error") {
+            return Err(InferenceError::ServerError(
+                v["message"].as_str().unwrap_or("unknown error").to_string(),
+            ));
+        }
+        if v["type"].as_str() != Some("yolo_seg_batch_result") {
+            return Err(InferenceError::Ipc(format!(
+                "expected yolo_seg_batch_result, got: {response}"
+            )));
+        }
+
+        let results = v["results"].as_array()
+            .ok_or_else(|| InferenceError::Ipc("missing results array".into()))?;
+
+        let mut out = Vec::with_capacity(items.len());
+        for (i, result) in results.iter().enumerate() {
+            let id = result["id"].as_str().unwrap_or("").to_string();
+            let mask_b64 = result["mask_b64"].as_str()
+                .ok_or_else(|| InferenceError::Ipc(format!("missing mask_b64 for result {i}")))?;
+            let mask_bytes = B64.decode(mask_b64)
+                .map_err(|e| InferenceError::Ipc(format!("base64 decode mask {i}: {e}")))?;
+            let w = result["width"].as_u64().unwrap_or(0) as usize;
+            let h = result["height"].as_u64().unwrap_or(0) as usize;
+            out.push((id, mask_bytes, w, h));
+        }
+
+        Ok(out)
     }
 
     /// Bilinearly upscale a depth map from (src_w, src_h) to (dst_w, dst_h).

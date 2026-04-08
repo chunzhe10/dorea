@@ -21,6 +21,8 @@ use dorea_cal::Calibration;
 #[cfg(feature = "cuda")]
 mod combined_lut;
 #[cfg(feature = "cuda")]
+pub mod guided_filter;
+#[cfg(feature = "cuda")]
 pub(crate) use combined_lut::CombinedLut;
 
 // Embedded PTX compiled by build.rs

@@ -62,5 +62,9 @@ pub fn run_keyframe_stage(cfg: &PipelineConfig, info: &ffmpeg::VideoInfo) -> Res
         "pass 1 detected no keyframes — video may be empty or undecodable"
     );
 
-    Ok(KeyframeStageOutput { keyframes, proxy_w, proxy_h })
+    // Motion fields are populated when optical flow is enabled (future: OpticalFlowDetector).
+    // For now, no motion vectors are computed during keyframe detection.
+    let motion_fields = vec![None; keyframes.len()];
+
+    Ok(KeyframeStageOutput { keyframes, proxy_w, proxy_h, motion_fields })
 }

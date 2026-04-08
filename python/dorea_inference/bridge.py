@@ -197,16 +197,34 @@ def run_raune_depth_batch_cpu(
     return results
 
 
+_yolo_seg_model = None
+
+
+def load_yolo_seg_model(model_path: Optional[str] = None, device: str = "cuda") -> None:
+    """Load YOLOv11n-seg for binary diver/water segmentation."""
+    global _yolo_seg_model
+    from .yolo_seg import YoloSegInference
+    _yolo_seg_model = YoloSegInference(model_path=model_path, device=device)
+
+
+def run_yolo_seg_batch_cpu(imgs: "list[np.ndarray]") -> "list[np.ndarray]":
+    """Run YOLO-seg on a batch of frames, returning class masks."""
+    if _yolo_seg_model is None:
+        raise RuntimeError("YOLO-seg not loaded — call load_yolo_seg_model() first")
+    return _yolo_seg_model.infer_batch(imgs)
+
+
 # ---------------------------------------------------------------------------
 # Model lifecycle
 # ---------------------------------------------------------------------------
 
 def unload_models() -> None:
     """Release model references so they can be garbage-collected."""
-    global _depth_model, _raune_model, _maxine_model
+    global _depth_model, _raune_model, _maxine_model, _yolo_seg_model
     _depth_model = None
     _raune_model = None
     _maxine_model = None
+    _yolo_seg_model = None
 
 
 # ---------------------------------------------------------------------------
