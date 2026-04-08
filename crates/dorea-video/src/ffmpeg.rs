@@ -33,6 +33,12 @@ pub struct VideoInfo {
     pub frame_count: u64,
     /// Has audio stream.
     pub has_audio: bool,
+    /// Codec name as reported by ffprobe, e.g. `"hevc"`, `"prores"`, `"h264"`.
+    pub codec_name: String,
+    /// Pixel format as reported by ffprobe, e.g. `"yuv420p10le"`, `"yuv422p10le"`.
+    pub pix_fmt: String,
+    /// Bits per colour component (8, 10, 12). Falls back to 0 if unknown.
+    pub bits_per_component: u8,
 }
 
 /// Probe a video file for metadata.
@@ -61,13 +67,16 @@ pub fn probe(input: &Path) -> Result<VideoInfo, FfmpegError> {
         FfmpegError::InvalidMetadata("no streams found".to_string())
     })?;
 
-    let video = streams.iter()
+    let video = streams
+        .iter()
         .find(|s| s["codec_type"].as_str() == Some("video"))
         .ok_or_else(|| FfmpegError::InvalidMetadata("no video stream".to_string()))?;
 
-    let width = video["width"].as_u64()
+    let width = video["width"]
+        .as_u64()
         .ok_or_else(|| FfmpegError::InvalidMetadata("missing width".to_string()))? as usize;
-    let height = video["height"].as_u64()
+    let height = video["height"]
+        .as_u64()
         .ok_or_else(|| FfmpegError::InvalidMetadata("missing height".to_string()))? as usize;
 
     // fps as rational string "30000/1001" or plain "30"
@@ -83,9 +92,42 @@ pub fn probe(input: &Path) -> Result<VideoInfo, FfmpegError> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or_else(|| (duration_secs * fps).round() as u64);
 
-    let has_audio = streams.iter().any(|s| s["codec_type"].as_str() == Some("audio"));
+    let has_audio = streams
+        .iter()
+        .any(|s| s["codec_type"].as_str() == Some("audio"));
 
-    Ok(VideoInfo { width, height, fps, duration_secs, frame_count, has_audio })
+    let codec_name = video["codec_name"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let pix_fmt = video["pix_fmt"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let bits_per_component = video["bits_per_raw_sample"]
+        .as_str()
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or_else(|| {
+            if pix_fmt.contains("10") {
+                10
+            } else if pix_fmt.contains("12") {
+                12
+            } else {
+                8
+            }
+        });
+
+    Ok(VideoInfo {
+        width,
+        height,
+        fps,
+        duration_secs,
+        frame_count,
+        has_audio,
+        codec_name,
+        pix_fmt,
+        bits_per_component,
+    })
 }
 
 fn parse_rational(s: &str) -> f64 {
@@ -416,11 +458,13 @@ impl FrameEncoder {
 
         // Check immediately if ffmpeg exited (e.g. bad codec args, permissions, etc.)
         if let Ok(Some(status)) = child.try_wait() {
-            let stderr_msg = stderr.map(|mut s| {
-                let mut buf = String::new();
-                let _ = s.read_to_string(&mut buf);
-                buf
-            }).unwrap_or_default();
+            let stderr_msg = stderr
+                .map(|mut s| {
+                    let mut buf = String::new();
+                    let _ = s.read_to_string(&mut buf);
+                    buf
+                })
+                .unwrap_or_default();
             return Err(FfmpegError::EncodeFailed(format!(
                 "ffmpeg encoder exited immediately (code {:?}): {}",
                 status.code(),
@@ -476,14 +520,17 @@ impl FrameEncoder {
         let stderr = child.stderr.take();
 
         if let Ok(Some(status)) = child.try_wait() {
-            let msg = stderr.map(|mut s| {
-                let mut buf = String::new();
-                let _ = s.read_to_string(&mut buf);
-                buf
-            }).unwrap_or_default();
+            let msg = stderr
+                .map(|mut s| {
+                    let mut buf = String::new();
+                    let _ = s.read_to_string(&mut buf);
+                    buf
+                })
+                .unwrap_or_default();
             return Err(FfmpegError::EncodeFailed(format!(
                 "ffv1 encoder exited immediately (code {:?}): {}",
-                status.code(), msg.trim()
+                status.code(),
+                msg.trim()
             )));
         }
 
@@ -568,6 +615,24 @@ mod tests {
         assert!((parse_rational("25/1") - 25.0).abs() < 0.001);
         assert!((parse_rational("24") - 24.0).abs() < 0.001);
         assert!((parse_rational("0/0") - 30.0).abs() < 0.001); // div-by-zero fallback
+    }
+
+    #[test]
+    fn video_info_has_codec_fields() {
+        let info = VideoInfo {
+            width: 3840,
+            height: 2160,
+            fps: 29.97,
+            duration_secs: 10.0,
+            frame_count: 300,
+            has_audio: true,
+            codec_name: "hevc".to_string(),
+            pix_fmt: "yuv420p10le".to_string(),
+            bits_per_component: 10,
+        };
+        assert_eq!(info.bits_per_component, 10);
+        assert_eq!(info.codec_name, "hevc");
+        assert_eq!(info.pix_fmt, "yuv420p10le");
     }
 
     #[test]
