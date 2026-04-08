@@ -6,6 +6,8 @@
 //! Created once via `CudaGrader::new(calibration, params)`; reused across frames.
 
 #[cfg(feature = "cuda")]
+use std::cell::RefCell;
+#[cfg(feature = "cuda")]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
@@ -29,6 +31,29 @@ const COMBINED_LUT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/combined_
 const BUILD_COMBINED_LUT_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/build_combined_lut.ptx"));
 
+/// Pre-allocated device buffers keyed by frame resolution.
+/// Reused across frames to eliminate per-frame cudaMalloc calls.
+#[cfg(feature = "cuda")]
+struct FrameBuffers {
+    width: usize,
+    height: usize,
+    d_pixels_in: CudaSlice<u8>,    // n * 3
+    d_depth: CudaSlice<f32>,        // n
+    d_pixels_out: CudaSlice<u8>,    // n * 3
+}
+
+#[cfg(feature = "cuda")]
+fn alloc_frame_buffers(dev: &Arc<CudaDevice>, width: usize, height: usize) -> Result<FrameBuffers, GpuError> {
+    let n = width * height;
+    Ok(FrameBuffers {
+        width,
+        height,
+        d_pixels_in: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
+        d_depth: dev.alloc_zeros(n).map_err(map_cudarc_error)?,
+        d_pixels_out: dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?,
+    })
+}
+
 /// CUDA grader: holds a device handle and the precomputed combined LUT textures.
 ///
 /// Create once via `CudaGrader::new(calibration, params)`, reuse across frames.
@@ -38,16 +63,24 @@ const BUILD_COMBINED_LUT_PTX: &str =
 /// so it is dropped first (Rust drops fields in declaration order). The
 /// `CombinedLut` destructor calls `cuTexObjectDestroy` / `cuArrayDestroy`, which
 /// require the CUDA context to still be alive — i.e. `device` must outlive it.
+/// Similarly, `d_textures`, `d_boundaries`, and `frame_bufs` hold CudaSlice
+/// allocations that must be freed before the device is destroyed.
 #[cfg(feature = "cuda")]
 pub struct CudaGrader {
     combined_lut: CombinedLut,              // dropped first — CUDA APIs require live context
-    device:       Arc<CudaDevice>,          // dropped second — destroys CUDA context
+    d_textures:   CudaSlice<u64>,           // texture handles (constant per session)
+    d_boundaries: CudaSlice<f32>,           // zone boundaries (constant per session)
+    frame_bufs:   RefCell<Option<FrameBuffers>>, // resolution-keyed, reallocated on size change
+    device:       Arc<CudaDevice>,          // dropped last — destroys CUDA context
     _not_send:    std::marker::PhantomData<*const ()>,
 }
 
 #[cfg(feature = "cuda")]
 impl CudaGrader {
     /// Initialise CUDA device 0, load per-frame kernel PTX, and build combined LUT textures.
+    ///
+    /// Texture handles and zone boundaries are uploaded to device once here and reused
+    /// across all frames (they are constant for the lifetime of the grader).
     pub fn new(calibration: &Calibration, params: &GradeParams) -> Result<Self, GpuError> {
         let device = CudaDevice::new(0).map_err(|e| {
             GpuError::ModuleLoad(format!("CudaDevice::new(0) failed: {e}"))
@@ -63,9 +96,16 @@ impl CudaGrader {
         // Build combined LUT textures (GPU build kernel runs here, ~<1ms)
         let combined_lut = CombinedLut::build(&device, calibration, params)?;
 
+        // Upload constant data to device once — these never change for this grader.
+        let d_textures = device.htod_sync_copy(&combined_lut.textures).map_err(map_cudarc_error)?;
+        let d_boundaries = device.htod_sync_copy(&combined_lut.zone_boundaries).map_err(map_cudarc_error)?;
+
         Ok(Self {
-            device,
             combined_lut,
+            d_textures,
+            d_boundaries,
+            frame_bufs: RefCell::new(None),
+            device,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -73,6 +113,9 @@ impl CudaGrader {
     /// Run the combined LUT kernel on one frame.
     ///
     /// Returns graded sRGB u8 pixels (interleaved RGB, same dimensions as input).
+    ///
+    /// Steady-state per-frame cost: 2 htod barriers (pixels + depth) + 1 dtoh barrier.
+    /// Texture handles, zone boundaries, and output buffer are pre-allocated.
     pub fn grade_frame_cuda(
         &self,
         pixels: &[u8],
@@ -95,28 +138,29 @@ impl CudaGrader {
         }
         let dev = &self.device;
 
-        // Upload inputs
-        let d_pixels_in = dev.htod_sync_copy(pixels).map_err(map_cudarc_error)?;
-        let d_depth     = dev.htod_sync_copy(depth).map_err(map_cudarc_error)?;
+        // Ensure frame buffers exist at the correct resolution.
+        {
+            let mut slot = self.frame_bufs.borrow_mut();
+            let needs = slot.as_ref().map_or(true, |b| b.width != width || b.height != height);
+            if needs {
+                *slot = Some(alloc_frame_buffers(dev, width, height)?);
+            }
+        }
 
-        // Upload texture handles (CUtexObject = u64) to device
-        // For the single-texture CudaGrader, pass the same set for both A and B
-        // with blend_t=0.0 so set B is never sampled.
-        let d_textures: CudaSlice<u64> = dev
-            .htod_sync_copy(&self.combined_lut.textures)
-            .map_err(map_cudarc_error)?;
-
-        // Upload zone boundaries
-        let d_boundaries = dev
-            .htod_sync_copy(&self.combined_lut.zone_boundaries)
-            .map_err(map_cudarc_error)?;
-
-        // Output buffer
-        let d_pixels_out: CudaSlice<u8> = dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?;
+        // Upload per-frame data into pre-allocated buffers (copy only, no cudaMalloc).
+        {
+            let mut slot = self.frame_bufs.borrow_mut();
+            let bufs = slot.as_mut().unwrap();
+            dev.htod_sync_copy_into(pixels, &mut bufs.d_pixels_in).map_err(map_cudarc_error)?;
+            dev.htod_sync_copy_into(depth, &mut bufs.d_depth).map_err(map_cudarc_error)?;
+        }
 
         // Launch combined_lut_kernel (11-arg dual-texture signature)
-        // blend_t=0.0 → early-out after set A, set B args are never sampled
+        // blend_t=0.0 → early-out after set A, set B args are never sampled.
+        // d_textures and d_boundaries are cached from construction — no per-frame upload.
         {
+            let slot = self.frame_bufs.borrow();
+            let bufs = slot.as_ref().unwrap();
             let func = dev.get_func("combined_lut", "combined_lut_kernel")
                 .ok_or_else(|| GpuError::ModuleLoad("combined_lut_kernel not found".into()))?;
             let cfg = LaunchConfig {
@@ -126,14 +170,14 @@ impl CudaGrader {
             };
             unsafe {
                 func.launch(cfg, (
-                    &d_pixels_in,
-                    &d_depth,
-                    &d_textures,       // textures_a
-                    &d_boundaries,     // zone_boundaries_a
-                    &d_textures,       // textures_b (same — never sampled when blend_t=0)
-                    &d_boundaries,     // zone_boundaries_b (same)
-                    0.0f32,            // blend_t = 0.0
-                    &d_pixels_out,
+                    &bufs.d_pixels_in,
+                    &bufs.d_depth,
+                    &self.d_textures,       // textures_a (cached)
+                    &self.d_boundaries,     // zone_boundaries_a (cached)
+                    &self.d_textures,       // textures_b (same — never sampled when blend_t=0)
+                    &self.d_boundaries,     // zone_boundaries_b (same)
+                    0.0f32,                 // blend_t = 0.0
+                    &bufs.d_pixels_out,
                     n as i32,
                     self.combined_lut.n_zones as i32,
                     self.combined_lut.grid_size as i32,
@@ -142,7 +186,9 @@ impl CudaGrader {
         }
 
         // Download result
-        let result = dev.dtoh_sync_copy(&d_pixels_out).map_err(map_cudarc_error)?;
+        let slot = self.frame_bufs.borrow();
+        let bufs = slot.as_ref().unwrap();
+        let result = dev.dtoh_sync_copy(&bufs.d_pixels_out).map_err(map_cudarc_error)?;
         Ok(result)
     }
 }
@@ -440,17 +486,26 @@ mod tests {
 
 /// Adaptive grader with per-keyframe zone boundaries and dual-texture blending.
 ///
-/// Field order matters for drop: `adaptive_lut` before `device`.
+/// Field order matters for drop: CUDA resource fields before `device`.
+/// Texture handles and per-frame buffers are cached to avoid per-frame cudaMalloc.
 #[cfg(feature = "cuda")]
 pub struct AdaptiveGrader {
-    adaptive_lut: combined_lut::AdaptiveLut,  // dropped first
-    device:       Arc<CudaDevice>,            // dropped second
+    adaptive_lut: combined_lut::AdaptiveLut,  // dropped first — CUDA resources
+    d_textures_a: CudaSlice<u64>,             // active texture handles (constant after allocate)
+    d_textures_b: CudaSlice<u64>,             // inactive texture handles (constant after allocate)
+    d_bounds_a:   RefCell<CudaSlice<f32>>,    // active boundaries (updated on swap/rebuild)
+    d_bounds_b:   RefCell<CudaSlice<f32>>,    // inactive boundaries (updated on swap/rebuild)
+    frame_bufs:   RefCell<Option<FrameBuffers>>, // resolution-keyed
+    device:       Arc<CudaDevice>,            // dropped last — destroys CUDA context
     _not_send:    std::marker::PhantomData<*const ()>,
 }
 
 #[cfg(feature = "cuda")]
 impl AdaptiveGrader {
     /// Initialize CUDA device, load both kernels, allocate double-buffered textures.
+    ///
+    /// Texture handles are uploaded to device once. Boundaries are uploaded and
+    /// refreshed on `prepare_keyframe()` / `swap_textures()`.
     pub fn new(
         base_luts_flat: &[f32],
         base_boundaries: &[f32],
@@ -487,20 +542,50 @@ impl AdaptiveGrader {
             runtime_n_zones,
         )?;
 
+        // Cache texture handles on device — CUtexObject values are stable after
+        // TextureSet::allocate(); only the 3D array content changes on rebuild.
+        let d_textures_a = device.htod_sync_copy(adaptive_lut.active_textures()).map_err(map_cudarc_error)?;
+        let d_textures_b = device.htod_sync_copy(adaptive_lut.inactive_textures()).map_err(map_cudarc_error)?;
+        let d_bounds_a = device.htod_sync_copy(adaptive_lut.active_boundaries()).map_err(map_cudarc_error)?;
+        let d_bounds_b = device.htod_sync_copy(adaptive_lut.inactive_boundaries()).map_err(map_cudarc_error)?;
+
         Ok(Self {
             adaptive_lut,
+            d_textures_a,
+            d_textures_b,
+            d_bounds_a: RefCell::new(d_bounds_a),
+            d_bounds_b: RefCell::new(d_bounds_b),
+            frame_bufs: RefCell::new(None),
             device,
             _not_send: std::marker::PhantomData,
         })
     }
 
     /// Build runtime textures for the next keyframe into the inactive set.
+    ///
+    /// Re-uploads the inactive set's boundary device slice (boundaries change per keyframe).
+    /// Texture handles remain stable — only the 3D array content is rebuilt.
     pub fn prepare_keyframe(&mut self, runtime_boundaries: &[f32]) -> Result<(), GpuError> {
         let inactive = 1 - self.adaptive_lut.active_index();
-        self.adaptive_lut.rebuild_set(&self.device, inactive, runtime_boundaries)
+        self.adaptive_lut.rebuild_set(&self.device, inactive, runtime_boundaries)?;
+
+        // Re-upload the inactive set's boundaries (they just changed).
+        let new_bounds = self.device.htod_sync_copy(
+            self.adaptive_lut.inactive_boundaries()
+        ).map_err(map_cudarc_error)?;
+        if inactive == 0 {
+            *self.d_bounds_a.borrow_mut() = new_bounds;
+        } else {
+            *self.d_bounds_b.borrow_mut() = new_bounds;
+        }
+        Ok(())
     }
 
     /// Swap active/inactive texture sets (call at keyframe boundary after prepare_keyframe).
+    ///
+    /// The cached device slices for texture handles remain valid — texture handles don't
+    /// change on swap. The d_textures_a/b and d_bounds_a/b were associated with sets[0]/sets[1]
+    /// at construction, and `active_index()` determines which is "active" at launch time.
     pub fn swap_textures(&mut self) {
         self.adaptive_lut.swap();
     }
@@ -520,6 +605,9 @@ impl AdaptiveGrader {
     /// Grade one frame with dual-texture temporal blending.
     ///
     /// `blend_t`: 0.0 = keyframe (uses active set only), 0.0–1.0 between keyframes.
+    ///
+    /// Steady-state per-frame cost: 2 htod barriers (pixels + depth) + 1 dtoh barrier.
+    /// Texture handles, boundaries, and output buffer are pre-allocated/cached.
     pub fn grade_frame_blended(
         &self,
         pixels: &[u8],
@@ -541,42 +629,67 @@ impl AdaptiveGrader {
         }
         let dev = &self.device;
 
-        let d_pixels_in  = dev.htod_sync_copy(pixels).map_err(map_cudarc_error)?;
-        let d_depth      = dev.htod_sync_copy(depth).map_err(map_cudarc_error)?;
-        // TODO(perf): texture handles and boundaries are stable between swap_textures() calls.
-        // Cache them as device slices in AdaptiveLut and update only on prepare_keyframe/swap.
-        // Current cost: 4 × ~128 bytes per frame — negligible but worth fixing in Task 7.
-        let d_textures_a = dev.htod_sync_copy(self.adaptive_lut.active_textures()).map_err(map_cudarc_error)?;
-        let d_bounds_a   = dev.htod_sync_copy(self.adaptive_lut.active_boundaries()).map_err(map_cudarc_error)?;
-        let d_textures_b = dev.htod_sync_copy(self.adaptive_lut.inactive_textures()).map_err(map_cudarc_error)?;
-        let d_bounds_b   = dev.htod_sync_copy(self.adaptive_lut.inactive_boundaries()).map_err(map_cudarc_error)?;
-        let d_pixels_out: CudaSlice<u8> = dev.alloc_zeros(n * 3).map_err(map_cudarc_error)?;
+        // Ensure frame buffers exist at the correct resolution.
+        {
+            let mut slot = self.frame_bufs.borrow_mut();
+            let needs = slot.as_ref().map_or(true, |b| b.width != width || b.height != height);
+            if needs {
+                *slot = Some(alloc_frame_buffers(dev, width, height)?);
+            }
+        }
 
-        let func = dev.get_func("combined_lut", "combined_lut_kernel")
-            .ok_or_else(|| GpuError::ModuleLoad("combined_lut_kernel not found".into()))?;
-        let cfg = LaunchConfig {
-            grid_dim: (div_ceil(n as u32, 256), 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
+        // Upload per-frame data into pre-allocated buffers.
+        {
+            let mut slot = self.frame_bufs.borrow_mut();
+            let bufs = slot.as_mut().unwrap();
+            dev.htod_sync_copy_into(pixels, &mut bufs.d_pixels_in).map_err(map_cudarc_error)?;
+            dev.htod_sync_copy_into(depth, &mut bufs.d_depth).map_err(map_cudarc_error)?;
+        }
+
+        // Determine which cached device slices correspond to the current active/inactive sets.
+        // d_textures_a/d_bounds_a always correspond to sets[0], d_textures_b/d_bounds_b to sets[1].
+        let active_idx = self.adaptive_lut.active_index();
+        let (d_tex_active, d_bounds_active, d_tex_inactive, d_bounds_inactive) = if active_idx == 0 {
+            (&self.d_textures_a, &self.d_bounds_a, &self.d_textures_b, &self.d_bounds_b)
+        } else {
+            (&self.d_textures_b, &self.d_bounds_b, &self.d_textures_a, &self.d_bounds_a)
         };
 
-        unsafe {
-            func.launch(cfg, (
-                &d_pixels_in,
-                &d_depth,
-                &d_textures_a,
-                &d_bounds_a,
-                &d_textures_b,
-                &d_bounds_b,
-                blend_t,
-                &d_pixels_out,
-                n as i32,
-                self.adaptive_lut.runtime_n_zones as i32,
-                self.adaptive_lut.grid_size as i32,
-            ))
-        }.map_err(map_cudarc_error)?;
+        {
+            let slot = self.frame_bufs.borrow();
+            let bufs = slot.as_ref().unwrap();
+            let bounds_a = d_bounds_active.borrow();
+            let bounds_b = d_bounds_inactive.borrow();
 
-        let result = dev.dtoh_sync_copy(&d_pixels_out).map_err(map_cudarc_error)?;
+            let func = dev.get_func("combined_lut", "combined_lut_kernel")
+                .ok_or_else(|| GpuError::ModuleLoad("combined_lut_kernel not found".into()))?;
+            let cfg = LaunchConfig {
+                grid_dim: (div_ceil(n as u32, 256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                func.launch(cfg, (
+                    &bufs.d_pixels_in,
+                    &bufs.d_depth,
+                    d_tex_active,
+                    &*bounds_a,
+                    d_tex_inactive,
+                    &*bounds_b,
+                    blend_t,
+                    &bufs.d_pixels_out,
+                    n as i32,
+                    self.adaptive_lut.runtime_n_zones as i32,
+                    self.adaptive_lut.grid_size as i32,
+                ))
+            }.map_err(map_cudarc_error)?;
+        }
+
+        // Download result
+        let slot = self.frame_bufs.borrow();
+        let bufs = slot.as_ref().unwrap();
+        let result = dev.dtoh_sync_copy(&bufs.d_pixels_out).map_err(map_cudarc_error)?;
         Ok(result)
     }
 }
