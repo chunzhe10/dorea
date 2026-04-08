@@ -17,8 +17,8 @@ use dorea_gpu::AdaptiveGrader;
 
 use super::{PipelineConfig, CalibrationStageOutput};
 
-/// Channel capacity for the decoder→GPU and GPU→encoder bounded queues.
-/// 4 frames at 4K ≈ 95 MB peak headroom.
+/// Channel capacity for each of the two bounded queues (decoder→GPU, GPU→encoder).
+/// Peak memory: 2 channels × 4 frames × 24 MB/frame (4K RGB24) ≈ 190 MB headroom.
 const CHANNEL_CAPACITY: usize = 4;
 
 /// Linearly interpolate between two f32 depth maps.
@@ -131,122 +131,129 @@ pub fn run_grading_stage(
         });
 
         // ---------------------------------------------------------------
-        // Thread 2: GPU (main thread) — depth interp + grade
+        // GPU thread (main) — depth interp + grade
+        // Wrapped in a closure so thread joins always run, even on error.
         // ---------------------------------------------------------------
-        let mut kf_cursor = 0usize;
-        #[cfg(feature = "cuda")]
-        let mut current_segment = kf_to_segment.first().copied().unwrap_or(0);
+        let gpu_result: Result<()> = (|| {
+            let mut kf_cursor = 0usize;
+            #[cfg(feature = "cuda")]
+            let mut current_segment = kf_to_segment.first().copied().unwrap_or(0);
 
-        for frame in decoded_rx {
-            let fi = frame.index;
+            for frame in decoded_rx {
+                let fi = frame.index;
 
-            // Advance cursor to most recent keyframe ≤ fi
-            while kf_cursor + 1 < kf_index_list.len() && kf_index_list[kf_cursor + 1].0 <= fi {
-                kf_cursor += 1;
+                // Advance cursor to most recent keyframe ≤ fi
+                while kf_cursor + 1 < kf_index_list.len() && kf_index_list[kf_cursor + 1].0 <= fi {
+                    kf_cursor += 1;
+
+                    #[cfg(feature = "cuda")]
+                    {
+                        let new_seg = kf_to_segment[kf_cursor];
+                        if new_seg != current_segment {
+                            let seg_cal = &segment_calibrations[new_seg];
+                            let base_flat: Vec<f32> = seg_cal.depth_luts.luts.iter()
+                                .flat_map(|lut| lut.data.iter().copied())
+                                .collect();
+                            let base_bounds = &seg_cal.depth_luts.zone_boundaries;
+                            let hsl = &seg_cal.hsl_corrections;
+                            let h_offsets: Vec<f32> = hsl.0.iter().map(|q| q.h_offset).collect();
+                            let s_ratios:  Vec<f32> = hsl.0.iter().map(|q| q.s_ratio).collect();
+                            let v_offsets: Vec<f32> = hsl.0.iter().map(|q| q.v_offset).collect();
+                            let weights:   Vec<f32> = hsl.0.iter().map(|q| q.weight).collect();
+                            adaptive_grader.load_segment(
+                                &base_flat, base_bounds,
+                                (&h_offsets, &s_ratios, &v_offsets, &weights),
+                            ).context("load_segment failed")?;
+                            adaptive_grader.prepare_keyframe(&smoothed_kf_zones[kf_cursor])
+                                .context("prepare_keyframe at segment boundary failed")?;
+                            current_segment = new_seg;
+                            log::info!("Segment switch to {new_seg} at keyframe {kf_cursor}");
+                        }
+
+                        adaptive_grader.swap_textures();
+
+                        if kf_cursor + 1 < smoothed_kf_zones.len() {
+                            adaptive_grader.prepare_keyframe(&smoothed_kf_zones[kf_cursor + 1])
+                                .context("prepare_keyframe failed")?;
+                        }
+                    }
+                }
+
+                let (prev_kf_idx, _) = kf_index_list[kf_cursor];
+                let (prev_depth_proxy, dpw, dph) = keyframe_depths
+                    .get(&prev_kf_idx)
+                    .expect("prev keyframe depth missing — logic error");
+                let (dpw, dph) = (*dpw, *dph);
+
+                let depth_proxy = if fi == prev_kf_idx {
+                    prev_depth_proxy.clone()
+                } else if let Some(&(next_kf_idx, scene_cut_before_next)) = kf_index_list.get(kf_cursor + 1) {
+                    if scene_cut_before_next {
+                        prev_depth_proxy.clone()
+                    } else {
+                        let (next_depth_proxy, _, _) = keyframe_depths
+                            .get(&next_kf_idx)
+                            .expect("next keyframe depth missing — logic error");
+                        let t = (fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32;
+                        lerp_depth(prev_depth_proxy, next_depth_proxy, t)
+                    }
+                } else {
+                    prev_depth_proxy.clone()
+                };
+
+                let depth = if dpw == frame.width && dph == frame.height {
+                    depth_proxy
+                } else {
+                    InferenceServer::upscale_depth(&depth_proxy, dpw, dph, frame.width, frame.height)
+                };
+
+                let blend_t = if fi == prev_kf_idx {
+                    0.0_f32
+                } else if let Some(&(next_kf_idx, scene_cut)) = kf_index_list.get(kf_cursor + 1) {
+                    if scene_cut { 0.0 } else {
+                        ((fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32).clamp(0.0, 1.0)
+                    }
+                } else {
+                    0.0
+                };
 
                 #[cfg(feature = "cuda")]
-                {
-                    let new_seg = kf_to_segment[kf_cursor];
-                    if new_seg != current_segment {
-                        let seg_cal = &segment_calibrations[new_seg];
-                        let base_flat: Vec<f32> = seg_cal.depth_luts.luts.iter()
-                            .flat_map(|lut| lut.data.iter().copied())
-                            .collect();
-                        let base_bounds = &seg_cal.depth_luts.zone_boundaries;
-                        let hsl = &seg_cal.hsl_corrections;
-                        let h_offsets: Vec<f32> = hsl.0.iter().map(|q| q.h_offset).collect();
-                        let s_ratios:  Vec<f32> = hsl.0.iter().map(|q| q.s_ratio).collect();
-                        let v_offsets: Vec<f32> = hsl.0.iter().map(|q| q.v_offset).collect();
-                        let weights:   Vec<f32> = hsl.0.iter().map(|q| q.weight).collect();
-                        adaptive_grader.load_segment(
-                            &base_flat, base_bounds,
-                            (&h_offsets, &s_ratios, &v_offsets, &weights),
-                        ).context("load_segment failed")?;
-                        adaptive_grader.prepare_keyframe(&smoothed_kf_zones[kf_cursor])
-                            .context("prepare_keyframe at segment boundary failed")?;
-                        current_segment = new_seg;
-                        log::info!("Segment switch to {new_seg} at keyframe {kf_cursor}");
-                    }
+                let graded = adaptive_grader.grade_frame_blended(
+                    &frame.pixels, &depth, frame.width, frame.height, blend_t,
+                ).map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?;
 
-                    adaptive_grader.swap_textures();
+                #[cfg(not(feature = "cuda"))]
+                let graded = {
+                    use dorea_cal::Calibration;
+                    use dorea_gpu::grade_frame;
+                    let seg_idx = kf_to_segment.get(kf_cursor).copied().unwrap_or(0);
+                    let cal = &segment_calibrations[seg_idx];
+                    let calibration = Calibration::new(
+                        cal.depth_luts.clone(), cal.hsl_corrections.clone(), store_len,
+                    );
+                    grade_frame(&frame.pixels, &depth, frame.width, frame.height, &calibration, &params)
+                        .map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?
+                };
 
-                    if kf_cursor + 1 < smoothed_kf_zones.len() {
-                        adaptive_grader.prepare_keyframe(&smoothed_kf_zones[kf_cursor + 1])
-                            .context("prepare_keyframe failed")?;
-                    }
+                if graded_tx.send(graded).is_err() {
+                    // Encoder thread dropped — likely hit an error
+                    break;
                 }
             }
+            Ok(())
+        })();
 
-            let (prev_kf_idx, _) = kf_index_list[kf_cursor];
-            let (prev_depth_proxy, dpw, dph) = keyframe_depths
-                .get(&prev_kf_idx)
-                .expect("prev keyframe depth missing — logic error");
-            let (dpw, dph) = (*dpw, *dph);
-
-            let depth_proxy = if fi == prev_kf_idx {
-                prev_depth_proxy.clone()
-            } else if let Some(&(next_kf_idx, scene_cut_before_next)) = kf_index_list.get(kf_cursor + 1) {
-                if scene_cut_before_next {
-                    prev_depth_proxy.clone()
-                } else {
-                    let (next_depth_proxy, _, _) = keyframe_depths
-                        .get(&next_kf_idx)
-                        .expect("next keyframe depth missing — logic error");
-                    let t = (fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32;
-                    lerp_depth(prev_depth_proxy, next_depth_proxy, t)
-                }
-            } else {
-                prev_depth_proxy.clone()
-            };
-
-            let depth = if dpw == frame.width && dph == frame.height {
-                depth_proxy
-            } else {
-                InferenceServer::upscale_depth(&depth_proxy, dpw, dph, frame.width, frame.height)
-            };
-
-            let blend_t = if fi == prev_kf_idx {
-                0.0_f32
-            } else if let Some(&(next_kf_idx, scene_cut)) = kf_index_list.get(kf_cursor + 1) {
-                if scene_cut { 0.0 } else {
-                    ((fi - prev_kf_idx) as f32 / (next_kf_idx - prev_kf_idx) as f32).clamp(0.0, 1.0)
-                }
-            } else {
-                0.0
-            };
-
-            #[cfg(feature = "cuda")]
-            let graded = adaptive_grader.grade_frame_blended(
-                &frame.pixels, &depth, frame.width, frame.height, blend_t,
-            ).map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?;
-
-            #[cfg(not(feature = "cuda"))]
-            let graded = {
-                use dorea_cal::Calibration;
-                use dorea_gpu::grade_frame;
-                let seg_idx = kf_to_segment.get(kf_cursor).copied().unwrap_or(0);
-                let cal = &segment_calibrations[seg_idx];
-                let calibration = Calibration::new(
-                    cal.depth_luts.clone(), cal.hsl_corrections.clone(), store_len,
-                );
-                grade_frame(&frame.pixels, &depth, frame.width, frame.height, &calibration, &params)
-                    .map_err(|e| anyhow::anyhow!("Grading failed for frame {fi}: {e}"))?
-            };
-
-            if graded_tx.send(graded).is_err() {
-                // Encoder thread dropped — likely hit an error
-                break;
-            }
-        }
         // Signal encoder that no more frames are coming
         drop(graded_tx);
 
-        // Join threads and propagate errors
+        // Always join threads — even when GPU errored — to collect all errors.
         let decoder_result = decoder_handle.join()
             .map_err(|_| anyhow::anyhow!("decoder thread panicked"))?;
         let encoder_result = encoder_handle.join()
             .map_err(|_| anyhow::anyhow!("encoder thread panicked"))?;
 
+        // Propagate GPU error first (root cause), then thread errors.
+        gpu_result.context("GPU grading failed")?;
         decoder_result.context("decoder thread failed")?;
         encoder_result
     })
