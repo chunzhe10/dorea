@@ -140,7 +140,7 @@ pub fn run_feature_stage(
     // The depth model internally resizes to max_size, but starting from 4K source
     // preserves more detail than starting from proxy (518px).
     // After RAUNE completes and is unloaded, depth can use the freed VRAM for 1036px.
-    let depth_max_size = 1036;
+    let depth_max_size = 1518; // max depth res — RAUNE unloaded first to free VRAM
     log::info!(
         "Extracting {} keyframes at full resolution for depth (max_size={})",
         keyframes.len(), depth_max_size,
@@ -178,7 +178,7 @@ pub fn run_feature_stage(
     use dorea_video::inference::DepthBatchItem;
     let mut depth_results: Vec<(String, Vec<f32>, usize, usize)> = Vec::with_capacity(keyframes.len());
     // Sub-batch depth to avoid OOM: 4 full-res frames at a time
-    let depth_sub_batch = 4;
+    let depth_sub_batch = 2; // small batches at high res to fit 6GB VRAM
     for chunk_start in (0..keyframes.len()).step_by(depth_sub_batch) {
         let chunk_end = (chunk_start + depth_sub_batch).min(keyframes.len());
         let depth_items: Vec<DepthBatchItem> = (chunk_start..chunk_end).map(|i| {
