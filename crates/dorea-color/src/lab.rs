@@ -1,15 +1,17 @@
-//! Standard sRGB ↔ CIELAB D65 conversion.
+//! OKLab colorspace conversion, rescaled to CIELab-compatible ranges.
 //!
-//! IEC 61966-2-1 piecewise linearisation + D65 matrix + CIE Lab formula.
+//! Uses Björn Ottosson's OKLab (2020) internally, with output rescaled to match
+//! CIELab numeric ranges so downstream consumers (ambiance, warmth, vibrance)
+//! need no constant changes:
+//!   L: OKLab [0,1] × 100 → [0,100]
+//!   a: OKLab [-0.4,0.4] × 300 → [-120,120]
+//!   b: OKLab [-0.4,0.4] × 300 → [-120,120]
+//!
+//! sRGB linearization uses IEC 61966-2-1 piecewise gamma (unchanged).
 
-// D65 whitepoint
-const XN: f32 = 0.95047;
-const YN: f32 = 1.0;
-const ZN: f32 = 1.08883;
-
-// Threshold for f(t) piecewise: (6/29)^3
-const DELTA_CUBED: f32 = (6.0 / 29.0) * (6.0 / 29.0) * (6.0 / 29.0); // ≈ 0.008856
-const DELTA_SQ_3: f32 = 3.0 * (6.0 / 29.0) * (6.0 / 29.0); // 3*(6/29)^2 ≈ 0.12842
+// OKLab rescale factors — map OKLab ranges to CIELab-compatible ranges.
+const L_SCALE: f32 = 100.0;
+const AB_SCALE: f32 = 300.0;
 
 /// sRGB component → linear light (IEC 61966-2-1).
 #[inline]
@@ -31,72 +33,60 @@ fn linear_to_srgb(v: f32) -> f32 {
     }
 }
 
-/// CIE Lab f(t) function.
-#[inline]
-fn f_lab(t: f32) -> f32 {
-    if t > DELTA_CUBED {
-        t.cbrt()
-    } else {
-        t / DELTA_SQ_3 + 4.0 / 29.0
-    }
-}
-
-/// Inverse of f(t): f⁻¹(s) = s³ if s > 6/29, else 3*(6/29)²*(s - 4/29)
-#[inline]
-fn f_lab_inv(s: f32) -> f32 {
-    let delta = 6.0_f32 / 29.0;
-    if s > delta {
-        s * s * s
-    } else {
-        DELTA_SQ_3 * (s - 4.0 / 29.0)
-    }
-}
-
-/// Convert sRGB [0,1] to CIELAB (D65).
+/// Convert sRGB [0,1] to OKLab, rescaled to CIELab-compatible ranges.
 ///
-/// Returns (L, a, b) where L ∈ [0,100], a/b ∈ approx [-128, 127].
+/// Returns (L, a, b) where L ∈ [0,100], a/b ∈ approx [-120, 120].
 pub fn srgb_to_lab(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     // sRGB → linear
     let rl = srgb_to_linear(r);
     let gl = srgb_to_linear(g);
     let bl = srgb_to_linear(b);
 
-    // Linear RGB → XYZ (D65, Rec. 709)
-    let x = 0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl;
-    let y = 0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl;
-    let z = 0.0193339 * rl + 0.119_192 * gl + 0.9503041 * bl;
+    // Linear RGB → LMS
+    let l = 0.4122214708 * rl + 0.5363325363 * gl + 0.0514459929 * bl;
+    let m = 0.2119034982 * rl + 0.6806995451 * gl + 0.1073969566 * bl;
+    let s = 0.0883024619 * rl + 0.2817188376 * gl + 0.6299787005 * bl;
 
-    // XYZ → Lab
-    let fx = f_lab(x / XN);
-    let fy = f_lab(y / YN);
-    let fz = f_lab(z / ZN);
+    // Cube root
+    let l_ = l.max(0.0).cbrt();
+    let m_ = m.max(0.0).cbrt();
+    let s_ = s.max(0.0).cbrt();
 
-    let l = 116.0 * fy - 16.0;
-    let a_lab = 500.0 * (fx - fy);
-    let b_lab = 200.0 * (fy - fz);
+    // LMS' → OKLab
+    let ok_l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+    let ok_a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+    let ok_b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
 
-    (l, a_lab, b_lab)
+    // Rescale to CIELab-compatible ranges
+    (ok_l * L_SCALE, ok_a * AB_SCALE, ok_b * AB_SCALE)
 }
 
-/// Convert CIELAB (D65) to sRGB [0,1] (clamped).
+/// Convert OKLab (rescaled) to sRGB [0,1] (clamped).
 pub fn lab_to_srgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
-    let fy = (l + 16.0) / 116.0;
-    let fx = a / 500.0 + fy;
-    let fz = fy - b / 200.0;
+    // Unscale from CIELab-compatible ranges to native OKLab
+    let ok_l = l / L_SCALE;
+    let ok_a = a / AB_SCALE;
+    let ok_b = b / AB_SCALE;
 
-    let x = XN * f_lab_inv(fx);
-    let y = YN * f_lab_inv(fy);
-    let z = ZN * f_lab_inv(fz);
+    // OKLab → LMS'
+    let l_ = ok_l + 0.3963377774 * ok_a + 0.2158037573 * ok_b;
+    let m_ = ok_l - 0.1055613458 * ok_a - 0.0638541728 * ok_b;
+    let s_ = ok_l - 0.0894841775 * ok_a - 1.2914855480 * ok_b;
 
-    // XYZ → linear RGB (D65, Rec. 709) — inverse matrix
-    let rl = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
-    let gl = -0.969_266 * x + 1.8760108 * y + 0.0415560 * z;
-    let bl = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+    // Cube (inverse of cube root)
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+
+    // LMS → linear RGB (proper inverse of forward RGB→LMS matrix)
+    let rl =  4.0767416613 * l - 3.3077115904 * m + 0.2309699287 * s;
+    let gl = -1.2684380041 * l + 2.6097574007 * m - 0.3413193963 * s;
+    let bl = -0.0041960863 * l - 0.7034186145 * m + 1.7076147010 * s;
 
     // Linear → sRGB, clamped
-    let r = linear_to_srgb(rl.clamp(0.0, 1.0));
-    let g = linear_to_srgb(gl.clamp(0.0, 1.0));
-    let b_out = linear_to_srgb(bl.clamp(0.0, 1.0));
+    let r = linear_to_srgb(rl.max(0.0));
+    let g = linear_to_srgb(gl.max(0.0));
+    let b_out = linear_to_srgb(bl.max(0.0));
 
     (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b_out.clamp(0.0, 1.0))
 }
@@ -127,8 +117,26 @@ mod tests {
     #[test]
     fn test_white_point() {
         let (l, a, b) = srgb_to_lab(1.0, 1.0, 1.0);
-        assert!((l - 100.0).abs() < 1e-3, "White L: expected 100, got {l}");
-        assert!(a.abs() < 1e-3, "White a: expected 0, got {a}");
-        assert!(b.abs() < 1e-3, "White b: expected 0, got {b}");
+        // OKLab white = (1,0,0), rescaled L = 100, a = 0, b = 0
+        assert!((l - 100.0).abs() < 1e-2, "White L: expected 100, got {l}");
+        assert!(a.abs() < 1e-2, "White a: expected 0, got {a}");
+        assert!(b.abs() < 1e-2, "White b: expected 0, got {b}");
+    }
+
+    #[test]
+    fn test_black_point() {
+        let (l, a, b) = srgb_to_lab(0.0, 0.0, 0.0);
+        assert!(l.abs() < 1e-3, "Black L: expected 0, got {l}");
+        assert!(a.abs() < 1e-3, "Black a: expected 0, got {a}");
+        assert!(b.abs() < 1e-3, "Black b: expected 0, got {b}");
+    }
+
+    #[test]
+    fn test_l_range() {
+        // L should span [0, 100] for sRGB gamut
+        let (l_black, _, _) = srgb_to_lab(0.0, 0.0, 0.0);
+        let (l_white, _, _) = srgb_to_lab(1.0, 1.0, 1.0);
+        assert!(l_black < 1.0, "Black L should be near 0, got {l_black}");
+        assert!(l_white > 99.0, "White L should be near 100, got {l_white}");
     }
 }
