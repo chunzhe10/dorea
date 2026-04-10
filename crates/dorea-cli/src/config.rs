@@ -51,6 +51,12 @@ pub struct InferDefaults {
 /// `dorea grade` defaults.
 #[derive(Debug, Deserialize, Default)]
 pub struct GradeDefaults {
+    /// Grading mode: `"lut"` (default) or `"direct"` (per-frame RAUNE, no LUT pipeline)
+    pub mode: Option<String>,
+    /// RAUNE proxy resolution for direct mode (long-edge pixels, default: 1920)
+    pub raune_proxy_size: Option<usize>,
+    /// Batch size for direct-mode RAUNE inference (number of frames per forward pass)
+    pub direct_batch_size: Option<usize>,
     /// Warmth multiplier [0.0–2.0] (default: 1.0)
     pub warmth: Option<f32>,
     /// LUT/HSL blend strength [0.0–1.0] (default: 0.8)
@@ -77,6 +83,8 @@ pub struct GradeDefaults {
     pub input_encoding: Option<String>,
     /// Output codec (default: "h264" for 8-bit, "prores" for 10-bit)
     pub output_codec: Option<String>,
+    /// Enabled grading stages (comma-separated). Default: all.
+    pub stages: Option<String>,
 }
 
 /// Maxine VFX SDK defaults (used when Maxine is re-enabled).
