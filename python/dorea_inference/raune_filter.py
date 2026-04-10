@@ -19,6 +19,8 @@ Supports both single-process mode (--input/--output) and legacy pipe mode
 import sys
 import argparse
 import time
+import threading
+import queue
 from pathlib import Path
 
 import numpy as np
@@ -248,77 +250,216 @@ def run_single_process(args, model, normalize):
           f"batch={batch_size}, codec={codec_name}, fps={fps:.3f}",
           file=sys.stderr, flush=True)
 
-    frame_count = 0
-    t_start = time.time()
-    batch_frames_np = []
+    # ─── 3-thread pipeline: decoder → GPU → encoder ────────────────────────
+    # Bounded queues provide backpressure (memory bound: ~200MB at 4K)
+    q_decoded = queue.Queue(maxsize=2)   # holds: list[np.ndarray] (one batch)
+    q_processed = queue.Queue(maxsize=2) # holds: list[np.ndarray] (one batch)
 
-    for packet in in_container.demux(in_stream):
-        for frame in packet.decode():
-            # PyAV frame → RGB24 numpy (in-process, no pipe)
-            rgb = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
+    # Shared error state
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+    stop_event = threading.Event()
 
-            # Resize if needed (input might not match expected dims)
-            if rgb.shape[1] != fw or rgb.shape[0] != fh:
-                rgb = np.array(
-                    frame.to_image().resize((fw, fh)),
-                    dtype=np.uint8,
-                )
+    def record_error(exc: BaseException) -> None:
+        with errors_lock:
+            errors.append(exc)
+        stop_event.set()
 
-            batch_frames_np.append(rgb)
+    def put_or_stop(q: "queue.Queue", item, stop_event: threading.Event,
+                    poll_interval: float = 0.1) -> bool:
+        """Put item on queue, periodically checking stop_event.
 
-            if len(batch_frames_np) < batch_size:
+        Returns True if put succeeded, False if stop_event was set first.
+        Ensures worker threads cannot get stuck forever in a blocking put()
+        when the downstream consumer has died.
+        """
+        while not stop_event.is_set():
+            try:
+                q.put(item, timeout=poll_interval)
+                return True
+            except queue.Full:
                 continue
+        return False
 
-            # Process batch
-            results = _process_batch(
-                batch_frames_np, model, normalize,
-                fw, fh, pw, ph, transfer_fn,
-            )
+    # Frame counter shared with encoder thread for progress reporting
+    t_start = time.time()
+    encoded_count = 0
 
-            # Encode results
-            for result_np in results:
-                out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
-                out_frame.pts = frame_count
-                for pkt in out_stream.encode(out_frame):
-                    out_container.mux(pkt)
-                frame_count += 1
+    # Per-stage cumulative timing (busy time, excluding queue waits)
+    decode_busy = 0.0
+    gpu_busy = 0.0
+    encode_busy = 0.0
 
-            batch_frames_np.clear()
+    # ─── Thread 1: Decoder ─────────────────────────────────────────────────
+    def decoder_thread() -> None:
+        nonlocal decode_busy
+        try:
+            batch: list[np.ndarray] = []
+            for packet in in_container.demux(in_stream):
+                if stop_event.is_set():
+                    return
+                # Time the entire packet.decode() iteration so that the
+                # libavcodec decode work (which actually runs here) is
+                # captured, not just the to_ndarray() conversion.
+                t_decode_start = time.perf_counter()
+                frames = list(packet.decode())
+                decode_busy += time.perf_counter() - t_decode_start
+                for frame in frames:
+                    if stop_event.is_set():
+                        return
+                    t0 = time.perf_counter()
+                    rgb = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
+                    if rgb.shape[1] != fw or rgb.shape[0] != fh:
+                        rgb = np.array(
+                            frame.to_image().resize((fw, fh)),
+                            dtype=np.uint8,
+                        )
+                    decode_busy += time.perf_counter() - t0
+                    batch.append(rgb)
+                    if len(batch) >= batch_size:
+                        if not put_or_stop(q_decoded, batch, stop_event):
+                            return
+                        batch = []
+            if batch:
+                if not put_or_stop(q_decoded, batch, stop_event):
+                    return
+        except BaseException as e:
+            record_error(e)
+        finally:
+            # Sentinel for GPU thread; use put_or_stop so we cannot hang
+            # here if the consumer has already died.
+            put_or_stop(q_decoded, None, stop_event)
 
-            if frame_count % (batch_size * 4) == 0:
-                elapsed = time.time() - t_start
-                fps_actual = frame_count / elapsed if elapsed > 0 else 0
-                pct = frame_count / total_frames * 100 if total_frames else 0
-                print(f"[raune-filter] {frame_count} frames "
-                      f"({pct:.0f}%, {fps_actual:.1f} fps)",
-                      file=sys.stderr, flush=True)
+    # ─── Thread 2: GPU processing ──────────────────────────────────────────
+    def gpu_thread() -> None:
+        nonlocal gpu_busy
+        try:
+            while True:
+                if stop_event.is_set():
+                    return
+                batch = q_decoded.get()
+                if batch is None:
+                    return
+                t0 = time.perf_counter()
+                results = _process_batch(
+                    batch, model, normalize,
+                    fw, fh, pw, ph, transfer_fn,
+                )
+                gpu_busy += time.perf_counter() - t0
+                if not put_or_stop(q_processed, results, stop_event):
+                    return
+        except BaseException as e:
+            record_error(e)
+        finally:
+            # Sentinel for encoder thread; use put_or_stop so we cannot hang.
+            put_or_stop(q_processed, None, stop_event)
 
-    # Process remaining frames
-    if batch_frames_np:
-        results = _process_batch(
-            batch_frames_np, model, normalize,
-            fw, fh, pw, ph, transfer_fn,
-        )
-        for result_np in results:
-            out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
-            out_frame.pts = frame_count
-            for pkt in out_stream.encode(out_frame):
+    # ─── Thread 3: Encoder ─────────────────────────────────────────────────
+    def encoder_thread() -> None:
+        nonlocal encoded_count, encode_busy
+        try:
+            while True:
+                if stop_event.is_set():
+                    return
+                results = q_processed.get()
+                if results is None:
+                    return
+                for result_np in results:
+                    t0 = time.perf_counter()
+                    out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
+                    out_frame.pts = encoded_count
+                    for pkt in out_stream.encode(out_frame):
+                        out_container.mux(pkt)
+                    encode_busy += time.perf_counter() - t0
+                    encoded_count += 1
+                    if encoded_count % (batch_size * 4) == 0:
+                        elapsed = time.time() - t_start
+                        fps_actual = encoded_count / elapsed if elapsed > 0 else 0
+                        pct = (encoded_count / total_frames * 100
+                               if total_frames else 0)
+                        print(f"[raune-filter] {encoded_count} frames "
+                              f"({pct:.0f}%, {fps_actual:.1f} fps)",
+                              file=sys.stderr, flush=True)
+        except BaseException as e:
+            record_error(e)
+            # On error, drain q_processed so the upstream gpu_thread does
+            # not deadlock in put_or_stop on a full queue. record_error
+            # has already set stop_event — once gpu_thread's in-flight put
+            # lands in the slot we empty here, its next loop iteration
+            # sees stop_event and exits cleanly.
+            try:
+                while True:
+                    _ = q_processed.get_nowait()
+            except queue.Empty:
+                pass
+
+    # Spawn threads
+    t_dec = threading.Thread(target=decoder_thread, name="decoder", daemon=False)
+    t_gpu = threading.Thread(target=gpu_thread, name="gpu", daemon=False)
+    t_enc = threading.Thread(target=encoder_thread, name="encoder", daemon=False)
+
+    t_dec.start()
+    t_gpu.start()
+    t_enc.start()
+
+    # Wait for all threads to finish
+    t_dec.join()
+    t_gpu.join()
+    t_enc.join()
+
+    # Determine whether any worker thread raised; read under lock.
+    error_to_raise: BaseException | None = None
+    with errors_lock:
+        if errors:
+            error_to_raise = errors[0]
+
+    # Flush encoder only on success — flushing after a failure can write
+    # trailing packets to an already-broken output file.
+    if error_to_raise is None:
+        try:
+            for pkt in out_stream.encode():
                 out_container.mux(pkt)
-            frame_count += 1
+        except BaseException as flush_err:
+            error_to_raise = flush_err
 
-    # Flush encoder
-    for pkt in out_stream.encode():
-        out_container.mux(pkt)
+    # Always close containers, but do not let a secondary close() failure
+    # (e.g. disk-full on trailer write) mask the original error.
+    try:
+        out_container.close()
+    except BaseException as close_err:
+        if error_to_raise is None:
+            error_to_raise = close_err
+    try:
+        in_container.close()
+    except BaseException:
+        pass  # input close errors are not interesting
 
-    out_container.close()
-    in_container.close()
+    # If anything went wrong, delete the partial/corrupt output file so
+    # callers do not see a broken ProRes left on disk.
+    if error_to_raise is not None:
+        try:
+            import os
+            if os.path.exists(args.output):
+                os.remove(args.output)
+                print(f"[raune-filter] removed partial output: {args.output}",
+                      file=sys.stderr, flush=True)
+        except OSError:
+            pass
+        raise error_to_raise
 
     elapsed = time.time() - t_start
-    fps_actual = frame_count / elapsed if elapsed > 0 else 0
-    print(f"[raune-filter] done: {frame_count} frames in {elapsed:.1f}s "
+    fps_actual = encoded_count / elapsed if elapsed > 0 else 0
+    n = max(encoded_count, 1)
+    print(f"[raune-filter] done: {encoded_count} frames in {elapsed:.1f}s "
           f"({fps_actual:.2f} fps)",
           file=sys.stderr, flush=True)
-    return frame_count
+    print(f"[raune-filter] stage timing (busy ms/frame): "
+          f"decode={decode_busy*1000/n:.1f} "
+          f"gpu={gpu_busy*1000/n:.1f} "
+          f"encode={encode_busy*1000/n:.1f} "
+          f"wall={elapsed*1000/n:.1f}",
+          file=sys.stderr, flush=True)
+    return encoded_count
 
 
 def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn):
