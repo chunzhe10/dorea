@@ -265,6 +265,22 @@ def run_single_process(args, model, normalize):
             errors.append(exc)
         stop_event.set()
 
+    def put_or_stop(q: "queue.Queue", item, stop_event: threading.Event,
+                    poll_interval: float = 0.1) -> bool:
+        """Put item on queue, periodically checking stop_event.
+
+        Returns True if put succeeded, False if stop_event was set first.
+        Ensures worker threads cannot get stuck forever in a blocking put()
+        when the downstream consumer has died.
+        """
+        while not stop_event.is_set():
+            try:
+                q.put(item, timeout=poll_interval)
+                return True
+            except queue.Full:
+                continue
+        return False
+
     # Frame counter shared with encoder thread for progress reporting
     t_start = time.time()
     encoded_count = 0
@@ -282,7 +298,13 @@ def run_single_process(args, model, normalize):
             for packet in in_container.demux(in_stream):
                 if stop_event.is_set():
                     return
-                for frame in packet.decode():
+                # Time the entire packet.decode() iteration so that the
+                # libavcodec decode work (which actually runs here) is
+                # captured, not just the to_ndarray() conversion.
+                t_decode_start = time.perf_counter()
+                frames = list(packet.decode())
+                decode_busy += time.perf_counter() - t_decode_start
+                for frame in frames:
                     if stop_event.is_set():
                         return
                     t0 = time.perf_counter()
@@ -295,14 +317,18 @@ def run_single_process(args, model, normalize):
                     decode_busy += time.perf_counter() - t0
                     batch.append(rgb)
                     if len(batch) >= batch_size:
-                        q_decoded.put(batch)
+                        if not put_or_stop(q_decoded, batch, stop_event):
+                            return
                         batch = []
             if batch:
-                q_decoded.put(batch)
+                if not put_or_stop(q_decoded, batch, stop_event):
+                    return
         except BaseException as e:
             record_error(e)
         finally:
-            q_decoded.put(None)  # sentinel: tell GPU thread we're done
+            # Sentinel for GPU thread; use put_or_stop so we cannot hang
+            # here if the consumer has already died.
+            put_or_stop(q_decoded, None, stop_event)
 
     # ─── Thread 2: GPU processing ──────────────────────────────────────────
     def gpu_thread() -> None:
@@ -320,11 +346,13 @@ def run_single_process(args, model, normalize):
                     fw, fh, pw, ph, transfer_fn,
                 )
                 gpu_busy += time.perf_counter() - t0
-                q_processed.put(results)
+                if not put_or_stop(q_processed, results, stop_event):
+                    return
         except BaseException as e:
             record_error(e)
         finally:
-            q_processed.put(None)  # sentinel: tell encoder we're done
+            # Sentinel for encoder thread; use put_or_stop so we cannot hang.
+            put_or_stop(q_processed, None, stop_event)
 
     # ─── Thread 3: Encoder ─────────────────────────────────────────────────
     def encoder_thread() -> None:
@@ -354,6 +382,16 @@ def run_single_process(args, model, normalize):
                               file=sys.stderr, flush=True)
         except BaseException as e:
             record_error(e)
+            # On error, drain q_processed so the upstream gpu_thread does
+            # not deadlock in put_or_stop on a full queue. record_error
+            # has already set stop_event — once gpu_thread's in-flight put
+            # lands in the slot we empty here, its next loop iteration
+            # sees stop_event and exits cleanly.
+            try:
+                while True:
+                    _ = q_processed.get_nowait()
+            except queue.Empty:
+                pass
 
     # Spawn threads
     t_dec = threading.Thread(target=decoder_thread, name="decoder", daemon=False)
@@ -369,17 +407,45 @@ def run_single_process(args, model, normalize):
     t_gpu.join()
     t_enc.join()
 
-    # Flush encoder (must happen on main thread after encoder thread finishes)
-    if not errors:
-        for pkt in out_stream.encode():
-            out_container.mux(pkt)
+    # Determine whether any worker thread raised; read under lock.
+    error_to_raise: BaseException | None = None
+    with errors_lock:
+        if errors:
+            error_to_raise = errors[0]
 
-    out_container.close()
-    in_container.close()
+    # Flush encoder only on success — flushing after a failure can write
+    # trailing packets to an already-broken output file.
+    if error_to_raise is None:
+        try:
+            for pkt in out_stream.encode():
+                out_container.mux(pkt)
+        except BaseException as flush_err:
+            error_to_raise = flush_err
 
-    # Propagate any error from worker threads
-    if errors:
-        raise errors[0]
+    # Always close containers, but do not let a secondary close() failure
+    # (e.g. disk-full on trailer write) mask the original error.
+    try:
+        out_container.close()
+    except BaseException as close_err:
+        if error_to_raise is None:
+            error_to_raise = close_err
+    try:
+        in_container.close()
+    except BaseException:
+        pass  # input close errors are not interesting
+
+    # If anything went wrong, delete the partial/corrupt output file so
+    # callers do not see a broken ProRes left on disk.
+    if error_to_raise is not None:
+        try:
+            import os
+            if os.path.exists(args.output):
+                os.remove(args.output)
+                print(f"[raune-filter] removed partial output: {args.output}",
+                      file=sys.stderr, flush=True)
+        except OSError:
+            pass
+        raise error_to_raise
 
     elapsed = time.time() - t_start
     fps_actual = encoded_count / elapsed if elapsed > 0 else 0
