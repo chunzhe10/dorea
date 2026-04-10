@@ -15,31 +15,35 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+// Stage bitmask constants — must match dorea_gpu::stages in Rust.
+#define STAGE_HSL          (1 << 0)
+#define STAGE_AMBIANCE     (1 << 1)
+#define STAGE_WARMTH       (1 << 2)
+#define STAGE_VIBRANCE     (1 << 3)
+#define STAGE_STRENGTH     (1 << 4)
+#define STAGE_DEPTH_MOD    (1 << 5)
+#define STAGE_DEPTH_DITHER (1 << 6)
+#define STAGE_YOLO_MASK    (1 << 7)
+
 // -------------------------------------------------------------------------
-// CIELAB D65 colorspace (matches dorea-color/src/lab.rs exactly)
+// OKLab colorspace, rescaled to CIELab-compatible ranges.
+// Matches dorea-color/src/lab.rs exactly.
+//
+// OKLab (Björn Ottosson, 2020) with output rescaled:
+//   L: OKLab [0,1] × 100 → [0,100]
+//   a: OKLab [-0.4,0.4] × 300 → [-120,120]
+//   b: OKLab [-0.4,0.4] × 300 → [-120,120]
 // -------------------------------------------------------------------------
 
-#define XN 0.95047f
-#define YN 1.00000f
-#define ZN 1.08883f
-#define DELTA_CUBED 0.008856f   // (6/29)^3
-#define DELTA_SQ_3  0.128419f   // 3*(6/29)^2
+#define L_SCALE  100.0f
+#define AB_SCALE 300.0f
 
 __device__ __forceinline__ float srgb_to_linear(float v) {
-    return (v <= 0.04045f) ? (v / 12.92f) : powf((v + 0.055f) / 1.055f, 2.4f);
+    return (v <= 0.04045f) ? (v / 12.92f) : __powf((v + 0.055f) / 1.055f, 2.4f);
 }
 
 __device__ __forceinline__ float linear_to_srgb(float v) {
-    return (v <= 0.0031308f) ? (v * 12.92f) : (1.055f * powf(v, 1.0f / 2.4f) - 0.055f);
-}
-
-__device__ __forceinline__ float f_lab(float t) {
-    return (t > DELTA_CUBED) ? cbrtf(t) : (t / DELTA_SQ_3 + 4.0f / 29.0f);
-}
-
-__device__ __forceinline__ float f_lab_inv(float s) {
-    const float delta = 6.0f / 29.0f;
-    return (s > delta) ? (s * s * s) : (DELTA_SQ_3 * (s - 4.0f / 29.0f));
+    return (v <= 0.0031308f) ? (v * 12.92f) : (1.055f * __powf(v, 1.0f / 2.4f) - 0.055f);
 }
 
 __device__ void srgb_to_lab(float r, float g, float b,
@@ -48,36 +52,47 @@ __device__ void srgb_to_lab(float r, float g, float b,
     float gl = srgb_to_linear(g);
     float bl = srgb_to_linear(b);
 
-    float x = 0.4124564f*rl + 0.3575761f*gl + 0.1804375f*bl;
-    float y = 0.2126729f*rl + 0.7151522f*gl + 0.0721750f*bl;
-    float z = 0.0193339f*rl + 0.1191920f*gl + 0.9503041f*bl;
+    // Linear RGB → LMS
+    float l = 0.4122214708f*rl + 0.5363325363f*gl + 0.0514459929f*bl;
+    float m = 0.2119034982f*rl + 0.6806995451f*gl + 0.1073969566f*bl;
+    float s = 0.0883024619f*rl + 0.2817188376f*gl + 0.6299787005f*bl;
 
-    float fx = f_lab(x / XN);
-    float fy = f_lab(y / YN);
-    float fz = f_lab(z / ZN);
+    // Cube root
+    float l_ = cbrtf(fmaxf(l, 0.0f));
+    float m_ = cbrtf(fmaxf(m, 0.0f));
+    float s_ = cbrtf(fmaxf(s, 0.0f));
 
-    *l_out     = 116.0f * fy - 16.0f;
-    *a_out     = 500.0f * (fx - fy);
-    *b_lab_out = 200.0f * (fy - fz);
+    // LMS' → OKLab, rescaled to CIELab ranges
+    *l_out     = (0.2104542553f*l_ + 0.7936177850f*m_ - 0.0040720468f*s_) * L_SCALE;
+    *a_out     = (1.9779984951f*l_ - 2.4285922050f*m_ + 0.4505937099f*s_) * AB_SCALE;
+    *b_lab_out = (0.0259040371f*l_ + 0.7827717662f*m_ - 0.8086757660f*s_) * AB_SCALE;
 }
 
 __device__ void lab_to_srgb(float l, float a, float b_lab,
                               float* r_out, float* g_out, float* b_out) {
-    float fy = (l + 16.0f) / 116.0f;
-    float fx = a / 500.0f + fy;
-    float fz = fy - b_lab / 200.0f;
+    // Unscale from CIELab-compatible ranges to native OKLab
+    float ok_l = l / L_SCALE;
+    float ok_a = a / AB_SCALE;
+    float ok_b = b_lab / AB_SCALE;
 
-    float x = XN * f_lab_inv(fx);
-    float y = YN * f_lab_inv(fy);
-    float z = ZN * f_lab_inv(fz);
+    // OKLab → LMS'
+    float l_ = ok_l + 0.3963377774f*ok_a + 0.2158037573f*ok_b;
+    float m_ = ok_l - 0.1055613458f*ok_a - 0.0638541728f*ok_b;
+    float s_ = ok_l - 0.0894841775f*ok_a - 1.2914855480f*ok_b;
 
-    float rl =  3.2404542f*x - 1.5371385f*y - 0.4985314f*z;
-    float gl = -0.9692660f*x + 1.8760108f*y + 0.0415560f*z;
-    float bl2=  0.0556434f*x - 0.2040259f*y + 1.0572252f*z;
+    // Cube (inverse of cube root)
+    float lc = l_ * l_ * l_;
+    float mc = m_ * m_ * m_;
+    float sc = s_ * s_ * s_;
+
+    // LMS → linear RGB (corrected inverse of forward RGB→LMS matrix)
+    float rl =  4.0767416613f*lc - 3.3077115904f*mc + 0.2309699287f*sc;
+    float gl = -1.2684380041f*lc + 2.6097574007f*mc - 0.3413193963f*sc;
+    float bl =  -0.0041960863f*lc - 0.7034186145f*mc + 1.7076147010f*sc;
 
     *r_out = fminf(fmaxf(linear_to_srgb(fmaxf(rl, 0.0f)), 0.0f), 1.0f);
     *g_out = fminf(fmaxf(linear_to_srgb(fmaxf(gl, 0.0f)), 0.0f), 1.0f);
-    *b_out = fminf(fmaxf(linear_to_srgb(fmaxf(bl2,0.0f)), 0.0f), 1.0f);
+    *b_out = fminf(fmaxf(linear_to_srgb(fmaxf(bl, 0.0f)), 0.0f), 1.0f);
 }
 
 // -------------------------------------------------------------------------
@@ -189,7 +204,8 @@ __device__ float3 grade_pixel_device(
     const float* __restrict__ s_ratios,
     const float* __restrict__ v_offsets,
     const float* __restrict__ weights,
-    float warmth, float strength, float contrast
+    float warmth, float strength, float contrast,
+    int stage_mask
 ) {
     // ------------------------------------------------------------------
     // 1. Depth-stratified LUT (soft triangular zone blend)
@@ -225,103 +241,112 @@ __device__ float3 grade_pixel_device(
     }
 
     // ------------------------------------------------------------------
-    // 2. HSL 6-qualifier corrections
+    // 2. HSL 6-qualifier corrections (STAGE_HSL)
     // ------------------------------------------------------------------
-    float h, s, v;
-    rgb_to_hsv_gp(r1, g1, b1, &h, &s, &v);
+    float r2 = r1, g2 = g1, b2 = b1;
+    if (stage_mask & STAGE_HSL) {
+        float h, s, v;
+        rgb_to_hsv_gp(r1, g1, b1, &h, &s, &v);
 
-    for (int q = 0; q < 6; q++) {
-        if (weights[q] < 100.0f) continue;
-        float dist_h = fabsf(fmodf(h - GP_H_CENTERS[q] + 360.0f, 360.0f));
-        if (dist_h > 180.0f) dist_h = 360.0f - dist_h;
-        float mask = fmaxf(1.0f - dist_h / GP_H_WIDTHS[q], 0.0f);
-        if (s < 0.08f) mask = 0.0f;
-        if (mask < 1e-6f) continue;
-        h += h_offsets[q] * mask;
-        s *= (1.0f + (s_ratios[q] - 1.0f) * mask);
-        v += v_offsets[q] * mask;
+        for (int q = 0; q < 6; q++) {
+            if (weights[q] < 100.0f) continue;
+            float dist_h = fabsf(fmodf(h - GP_H_CENTERS[q] + 360.0f, 360.0f));
+            if (dist_h > 180.0f) dist_h = 360.0f - dist_h;
+            float mask = fmaxf(1.0f - dist_h / GP_H_WIDTHS[q], 0.0f);
+            if (s < 0.08f) mask = 0.0f;
+            if (mask < 1e-6f) continue;
+            h += h_offsets[q] * mask;
+            s *= (1.0f + (s_ratios[q] - 1.0f) * mask);
+            v += v_offsets[q] * mask;
+        }
+
+        h = fmodf(h, 360.0f); if (h < 0.0f) h += 360.0f;
+        s = fminf(fmaxf(s, 0.0f), 1.0f);
+        v = fminf(fmaxf(v, 0.0f), 1.0f);
+
+        hsv_to_rgb_gp(h, s, v, &r2, &g2, &b2);
     }
-
-    h = fmodf(h, 360.0f); if (h < 0.0f) h += 360.0f;
-    s = fminf(fmaxf(s, 0.0f), 1.0f);
-    v = fminf(fmaxf(v, 0.0f), 1.0f);
-
-    float r2, g2, b2;
-    hsv_to_rgb_gp(h, s, v, &r2, &g2, &b2);
 
     // ------------------------------------------------------------------
     // 3. Fused ambiance + warmth (LAB colorspace)
     // ------------------------------------------------------------------
-    float d = depth;
-    float l_norm, a_ab, b_ab;
-    {
-        float l_raw, a_raw, b_raw;
-        srgb_to_lab(r2, g2, b2, &l_raw, &a_raw, &b_raw);
-        l_norm = l_raw / 100.0f; a_ab = a_raw; b_ab = b_raw;
-    }
+    float r3 = r2, g3 = g2, b3 = b2;
+    if (stage_mask & (STAGE_AMBIANCE | STAGE_WARMTH | STAGE_VIBRANCE)) {
+        float d = depth;
+        float l_norm, a_ab, b_ab;
+        {
+            float l_raw, a_raw, b_raw;
+            srgb_to_lab(r2, g2, b2, &l_raw, &a_raw, &b_raw);
+            l_norm = l_raw / 100.0f; a_ab = a_raw; b_ab = b_raw;
+        }
 
-    // Shadow lift
-    float lift = 0.2f + 0.15f * d;
-    float toe = 0.15f;
-    float shadow_mask = fminf(fmaxf((toe - l_norm) / toe, 0.0f), 1.0f);
-    l_norm += shadow_mask * lift * toe;
+        if (stage_mask & STAGE_AMBIANCE) {
+            // Shadow lift
+            float lift = 0.2f + 0.15f * d;
+            float toe = 0.15f;
+            float shadow_mask = fminf(fmaxf((toe - l_norm) / toe, 0.0f), 1.0f);
+            l_norm += shadow_mask * lift * toe;
 
-    // S-curve contrast
-    float cs = (0.3f + 0.3f * d) * contrast;
-    float slope = 4.0f + 4.0f * cs;
-    float s_curve = 1.0f / (1.0f + expf(-(l_norm - 0.5f) * slope));
-    l_norm += (s_curve - l_norm) * cs;
+            // S-curve contrast
+            float cs = (0.3f + 0.3f * d) * contrast;
+            float slope = 4.0f + 4.0f * cs;
+            float s_curve = 1.0f / (1.0f + expf(-(l_norm - 0.5f) * slope));
+            l_norm += (s_curve - l_norm) * cs;
 
-    // Highlight compress
-    float compress = 0.4f + 0.2f * (1.0f - d);
-    float knee_h = 0.88f;
-    if (l_norm > knee_h) {
-        float over = l_norm - knee_h;
-        float headroom = 1.0f - knee_h;
-        l_norm = knee_h + headroom * tanhf(over / headroom * (1.0f + compress));
-    }
+            // Highlight compress
+            float compress = 0.4f + 0.2f * (1.0f - d);
+            float knee_h = 0.88f;
+            if (l_norm > knee_h) {
+                float over = l_norm - knee_h;
+                float headroom = 1.0f - knee_h;
+                l_norm = knee_h + headroom * tanhf(over / headroom * (1.0f + compress));
+            }
+        }
 
-    // Warmth (a*/b* push)
-    float lum_w = 4.0f * l_norm * (1.0f - l_norm);
-    a_ab += (1.0f + 5.0f * d) * lum_w;
-    b_ab +=  4.0f * d          * lum_w;
+        if (stage_mask & STAGE_WARMTH) {
+            // Warmth (a*/b* push)
+            float lum_w = 4.0f * l_norm * (1.0f - l_norm);
+            a_ab += (1.0f + 5.0f * d) * lum_w;
+            b_ab +=  4.0f * d          * lum_w;
 
-    // Vibrance
-    float vib = 0.4f + 0.5f * d;
-    float chroma = sqrtf(a_ab*a_ab + b_ab*b_ab + 1e-8f);
-    float chroma_n = fminf(chroma / 40.0f, 1.0f);
-    float boost = vib * (1.0f - chroma_n) * fminf(l_norm / 0.25f, 1.0f);
-    a_ab *= 1.0f + boost;
-    b_ab *= 1.0f + boost;
+            // User warmth scaling
+            float warmth_factor = 1.0f + (warmth - 1.0f) * 0.3f;
+            if (fabsf(warmth_factor - 1.0f) > 1e-4f) {
+                a_ab *= warmth_factor;
+                b_ab *= warmth_factor;
+            }
+        }
 
-    // User warmth scaling
-    float warmth_factor = 1.0f + (warmth - 1.0f) * 0.3f;
-    if (fabsf(warmth_factor - 1.0f) > 1e-4f) {
-        a_ab *= warmth_factor;
-        b_ab *= warmth_factor;
-    }
+        if (stage_mask & STAGE_VIBRANCE) {
+            // Vibrance
+            float vib = 0.4f + 0.5f * d;
+            float chroma = sqrtf(a_ab*a_ab + b_ab*b_ab + 1e-8f);
+            float chroma_n = fminf(chroma / 40.0f, 1.0f);
+            float boost = vib * (1.0f - chroma_n) * fminf(l_norm / 0.25f, 1.0f);
+            a_ab *= 1.0f + boost;
+            b_ab *= 1.0f + boost;
+        }
 
-    // LAB -> RGB
-    float l_out  = fminf(fmaxf(l_norm * 100.0f, 0.0f), 100.0f);
-    float a_out  = fminf(fmaxf(a_ab,  -128.0f), 127.0f);
-    float b_out2 = fminf(fmaxf(b_ab,  -128.0f), 127.0f);
-    float r3, g3, b3;
-    lab_to_srgb(l_out, a_out, b_out2, &r3, &g3, &b3);
+        // LAB -> RGB
+        float l_out  = fminf(fmaxf(l_norm * 100.0f, 0.0f), 100.0f);
+        float a_out  = fminf(fmaxf(a_ab,  -128.0f), 127.0f);
+        float b_out2 = fminf(fmaxf(b_ab,  -128.0f), 127.0f);
+        lab_to_srgb(l_out, a_out, b_out2, &r3, &g3, &b3);
 
-    // Final highlight knee -- inlined to avoid `auto` lambda in __device__ fn
-    // (CUDA device lambdas require --expt-extended-lambda; inline avoids the flag)
-    {
-        const float knee = 0.92f;
-        const float room = 1.0f - knee;
-        r3 = fminf(fmaxf(r3 > knee ? knee + room * tanhf((r3 - knee) / room) : r3, 0.0f), 1.0f);
-        g3 = fminf(fmaxf(g3 > knee ? knee + room * tanhf((g3 - knee) / room) : g3, 0.0f), 1.0f);
-        b3 = fminf(fmaxf(b3 > knee ? knee + room * tanhf((b3 - knee) / room) : b3, 0.0f), 1.0f);
+        // Final highlight knee (part of AMBIANCE)
+        if (stage_mask & STAGE_AMBIANCE) {
+            const float knee = 0.92f;
+            const float room = 1.0f - knee;
+            r3 = fminf(fmaxf(r3 > knee ? knee + room * tanhf((r3 - knee) / room) : r3, 0.0f), 1.0f);
+            g3 = fminf(fmaxf(g3 > knee ? knee + room * tanhf((g3 - knee) / room) : g3, 0.0f), 1.0f);
+            b3 = fminf(fmaxf(b3 > knee ? knee + room * tanhf((b3 - knee) / room) : b3, 0.0f), 1.0f);
+        }
     }
 
     // ------------------------------------------------------------------
-    // 4. Strength blend with original input
+    // 4. Strength blend with original input (STAGE_STRENGTH)
     // ------------------------------------------------------------------
-    if (strength < 1.0f - 1e-4f) {
+    if ((stage_mask & STAGE_STRENGTH) && strength < 1.0f - 1e-4f) {
         r3 = r * (1.0f - strength) + r3 * strength;
         g3 = g * (1.0f - strength) + g3 * strength;
         b3 = b * (1.0f - strength) + b3 * strength;

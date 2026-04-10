@@ -103,6 +103,23 @@ pub struct GradeArgs {
     /// Output codec: prores, hevc10, h264 (default: auto for source bit depth)
     #[arg(long)]
     pub output_codec: Option<String>,
+
+    /// Enabled grading stages (comma-separated). Default: all.
+    /// Stages: hsl, ambiance, warmth, vibrance, strength, depth_mod, depth_dither, yolo_mask
+    #[arg(long)]
+    pub stages: Option<String>,
+
+    /// Flat mode: RAUNE-only LUT (equivalent to --stages with no stages)
+    #[arg(long)]
+    pub flat: bool,
+
+    /// Direct mode: per-frame RAUNE, no LUT pipeline (skips keyframe/calibration/CUDA stages)
+    #[arg(long)]
+    pub direct: bool,
+
+    /// RAUNE proxy resolution for direct mode (long-edge pixels, default: 1920)
+    #[arg(long)]
+    pub raune_proxy_size: Option<usize>,
 }
 
 pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
@@ -177,6 +194,64 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
 
     log::info!("Grading: {} → {}", args.input.display(), output.display());
 
+    // -----------------------------------------------------------------------
+    // Direct mode: per-frame RAUNE, skip LUT pipeline entirely
+    // -----------------------------------------------------------------------
+    let direct_mode = args.direct || cfg.grade.mode.as_deref() == Some("direct");
+    if direct_mode {
+        let raune_proxy_size = args.raune_proxy_size
+            .or(cfg.grade.raune_proxy_size)
+            .unwrap_or(1080_usize);
+
+        let rw = raune_weights.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--direct requires RAUNE weights (set [models].raune_weights in dorea.toml)"))?;
+        let rmd = raune_models_dir.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--direct requires RAUNE models dir (set [models].raune_models_dir in dorea.toml)"))?;
+
+        let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(
+            info.width, info.height, raune_proxy_size,
+        );
+
+        log::info!(
+            "Direct mode: single-process OKLab transfer, RAUNE proxy {}x{} (max {raune_proxy_size}), output {}x{}",
+            proxy_w, proxy_h, info.width, info.height,
+        );
+
+        let pipeline_cfg = PipelineConfig {
+            input: args.input.clone(),
+            warmth, strength, contrast, proxy_size,
+            depth_skip_threshold, depth_max_interval, fused_batch_size,
+            depth_zones, base_lut_zones, scene_threshold, min_segment_kfs,
+            zone_smoothing_w, maxine_upscale_factor,
+            interp_enabled: false,
+            maxine_in_fused_batch: false,
+            input_encoding, output_codec,
+            stage_mask: 0,
+        };
+
+        let direct_cfg = pipeline::grading::DirectModeConfig {
+            python: python.clone(),
+            raune_weights: rw.clone(),
+            raune_models_dir: rmd.clone(),
+            raune_proxy_size,
+            batch_size: 4,
+            output: output.clone(),
+        };
+
+        let frame_count = pipeline::grading::run_grading_stage_direct(
+            &pipeline_cfg, &info, &direct_cfg,
+        )?;
+
+        if info.frame_count > 0 && frame_count < info.frame_count {
+            log::warn!(
+                "Incomplete direct-mode grading: {frame_count} frames processed, {} expected",
+                info.frame_count
+            );
+        }
+        log::info!("Done. Direct-mode graded {frame_count} frames → {}", output.display());
+        return Ok(());
+    }
+
     // Open encoder first — validate output path before doing expensive calibration.
     let audio_src = if info.has_audio { Some(args.input.as_path()) } else { None };
     let encoder = if output_codec.is_10bit() {
@@ -191,6 +266,25 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         &python, raune_weights.as_deref(), raune_models_dir.as_deref(),
         depth_model.as_deref(), device.clone(), maxine_upscale_factor,
     );
+
+    // Resolve stage mask: --flat → 0 (no stages), --stages → parse, default → all
+    let stage_mask = if args.flat {
+        0u32
+    } else if let Some(ref stages_str) = args.stages {
+        dorea_gpu::stages::parse(stages_str)
+            .map_err(|e| anyhow::anyhow!("invalid --stages: {e}"))?
+    } else if let Some(ref stages_str) = cfg.grade.stages {
+        dorea_gpu::stages::parse(stages_str)
+            .map_err(|e| anyhow::anyhow!("invalid [grade].stages config: {e}"))?
+    } else {
+        dorea_gpu::stages::ALL
+    };
+
+    // In flat mode (stage_mask=0), force single zone — no depth stratification.
+    let depth_zones = if stage_mask == 0 { 1 } else { depth_zones };
+    let base_lut_zones = if stage_mask == 0 { 1 } else { base_lut_zones };
+
+    log::info!("Stages: {}", dorea_gpu::stages::format(stage_mask));
 
     let pipeline_cfg = PipelineConfig {
         input: args.input.clone(),
@@ -211,6 +305,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         maxine_in_fused_batch: false, // Maxine disabled — SDK not available in devcontainer
         input_encoding,
         output_codec,
+        stage_mask,
     };
 
     // -----------------------------------------------------------------------

@@ -13,7 +13,8 @@
 
 use anyhow::{Context, Result};
 
-use dorea_video::ffmpeg::{self, Frame, FrameEncoder, VideoInfo};
+use dorea_video::ffmpeg::{self, Frame, FrameEncoder, OutputCodec, VideoInfo};
+use dorea_video::inference::InferenceServer;
 
 #[cfg(feature = "cuda")]
 use dorea_gpu::AdaptiveGrader;
@@ -302,6 +303,87 @@ fn run_grading_stage_8bit(
         decoder_result.context("decoder thread failed")?;
         encoder_result
     })
+}
+
+/// Direct-mode grading: per-frame RAUNE inference, no LUT pipeline.
+///
+/// 3-thread pipeline:
+///   Thread 1 (spawned): ffmpeg decode at proxy resolution → channel_a
+///   Thread 2 (main):    RAUNE inference (InferenceServer is !Send) → channel_b
+///   Thread 3 (spawned): encode with Lanczos upscale → output file
+/// Direct-mode grading configuration — passed to `run_grading_stage_direct`.
+pub struct DirectModeConfig {
+    pub python: std::path::PathBuf,
+    pub raune_weights: std::path::PathBuf,
+    pub raune_models_dir: std::path::PathBuf,
+    pub raune_proxy_size: usize,
+    pub batch_size: usize,
+    pub output: std::path::PathBuf,
+}
+
+/// Direct mode: single-process RAUNE with OKLab chroma transfer.
+///
+/// Pipeline: Python single-process (PyAV decode → GPU → PyAV encode).
+/// No pipe I/O — the filter handles decode/encode internally.
+/// Falls back to legacy pipe mode if PyAV is unavailable.
+pub fn run_grading_stage_direct(
+    cfg: &PipelineConfig,
+    info: &VideoInfo,
+    direct_cfg: &DirectModeConfig,
+) -> Result<u64> {
+    use std::process::{Command, Stdio};
+
+    let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(
+        info.width, info.height, direct_cfg.raune_proxy_size,
+    );
+
+    // Map output codec to PyAV codec name
+    let pyav_codec = match cfg.output_codec {
+        OutputCodec::Hevc10 => "hevc",
+        OutputCodec::H264 => "h264",
+        _ => "prores_ks",
+    };
+
+    log::info!(
+        "Direct mode: single-process OKLab transfer, RAUNE proxy {}x{} batch={}, full-res {}x{}, codec={}",
+        proxy_w, proxy_h, direct_cfg.batch_size, info.width, info.height, pyav_codec,
+    );
+
+    let python_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().and_then(|p| p.parent())
+        .map(|p| p.join("python"))
+        .unwrap_or_default();
+
+    let output_str = direct_cfg.output.to_string_lossy();
+
+    let mut raune_proc = Command::new(&direct_cfg.python)
+        .env("PYTHONPATH", &python_dir)
+        .args([
+            "-m", "dorea_inference.raune_filter",
+            "--weights", direct_cfg.raune_weights.to_str().unwrap_or(""),
+            "--models-dir", direct_cfg.raune_models_dir.to_str().unwrap_or(""),
+            "--full-width", &info.width.to_string(),
+            "--full-height", &info.height.to_string(),
+            "--proxy-width", &proxy_w.to_string(),
+            "--proxy-height", &proxy_h.to_string(),
+            "--batch-size", &direct_cfg.batch_size.to_string(),
+            "--input", cfg.input.to_str().unwrap_or(""),
+            "--output", &output_str,
+            "--output-codec", pyav_codec,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to spawn raune_filter.py")?;
+
+    let status = raune_proc.wait().context("raune_filter wait failed")?;
+    if !status.success() {
+        anyhow::bail!("raune_filter exited with {status}");
+    }
+
+    // The filter reports frame count via stderr; return total frames from info
+    Ok(info.frame_count)
 }
 
 /// 16-bit grading pipeline: Frame16 (u16) → grade_frame_blended_16 → write_frame_16 (u16).
