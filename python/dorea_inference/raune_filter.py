@@ -483,8 +483,16 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         proxy_batch = torch.stack(proxy_tensors).cuda()
         del proxy_tensors
 
-        # RAUNE inference
+        # Cast to model's dtype (fp16 if model.half() was called, fp32 otherwise).
+        # Match input dtype to model dtype to avoid PyTorch type mismatch errors.
+        model_dtype = next(model.parameters()).dtype
+        if proxy_batch.dtype != model_dtype:
+            proxy_batch = proxy_batch.to(model_dtype)
+
+        # RAUNE inference (may run in fp16)
         raune_out = model(proxy_batch)
+        # Cast back to fp32 for downstream OKLab math
+        raune_out = raune_out.float()
         raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
 
         # Handle U-Net padding
@@ -492,8 +500,8 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         if rh != ph or rw != pw:
             raune_out = F.interpolate(raune_out, size=(ph, pw), mode="bilinear", align_corners=False)
 
-        # Original proxy (un-normalized)
-        orig_proxy = (proxy_batch * 0.5 + 0.5).clamp(0.0, 1.0)
+        # Original proxy (un-normalized) — cast back to fp32 for OKLab math
+        orig_proxy = (proxy_batch.float() * 0.5 + 0.5).clamp(0.0, 1.0)
         del proxy_batch
 
         # OKLab deltas at proxy resolution
@@ -571,14 +579,19 @@ def run_pipe_mode(args, model, normalize):
             proxy_batch = torch.stack(proxy_tensors).cuda()
             del proxy_tensors
 
-            raune_out = model(proxy_batch)
+            # Match input dtype to model dtype (fp16 if model.half() was called)
+            model_dtype = next(model.parameters()).dtype
+            if proxy_batch.dtype != model_dtype:
+                proxy_batch = proxy_batch.to(model_dtype)
+
+            raune_out = model(proxy_batch).float()
             raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
 
             rh, rw = raune_out.shape[2], raune_out.shape[3]
             if rh != ph or rw != pw:
                 raune_out = F.interpolate(raune_out, size=(ph, pw), mode="bilinear", align_corners=False)
 
-            orig_proxy = (proxy_batch * 0.5 + 0.5).clamp(0.0, 1.0)
+            orig_proxy = (proxy_batch.float() * 0.5 + 0.5).clamp(0.0, 1.0)
             del proxy_batch
 
             raune_lab = rgb_to_lab(raune_out)
@@ -652,6 +665,15 @@ def main():
     state = torch.load(args.weights, map_location="cuda", weights_only=True)
     model.load_state_dict(state)
     model.eval()
+    # Convert to fp16 for ~2× throughput on Ampere. fp16 has 11 bits of mantissa
+    # precision, more than enough for 8-bit (or 10-bit) output. The forward pass
+    # outputs fp16; we cast back to fp32 in _process_batch before the OKLab transfer.
+    try:
+        model = model.half()
+        print("[raune-filter] RAUNE model converted to fp16", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[raune-filter] WARNING: model.half() failed ({e}); falling back to fp32",
+              file=sys.stderr, flush=True)
 
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 
