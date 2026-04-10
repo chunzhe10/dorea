@@ -199,7 +199,7 @@ def pytorch_oklab_transfer(frame_nchw_f32, delta_nchw_f32):
 # Single-process mode (PyAV decode + encode, zero pipes)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_single_process(args, model, normalize):
+def run_single_process(args, model, normalize, model_dtype):
     """Decode → GPU process → encode, all in one process via PyAV."""
     import av
 
@@ -247,7 +247,8 @@ def run_single_process(args, model, normalize):
         out_stream.pix_fmt = "yuv420p"
 
     print(f"[raune-filter] single-process: {fw}x{fh}, proxy={pw}x{ph}, "
-          f"batch={batch_size}, codec={codec_name}, fps={fps:.3f}",
+          f"batch={batch_size}, codec={codec_name}, fps={fps:.3f}, "
+          f"dtype={model_dtype}",
           file=sys.stderr, flush=True)
 
     # ─── 3-thread pipeline: decoder → GPU → encoder ────────────────────────
@@ -344,6 +345,7 @@ def run_single_process(args, model, normalize):
                 results = _process_batch(
                     batch, model, normalize,
                     fw, fh, pw, ph, transfer_fn,
+                    model_dtype,
                 )
                 gpu_busy += time.perf_counter() - t0
                 if not put_or_stop(q_processed, results, stop_event):
@@ -462,7 +464,7 @@ def run_single_process(args, model, normalize):
     return encoded_count
 
 
-def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn):
+def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn, model_dtype):
     """Process a batch of frames on GPU. Returns list of uint8 HWC numpy arrays."""
     n = len(batch_frames_np)
     results = []
@@ -483,9 +485,7 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         proxy_batch = torch.stack(proxy_tensors).cuda()
         del proxy_tensors
 
-        # Cast to model's dtype (fp16 if model.half() was called, fp32 otherwise).
-        # Match input dtype to model dtype to avoid PyTorch type mismatch errors.
-        model_dtype = next(model.parameters()).dtype
+        # Cast to model's dtype (passed in from main(), set once at model load)
         if proxy_batch.dtype != model_dtype:
             proxy_batch = proxy_batch.to(model_dtype)
 
@@ -537,14 +537,15 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
 # Legacy pipe mode (stdin/stdout rgb48le)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_pipe_mode(args, model, normalize):
+def run_pipe_mode(args, model, normalize, model_dtype):
     """Read rgb48le from stdin, process, write rgb48le to stdout."""
     fw, fh = args.full_width, args.full_height
     pw, ph = args.proxy_width, args.proxy_height
     full_frame_bytes = fw * fh * 3 * 2  # rgb48le
     batch_size = args.batch_size
 
-    print(f"[raune-filter] pipe mode: full={fw}x{fh}, proxy={pw}x{ph}, batch={batch_size}",
+    print(f"[raune-filter] pipe mode: full={fw}x{fh}, proxy={pw}x{ph}, "
+          f"batch={batch_size}, dtype={model_dtype}",
           file=sys.stderr, flush=True)
 
     stdin = sys.stdin.buffer
@@ -579,8 +580,6 @@ def run_pipe_mode(args, model, normalize):
             proxy_batch = torch.stack(proxy_tensors).cuda()
             del proxy_tensors
 
-            # Match input dtype to model dtype (fp16 if model.half() was called)
-            model_dtype = next(model.parameters()).dtype
             if proxy_batch.dtype != model_dtype:
                 proxy_batch = proxy_batch.to(model_dtype)
 
@@ -640,7 +639,8 @@ def main():
     parser.add_argument("--full-height", type=int, required=True)
     parser.add_argument("--proxy-width", type=int, required=True)
     parser.add_argument("--proxy-height", type=int, required=True)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Frames per batch (default: 8). Must match grade.rs default.")
     # Single-process mode args
     parser.add_argument("--input", help="Input video file (enables single-process mode)")
     parser.add_argument("--output", help="Output video file (required with --input)")
@@ -665,15 +665,23 @@ def main():
     state = torch.load(args.weights, map_location="cuda", weights_only=True)
     model.load_state_dict(state)
     model.eval()
-    # Convert to fp16 for ~2× throughput on Ampere. fp16 has 11 bits of mantissa
-    # precision, more than enough for 8-bit (or 10-bit) output. The forward pass
-    # outputs fp16; we cast back to fp32 in _process_batch before the OKLab transfer.
-    try:
-        model = model.half()
-        print("[raune-filter] RAUNE model converted to fp16", file=sys.stderr, flush=True)
-    except Exception as e:
-        print(f"[raune-filter] WARNING: model.half() failed ({e}); falling back to fp32",
-              file=sys.stderr, flush=True)
+    # Convert RAUNE to fp16 for ~2× throughput on Ampere.
+    # fp16 has 11 bits of mantissa precision, more than enough for 8/10-bit output.
+    # InstanceNorm2d layers are kept in fp32 because their per-channel variance
+    # computation can underflow in fp16 (PyTorch's autocast handles this automatically;
+    # model.half() does not, so we restore InstanceNorm explicitly here).
+    import torch.nn as nn
+    model = model.half()
+    instance_norm_count = 0
+    for m in model.modules():
+        if isinstance(m, (nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)):
+            m.float()
+            instance_norm_count += 1
+    model_dtype = next(model.parameters()).dtype
+    print(f"[raune-filter] RAUNE converted to fp16 "
+          f"({instance_norm_count} InstanceNorm layers kept in fp32, "
+          f"model_dtype={model_dtype})",
+          file=sys.stderr, flush=True)
 
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 
@@ -682,9 +690,9 @@ def main():
         if not args.output:
             print("error: --output required with --input", file=sys.stderr)
             sys.exit(1)
-        run_single_process(args, model, normalize)
+        run_single_process(args, model, normalize, model_dtype)
     else:
-        run_pipe_mode(args, model, normalize)
+        run_pipe_mode(args, model, normalize, model_dtype)
 
 
 if __name__ == "__main__":

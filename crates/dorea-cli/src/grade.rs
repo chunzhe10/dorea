@@ -121,8 +121,9 @@ pub struct GradeArgs {
     #[arg(long)]
     pub raune_proxy_size: Option<usize>,
 
-    /// Frames per batch in direct mode (default: 8). Larger = better GPU
-    /// utilization, more VRAM. fp16 inference allows larger batches than fp32.
+    /// Frames per batch in direct mode (default: 4). On RTX 3060 (6GB), values
+    /// above 8 show diminishing returns due to PCIe upload overhead in the
+    /// per-frame loop in _process_batch. batch=8 ~4.36 fps, batch=16 ~3.47 fps.
     #[arg(long)]
     pub direct_batch_size: Option<usize>,
 }
@@ -219,7 +220,26 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
 
         let direct_batch_size = args.direct_batch_size
             .or(cfg.grade.direct_batch_size)
-            .unwrap_or(8);
+            .unwrap_or(4);
+
+        // Validate batch size: zero causes silent regression in Python; values
+        // above 8 show diminishing returns and may regress on 6GB VRAM (RTX 3060)
+        if direct_batch_size == 0 {
+            anyhow::bail!("--direct-batch-size must be >= 1");
+        }
+        if direct_batch_size > 32 {
+            anyhow::bail!(
+                "--direct-batch-size {direct_batch_size} exceeds safe limit of 32 \
+                 (would risk CUDA OOM on 6GB VRAM). Use a smaller value."
+            );
+        }
+        if direct_batch_size > 8 {
+            log::warn!(
+                "--direct-batch-size={direct_batch_size}: values above 8 may regress \
+                 throughput on 6GB VRAM (RTX 3060) due to per-frame upload overhead \
+                 in _process_batch. Measured baseline: batch=8 ~4.36 fps, batch=16 ~3.47 fps."
+            );
+        }
 
         log::info!(
             "Direct mode: single-process OKLab transfer, RAUNE proxy {}x{} (max {raune_proxy_size}), batch={direct_batch_size}, output {}x{}",
