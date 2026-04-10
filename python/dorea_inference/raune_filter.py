@@ -269,8 +269,14 @@ def run_single_process(args, model, normalize):
     t_start = time.time()
     encoded_count = 0
 
+    # Per-stage cumulative timing (busy time, excluding queue waits)
+    decode_busy = 0.0
+    gpu_busy = 0.0
+    encode_busy = 0.0
+
     # ─── Thread 1: Decoder ─────────────────────────────────────────────────
     def decoder_thread() -> None:
+        nonlocal decode_busy
         try:
             batch: list[np.ndarray] = []
             for packet in in_container.demux(in_stream):
@@ -279,12 +285,14 @@ def run_single_process(args, model, normalize):
                 for frame in packet.decode():
                     if stop_event.is_set():
                         return
+                    t0 = time.perf_counter()
                     rgb = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
                     if rgb.shape[1] != fw or rgb.shape[0] != fh:
                         rgb = np.array(
                             frame.to_image().resize((fw, fh)),
                             dtype=np.uint8,
                         )
+                    decode_busy += time.perf_counter() - t0
                     batch.append(rgb)
                     if len(batch) >= batch_size:
                         q_decoded.put(batch)
@@ -298,6 +306,7 @@ def run_single_process(args, model, normalize):
 
     # ─── Thread 2: GPU processing ──────────────────────────────────────────
     def gpu_thread() -> None:
+        nonlocal gpu_busy
         try:
             while True:
                 if stop_event.is_set():
@@ -305,10 +314,12 @@ def run_single_process(args, model, normalize):
                 batch = q_decoded.get()
                 if batch is None:
                     return
+                t0 = time.perf_counter()
                 results = _process_batch(
                     batch, model, normalize,
                     fw, fh, pw, ph, transfer_fn,
                 )
+                gpu_busy += time.perf_counter() - t0
                 q_processed.put(results)
         except BaseException as e:
             record_error(e)
@@ -317,7 +328,7 @@ def run_single_process(args, model, normalize):
 
     # ─── Thread 3: Encoder ─────────────────────────────────────────────────
     def encoder_thread() -> None:
-        nonlocal encoded_count
+        nonlocal encoded_count, encode_busy
         try:
             while True:
                 if stop_event.is_set():
@@ -326,10 +337,12 @@ def run_single_process(args, model, normalize):
                 if results is None:
                     return
                 for result_np in results:
+                    t0 = time.perf_counter()
                     out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
                     out_frame.pts = encoded_count
                     for pkt in out_stream.encode(out_frame):
                         out_container.mux(pkt)
+                    encode_busy += time.perf_counter() - t0
                     encoded_count += 1
                     if encoded_count % (batch_size * 4) == 0:
                         elapsed = time.time() - t_start
@@ -370,8 +383,15 @@ def run_single_process(args, model, normalize):
 
     elapsed = time.time() - t_start
     fps_actual = encoded_count / elapsed if elapsed > 0 else 0
+    n = max(encoded_count, 1)
     print(f"[raune-filter] done: {encoded_count} frames in {elapsed:.1f}s "
           f"({fps_actual:.2f} fps)",
+          file=sys.stderr, flush=True)
+    print(f"[raune-filter] stage timing (busy ms/frame): "
+          f"decode={decode_busy*1000/n:.1f} "
+          f"gpu={gpu_busy*1000/n:.1f} "
+          f"encode={encode_busy*1000/n:.1f} "
+          f"wall={elapsed*1000/n:.1f}",
           file=sys.stderr, flush=True)
     return encoded_count
 
