@@ -639,8 +639,8 @@ def main():
     parser.add_argument("--full-height", type=int, required=True)
     parser.add_argument("--proxy-width", type=int, required=True)
     parser.add_argument("--proxy-height", type=int, required=True)
-    parser.add_argument("--batch-size", type=int, default=8,
-                        help="Frames per batch (default: 8). Must match grade.rs default.")
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Frames per batch (default: 4). Must match grade.rs default.")
     # Single-process mode args
     parser.add_argument("--input", help="Input video file (enables single-process mode)")
     parser.add_argument("--output", help="Output video file (required with --input)")
