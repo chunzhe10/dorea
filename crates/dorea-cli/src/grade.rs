@@ -120,6 +120,11 @@ pub struct GradeArgs {
     /// RAUNE proxy resolution for direct mode (long-edge pixels, default: 1920)
     #[arg(long)]
     pub raune_proxy_size: Option<usize>,
+
+    /// Frames per batch in direct mode (default: 8). Larger = better GPU
+    /// utilization, more VRAM. fp16 inference allows larger batches than fp32.
+    #[arg(long)]
+    pub direct_batch_size: Option<usize>,
 }
 
 pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
@@ -212,8 +217,12 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
             info.width, info.height, raune_proxy_size,
         );
 
+        let direct_batch_size = args.direct_batch_size
+            .or(cfg.grade.direct_batch_size)
+            .unwrap_or(8);
+
         log::info!(
-            "Direct mode: single-process OKLab transfer, RAUNE proxy {}x{} (max {raune_proxy_size}), output {}x{}",
+            "Direct mode: single-process OKLab transfer, RAUNE proxy {}x{} (max {raune_proxy_size}), batch={direct_batch_size}, output {}x{}",
             proxy_w, proxy_h, info.width, info.height,
         );
 
@@ -234,7 +243,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
             raune_weights: rw.clone(),
             raune_models_dir: rmd.clone(),
             raune_proxy_size,
-            batch_size: 4,
+            batch_size: direct_batch_size,
             output: output.clone(),
         };
 
