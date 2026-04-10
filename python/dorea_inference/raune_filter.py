@@ -19,6 +19,8 @@ Supports both single-process mode (--input/--output) and legacy pipe mode
 import sys
 import argparse
 import time
+import threading
+import queue
 from pathlib import Path
 
 import numpy as np
@@ -248,77 +250,130 @@ def run_single_process(args, model, normalize):
           f"batch={batch_size}, codec={codec_name}, fps={fps:.3f}",
           file=sys.stderr, flush=True)
 
-    frame_count = 0
+    # ─── 3-thread pipeline: decoder → GPU → encoder ────────────────────────
+    # Bounded queues provide backpressure (memory bound: ~200MB at 4K)
+    q_decoded = queue.Queue(maxsize=2)   # holds: list[np.ndarray] (one batch)
+    q_processed = queue.Queue(maxsize=2) # holds: list[np.ndarray] (one batch)
+
+    # Shared error state
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    def record_error(exc: BaseException) -> None:
+        with errors_lock:
+            errors.append(exc)
+        stop_event.set()
+
+    # Frame counter shared with encoder thread for progress reporting
     t_start = time.time()
-    batch_frames_np = []
+    encoded_count = 0
 
-    for packet in in_container.demux(in_stream):
-        for frame in packet.decode():
-            # PyAV frame → RGB24 numpy (in-process, no pipe)
-            rgb = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
+    # ─── Thread 1: Decoder ─────────────────────────────────────────────────
+    def decoder_thread() -> None:
+        try:
+            batch: list[np.ndarray] = []
+            for packet in in_container.demux(in_stream):
+                if stop_event.is_set():
+                    return
+                for frame in packet.decode():
+                    if stop_event.is_set():
+                        return
+                    rgb = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
+                    if rgb.shape[1] != fw or rgb.shape[0] != fh:
+                        rgb = np.array(
+                            frame.to_image().resize((fw, fh)),
+                            dtype=np.uint8,
+                        )
+                    batch.append(rgb)
+                    if len(batch) >= batch_size:
+                        q_decoded.put(batch)
+                        batch = []
+            if batch:
+                q_decoded.put(batch)
+        except BaseException as e:
+            record_error(e)
+        finally:
+            q_decoded.put(None)  # sentinel: tell GPU thread we're done
 
-            # Resize if needed (input might not match expected dims)
-            if rgb.shape[1] != fw or rgb.shape[0] != fh:
-                rgb = np.array(
-                    frame.to_image().resize((fw, fh)),
-                    dtype=np.uint8,
+    # ─── Thread 2: GPU processing ──────────────────────────────────────────
+    def gpu_thread() -> None:
+        try:
+            while True:
+                if stop_event.is_set():
+                    return
+                batch = q_decoded.get()
+                if batch is None:
+                    return
+                results = _process_batch(
+                    batch, model, normalize,
+                    fw, fh, pw, ph, transfer_fn,
                 )
+                q_processed.put(results)
+        except BaseException as e:
+            record_error(e)
+        finally:
+            q_processed.put(None)  # sentinel: tell encoder we're done
 
-            batch_frames_np.append(rgb)
+    # ─── Thread 3: Encoder ─────────────────────────────────────────────────
+    def encoder_thread() -> None:
+        nonlocal encoded_count
+        try:
+            while True:
+                if stop_event.is_set():
+                    return
+                results = q_processed.get()
+                if results is None:
+                    return
+                for result_np in results:
+                    out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
+                    out_frame.pts = encoded_count
+                    for pkt in out_stream.encode(out_frame):
+                        out_container.mux(pkt)
+                    encoded_count += 1
+                    if encoded_count % (batch_size * 4) == 0:
+                        elapsed = time.time() - t_start
+                        fps_actual = encoded_count / elapsed if elapsed > 0 else 0
+                        pct = (encoded_count / total_frames * 100
+                               if total_frames else 0)
+                        print(f"[raune-filter] {encoded_count} frames "
+                              f"({pct:.0f}%, {fps_actual:.1f} fps)",
+                              file=sys.stderr, flush=True)
+        except BaseException as e:
+            record_error(e)
 
-            if len(batch_frames_np) < batch_size:
-                continue
+    # Spawn threads
+    t_dec = threading.Thread(target=decoder_thread, name="decoder", daemon=False)
+    t_gpu = threading.Thread(target=gpu_thread, name="gpu", daemon=False)
+    t_enc = threading.Thread(target=encoder_thread, name="encoder", daemon=False)
 
-            # Process batch
-            results = _process_batch(
-                batch_frames_np, model, normalize,
-                fw, fh, pw, ph, transfer_fn,
-            )
+    t_dec.start()
+    t_gpu.start()
+    t_enc.start()
 
-            # Encode results
-            for result_np in results:
-                out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
-                out_frame.pts = frame_count
-                for pkt in out_stream.encode(out_frame):
-                    out_container.mux(pkt)
-                frame_count += 1
+    # Wait for all threads to finish
+    t_dec.join()
+    t_gpu.join()
+    t_enc.join()
 
-            batch_frames_np.clear()
-
-            if frame_count % (batch_size * 4) == 0:
-                elapsed = time.time() - t_start
-                fps_actual = frame_count / elapsed if elapsed > 0 else 0
-                pct = frame_count / total_frames * 100 if total_frames else 0
-                print(f"[raune-filter] {frame_count} frames "
-                      f"({pct:.0f}%, {fps_actual:.1f} fps)",
-                      file=sys.stderr, flush=True)
-
-    # Process remaining frames
-    if batch_frames_np:
-        results = _process_batch(
-            batch_frames_np, model, normalize,
-            fw, fh, pw, ph, transfer_fn,
-        )
-        for result_np in results:
-            out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
-            out_frame.pts = frame_count
-            for pkt in out_stream.encode(out_frame):
-                out_container.mux(pkt)
-            frame_count += 1
-
-    # Flush encoder
-    for pkt in out_stream.encode():
-        out_container.mux(pkt)
+    # Flush encoder (must happen on main thread after encoder thread finishes)
+    if not errors:
+        for pkt in out_stream.encode():
+            out_container.mux(pkt)
 
     out_container.close()
     in_container.close()
 
+    # Propagate any error from worker threads
+    if errors:
+        raise errors[0]
+
     elapsed = time.time() - t_start
-    fps_actual = frame_count / elapsed if elapsed > 0 else 0
-    print(f"[raune-filter] done: {frame_count} frames in {elapsed:.1f}s "
+    fps_actual = encoded_count / elapsed if elapsed > 0 else 0
+    print(f"[raune-filter] done: {encoded_count} frames in {elapsed:.1f}s "
           f"({fps_actual:.2f} fps)",
           file=sys.stderr, flush=True)
-    return frame_count
+    return encoded_count
 
 
 def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn):
