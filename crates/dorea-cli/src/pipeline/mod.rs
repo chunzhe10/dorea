@@ -17,4 +17,5 @@ pub struct PipelineConfig {
     pub batch_size: usize,
     pub proxy_w: usize,
     pub proxy_h: usize,
+    pub tensorrt: bool,
 }

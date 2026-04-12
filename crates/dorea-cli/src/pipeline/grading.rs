@@ -40,8 +40,8 @@ pub fn run(cfg: &PipelineConfig, info: &VideoInfo) -> Result<u64> {
     let output_str = cfg.output.to_str()
         .ok_or_else(|| anyhow::anyhow!("output path is not valid UTF-8: {}", cfg.output.display()))?;
 
-    let mut raune_proc = Command::new(&cfg.python)
-        .env("PYTHONPATH", &python_dir)
+    let mut cmd = Command::new(&cfg.python);
+    cmd.env("PYTHONPATH", &python_dir)
         .args([
             "-m", "dorea_inference.raune_filter",
             "--weights", raune_weights_str,
@@ -54,7 +54,13 @@ pub fn run(cfg: &PipelineConfig, info: &VideoInfo) -> Result<u64> {
             "--input", input_str,
             "--output", output_str,
             "--output-codec", pyav_codec,
-        ])
+        ]);
+
+    if cfg.tensorrt {
+        cmd.arg("--tensorrt");
+    }
+
+    let mut raune_proc = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

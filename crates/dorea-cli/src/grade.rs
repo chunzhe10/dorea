@@ -55,6 +55,10 @@ pub struct GradeArgs {
     /// Enable verbose (debug) logging.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Use TensorRT FP16 engine for RAUNE-Net inference (requires tensorrt-cu12 in venv).
+    #[arg(long)]
+    pub tensorrt: bool,
 }
 
 pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
@@ -167,6 +171,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         batch_size,
         proxy_w,
         proxy_h,
+        tensorrt: args.tensorrt,
     };
 
     let frame_count = pipeline::grading::run(&pipeline_cfg, &info)?;
