@@ -497,10 +497,13 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         if proxy_batch.dtype != model_dtype:
             proxy_batch = proxy_batch.to(model_dtype)
 
-        # RAUNE inference (may run in fp16)
-        raune_out = model(proxy_batch)
-        # Cast back to fp32 for downstream OKLab math
-        raune_out = raune_out.float()
+        # RAUNE inference
+        if hasattr(model, 'infer'):
+            # TRT engine path
+            raune_out = model.infer(proxy_batch).float()
+        else:
+            # PyTorch model path
+            raune_out = model(proxy_batch).float()
         raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
 
         # Handle U-Net padding
@@ -591,7 +594,10 @@ def run_pipe_mode(args, model, normalize, model_dtype):
             if proxy_batch.dtype != model_dtype:
                 proxy_batch = proxy_batch.to(model_dtype)
 
-            raune_out = model(proxy_batch).float()
+            if hasattr(model, 'infer'):
+                raune_out = model.infer(proxy_batch).float()
+            else:
+                raune_out = model(proxy_batch).float()
             raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
 
             rh, rw = raune_out.shape[2], raune_out.shape[3]
@@ -654,9 +660,15 @@ def main():
     parser.add_argument("--output", help="Output video file (required with --input)")
     parser.add_argument("--output-codec", default="prores_ks",
                         help="Output codec: prores_ks, hevc, libx265, h264 (default: prores_ks)")
+    parser.add_argument("--tensorrt", action="store_true",
+                        help="Use TensorRT FP16 engine instead of PyTorch (requires tensorrt-cu12)")
+    parser.add_argument("--trt-cache-dir", default=None,
+                        help="TRT engine cache directory (default: <models-dir>/trt_cache)")
+    parser.add_argument("--onnx-path", default=None,
+                        help="Pre-exported ONNX model path (default: auto-export to <models-dir>/raune_net.onnx)")
     args = parser.parse_args()
 
-    # Load RAUNE model
+    # Load RAUNE model — either TRT engine or PyTorch
     models_dir = Path(args.models_dir)
     if (models_dir / "models" / "raune_net.py").exists():
         raune_dir = models_dir
@@ -667,31 +679,59 @@ def main():
     if str(raune_dir) not in sys.path:
         sys.path.insert(0, str(raune_dir))
 
-    from models.raune_net import RauneNet
-
-    model = RauneNet(input_nc=3, output_nc=3, n_blocks=30, n_down=2, ngf=64).cuda()
-    state = torch.load(args.weights, map_location="cuda", weights_only=True)
-    model.load_state_dict(state)
-    model.eval()
-    # Convert RAUNE to fp16 for ~2× throughput on Ampere.
-    # fp16 has 11 bits of mantissa precision, more than enough for 8/10-bit output.
-    # InstanceNorm2d layers are kept in fp32 because their per-channel variance
-    # computation can underflow in fp16 (PyTorch's autocast handles this automatically;
-    # model.half() does not, so we restore InstanceNorm explicitly here).
-    import torch.nn as nn
-    model = model.half()
-    instance_norm_count = 0
-    for m in model.modules():
-        if isinstance(m, (nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)):
-            m.float()
-            instance_norm_count += 1
-    model_dtype = next(model.parameters()).dtype
-    print(f"[raune-filter] RAUNE converted to fp16 "
-          f"({instance_norm_count} InstanceNorm layers kept in fp32, "
-          f"model_dtype={model_dtype})",
-          file=sys.stderr, flush=True)
-
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+
+    if args.tensorrt:
+        from dorea_inference.trt_engine import RauneTRTEngine
+        from dorea_inference.export_onnx import export_raune_onnx
+
+        # Resolve ONNX path
+        onnx_path = args.onnx_path
+        if onnx_path is None:
+            onnx_path = str(models_dir / "raune_net.onnx")
+            if not Path(onnx_path).exists():
+                print(f"[raune-filter] Exporting ONNX to {onnx_path}...",
+                      file=sys.stderr, flush=True)
+                export_raune_onnx(args.weights, str(models_dir), onnx_path)
+
+        # Resolve cache dir and proxy dimensions
+        trt_cache_dir = args.trt_cache_dir or str(models_dir / "trt_cache")
+
+        model = RauneTRTEngine.get_or_build(
+            onnx_path=onnx_path,
+            cache_dir=trt_cache_dir,
+            batch_size=args.batch_size,
+            height=args.proxy_height,
+            width=args.proxy_width,
+            fp16=True,
+        )
+        model_dtype = torch.float16
+        print(f"[raune-filter] Using TensorRT FP16 engine", file=sys.stderr, flush=True)
+    else:
+        from models.raune_net import RauneNet
+
+        model = RauneNet(input_nc=3, output_nc=3, n_blocks=30, n_down=2, ngf=64).cuda()
+        state = torch.load(args.weights, map_location="cuda", weights_only=True)
+        model.load_state_dict(state)
+        model.eval()
+        import torch.nn as nn
+        model = model.half()
+        instance_norm_count = 0
+        for m in model.modules():
+            if isinstance(m, (nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)):
+                m.float()
+                instance_norm_count += 1
+        model_dtype = next(model.parameters()).dtype
+        print(f"[raune-filter] RAUNE converted to fp16 "
+              f"({instance_norm_count} InstanceNorm layers kept in fp32, "
+              f"model_dtype={model_dtype})",
+              file=sys.stderr, flush=True)
+        # torch.compile for ~15-30% speedup on the PyTorch path.
+        # Must be called AFTER model.half() + InstanceNorm float() restoration
+        # so the compiled graph sees the final dtype layout.
+        model = torch.compile(model, mode="default")
+        print("[raune-filter] Applied torch.compile (inductor backend)",
+              file=sys.stderr, flush=True)
 
     # Dispatch to single-process or pipe mode
     if args.input:
