@@ -49,11 +49,21 @@ impl DoreaConfig {
     /// Returns `Default` if no config file is found (not an error).
     pub fn load() -> Self {
         if let Ok(path) = std::env::var("DOREA_CONFIG") {
-            if let Some(cfg) = Self::try_load(&PathBuf::from(&path)) {
-                log::debug!("Loaded config from $DOREA_CONFIG: {path}");
-                return cfg;
+            let p = PathBuf::from(&path);
+            if !p.exists() {
+                log::warn!("$DOREA_CONFIG={path} does not exist — using defaults");
+            } else {
+                // When the user explicitly sets DOREA_CONFIG, parse errors are fatal.
+                let text = std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("cannot read $DOREA_CONFIG={path}: {e}"));
+                match toml::from_str::<Self>(&text) {
+                    Ok(cfg) => {
+                        log::debug!("Loaded config from $DOREA_CONFIG: {path}");
+                        return cfg;
+                    }
+                    Err(e) => panic!("$DOREA_CONFIG={path} is invalid TOML: {e}"),
+                }
             }
-            log::warn!("$DOREA_CONFIG={path} does not exist or is invalid — using defaults");
         }
 
         if let Some(cfg) = Self::try_load(&PathBuf::from("dorea.toml")) {

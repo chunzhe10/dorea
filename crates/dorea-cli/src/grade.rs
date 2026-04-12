@@ -40,10 +40,7 @@ pub struct GradeArgs {
     #[arg(long)]
     pub raune_proxy_size: Option<usize>,
 
-    /// Frames per RAUNE batch (config: [grade].direct_batch_size, default: 8).
-    /// fp16 RAUNE halves activation memory vs fp32; batch=8 fp16 ≈ batch=4 fp32
-    /// footprint — known-safe on RTX 3060 (6 GB). Values above 8 show diminishing
-    /// returns; 16+ regresses throughput due to per-frame upload overhead.
+    /// Frames per RAUNE batch [default: 8, max: 32].
     #[arg(long)]
     pub direct_batch_size: Option<usize>,
 
@@ -61,6 +58,20 @@ pub struct GradeArgs {
 }
 
 pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
+    // Catch legacy subcommand names used as positional input
+    let input_str = args.input.to_string_lossy();
+    if matches!(input_str.as_ref(), "grade" | "calibrate" | "preview" | "probe") {
+        anyhow::bail!(
+            "The '{}' subcommand was removed. Use: dorea <input-file>\n\
+             Example: dorea clip.mp4 --output graded.mp4",
+            input_str
+        );
+    }
+
+    if !args.input.is_file() {
+        anyhow::bail!("input file not found: {}", args.input.display());
+    }
+
     // Resolve config → CLI → built-in defaults
     let python = args.python
         .or_else(|| cfg.models.python.clone())
@@ -147,7 +158,6 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
 
     let pipeline_cfg = PipelineConfig {
         input: args.input,
-        input_encoding,
         output_codec,
         output,
         python,
@@ -155,6 +165,8 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         raune_models_dir,
         raune_proxy_size,
         batch_size,
+        proxy_w,
+        proxy_h,
     };
 
     let frame_count = pipeline::grading::run(&pipeline_cfg, &info)?;

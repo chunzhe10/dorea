@@ -74,3 +74,8 @@ CLI flags always override config values. See `dorea --help` for the full list.
 ## Breaking changes from previous `dorea`
 
 This release removes the `calibrate`, `preview`, and `probe` subcommands and the entire 3D LUT / depth-zones / YOLO-seg / Maxine pipeline. `dorea grade` is gone; the new form is `dorea <input>` with `<input>` as a positional argument (no `--input` flag). Existing `dorea.toml` files will parse but fields for removed features (`[maxine]`, `[preview]`, `[inference]`, most of `[grade]`) are silently ignored.
+
+```bash
+# Before:  dorea grade --input clip.mp4 --output graded.mp4
+# After:   dorea clip.mp4 --output graded.mp4
+```

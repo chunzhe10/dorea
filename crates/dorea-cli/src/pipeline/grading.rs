@@ -13,26 +13,22 @@ use crate::pipeline::PipelineConfig;
 pub fn run(cfg: &PipelineConfig, info: &VideoInfo) -> Result<u64> {
     use std::process::{Command, Stdio};
 
-    let (proxy_w, proxy_h) = dorea_video::resize::proxy_dims(
-        info.width, info.height, cfg.raune_proxy_size,
-    );
-
     // Map output codec to PyAV codec name
     let pyav_codec = match cfg.output_codec {
         OutputCodec::Hevc10 => "hevc",
         OutputCodec::H264 => "h264",
-        _ => "prores_ks",
+        OutputCodec::ProRes => "prores_ks",
     };
 
     log::info!(
         "Grading: RAUNE proxy {}x{} batch={}, full-res {}x{}, codec={}",
-        proxy_w, proxy_h, cfg.batch_size, info.width, info.height, pyav_codec,
+        cfg.proxy_w, cfg.proxy_h, cfg.batch_size, info.width, info.height, pyav_codec,
     );
 
     let python_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent().and_then(|p| p.parent())
         .map(|p| p.join("python"))
-        .unwrap_or_default();
+        .expect("CARGO_MANIFEST_DIR must have two parent directories");
 
     // Fail-fast UTF-8 path validation — no silent fallbacks.
     let raune_weights_str = cfg.raune_weights.to_str()
@@ -52,8 +48,8 @@ pub fn run(cfg: &PipelineConfig, info: &VideoInfo) -> Result<u64> {
             "--models-dir", raune_models_dir_str,
             "--full-width", &info.width.to_string(),
             "--full-height", &info.height.to_string(),
-            "--proxy-width", &proxy_w.to_string(),
-            "--proxy-height", &proxy_h.to_string(),
+            "--proxy-width", &cfg.proxy_w.to_string(),
+            "--proxy-height", &cfg.proxy_h.to_string(),
             "--batch-size", &cfg.batch_size.to_string(),
             "--input", input_str,
             "--output", output_str,
@@ -70,6 +66,5 @@ pub fn run(cfg: &PipelineConfig, info: &VideoInfo) -> Result<u64> {
         anyhow::bail!("raune_filter exited with {status}");
     }
 
-    // The filter reports frame count via stderr; return total frames from info
     Ok(info.frame_count)
 }
