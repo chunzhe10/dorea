@@ -548,100 +548,6 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Legacy pipe mode (stdin/stdout rgb48le)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def run_pipe_mode(args, model, normalize, model_dtype):
-    """Read rgb48le from stdin, process, write rgb48le to stdout."""
-    fw, fh = args.full_width, args.full_height
-    pw, ph = args.proxy_width, args.proxy_height
-    full_frame_bytes = fw * fh * 3 * 2  # rgb48le
-    batch_size = args.batch_size
-
-    print(f"[raune-filter] pipe mode: full={fw}x{fh}, proxy={pw}x{ph}, "
-          f"batch={batch_size}, dtype={model_dtype}",
-          file=sys.stderr, flush=True)
-
-    stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
-    frame_count = 0
-    read_buf = bytearray(full_frame_bytes)
-
-    while True:
-        batch_raw = []
-        for _ in range(batch_size):
-            n_read = stdin.readinto(read_buf)
-            if n_read is None or n_read < full_frame_bytes:
-                break
-            batch_raw.append(bytes(read_buf))
-
-        if not batch_raw:
-            break
-
-        n = len(batch_raw)
-
-        with torch.no_grad():
-            proxy_tensors = []
-            for raw in batch_raw:
-                arr_u16 = np.frombuffer(raw, dtype=np.uint16).reshape(fh, fw, 3)
-                full_t = torch.from_numpy(arr_u16.astype(np.float32)).cuda() / 65535.0
-                full_t = full_t.permute(2, 0, 1).unsqueeze(0)
-                proxy_t = F.interpolate(full_t, size=(ph, pw), mode="bilinear", align_corners=False)
-                proxy_norm = (proxy_t - 0.5) / 0.5
-                proxy_tensors.append(proxy_norm.squeeze(0))
-                del full_t
-
-            proxy_batch = torch.stack(proxy_tensors).cuda()
-            del proxy_tensors
-
-            if proxy_batch.dtype != model_dtype:
-                proxy_batch = proxy_batch.to(model_dtype)
-
-            raune_out = model(proxy_batch).float()
-            raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
-
-            rh, rw = raune_out.shape[2], raune_out.shape[3]
-            if rh != ph or rw != pw:
-                raune_out = F.interpolate(raune_out, size=(ph, pw), mode="bilinear", align_corners=False)
-
-            orig_proxy = (proxy_batch.float() * 0.5 + 0.5).clamp(0.0, 1.0)
-            del proxy_batch
-
-            raune_lab = rgb_to_lab(raune_out)
-            orig_lab = rgb_to_lab(orig_proxy)
-            delta_lab = raune_lab - orig_lab
-            del raune_out, orig_proxy, raune_lab, orig_lab
-
-            delta_full = F.interpolate(delta_lab, size=(fh, fw), mode="bilinear", align_corners=False)
-            del delta_lab
-
-            for i in range(n):
-                arr_u16 = np.frombuffer(batch_raw[i], dtype=np.uint16).reshape(fh, fw, 3)
-                full_t = torch.from_numpy(arr_u16.astype(np.float32)).cuda() / 65535.0
-                full_t = full_t.permute(2, 0, 1).unsqueeze(0)
-
-                full_lab = rgb_to_lab(full_t)
-                full_lab = full_lab + delta_full[i:i+1]
-                result = lab_to_rgb(full_lab)
-                del full_lab, full_t
-
-                result_u16 = (result.squeeze(0).permute(1, 2, 0) * 65535.0
-                              ).clamp(0, 65535).to(torch.int32).cpu().numpy().astype(np.uint16)
-                stdout.write(result_u16.tobytes())
-                del result, result_u16
-
-            del delta_full
-
-        stdout.flush()
-        frame_count += n
-        if frame_count % (batch_size * 4) == 0:
-            print(f"[raune-filter] {frame_count} frames", file=sys.stderr, flush=True)
-
-    print(f"[raune-filter] done: {frame_count} frames", file=sys.stderr, flush=True)
-    return frame_count
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -699,14 +605,11 @@ def main():
 
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 
-    # Dispatch to single-process or pipe mode
-    if args.input:
-        if not args.output:
-            print("error: --output required with --input", file=sys.stderr)
-            sys.exit(1)
-        run_single_process(args, model, normalize, model_dtype)
-    else:
-        run_pipe_mode(args, model, normalize, model_dtype)
+    # Single-process mode only (pipe mode removed)
+    if not args.input or not args.output:
+        print("error: --input and --output are required", file=sys.stderr)
+        sys.exit(1)
+    run_single_process(args, model, normalize, model_dtype)
 
 
 if __name__ == "__main__":
