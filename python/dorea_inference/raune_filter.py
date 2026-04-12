@@ -253,7 +253,7 @@ def run_single_process(args, model, normalize, model_dtype):
 
     # ─── 3-thread pipeline: decoder → GPU → encoder ────────────────────────
     # Bounded queues provide backpressure (memory bound: ~200MB at 4K)
-    q_decoded = queue.Queue(maxsize=2)   # holds: list[np.ndarray] (one batch)
+    q_decoded = queue.Queue(maxsize=2)   # holds: list[np.ndarray] uint16 (~794 MB at 4K, batch=8)
     q_processed = queue.Queue(maxsize=2) # holds: list[np.ndarray] (one batch)
 
     # Shared error state
@@ -309,12 +309,11 @@ def run_single_process(args, model, normalize, model_dtype):
                     if stop_event.is_set():
                         return
                     t0 = time.perf_counter()
-                    rgb = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
+                    rgb = frame.to_ndarray(format="rgb48le")  # (H, W, 3) uint16
                     if rgb.shape[1] != fw or rgb.shape[0] != fh:
-                        rgb = np.array(
-                            frame.to_image().resize((fw, fh)),
-                            dtype=np.uint8,
-                        )
+                        # PyAV reformat preserves 16-bit (PIL .to_image() is 8-bit)
+                        frame_resized = frame.reformat(width=fw, height=fh, format="rgb48le")
+                        rgb = frame_resized.to_ndarray(format="rgb48le")
                     decode_busy += time.perf_counter() - t0
                     batch.append(rgb)
                     if len(batch) >= batch_size:
