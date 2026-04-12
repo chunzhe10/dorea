@@ -375,7 +375,7 @@ def run_single_process(args, model, normalize, model_dtype):
                     return
                 for result_np in results:
                     t0 = time.perf_counter()
-                    out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
+                    out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb48le")
                     out_frame.pts = encoded_count
                     for pkt in out_stream.encode(out_frame):
                         out_container.mux(pkt)
