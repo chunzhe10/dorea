@@ -60,6 +60,10 @@ pub fn run(cfg: &PipelineConfig, info: &VideoInfo) -> Result<u64> {
         cmd.arg("--tensorrt");
     }
 
+    if cfg.nvdec {
+        cmd.arg("--nvdec");
+    }
+
     let mut raune_proc = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())

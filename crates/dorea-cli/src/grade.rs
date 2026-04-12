@@ -59,6 +59,10 @@ pub struct GradeArgs {
     /// Use TensorRT FP16 engine for RAUNE-Net inference (requires tensorrt-cu12 in venv).
     #[arg(long)]
     pub tensorrt: bool,
+
+    /// Use NVDEC hardware decode for input video (requires CUDA-capable GPU).
+    #[arg(long)]
+    pub nvdec: bool,
 }
 
 pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
@@ -172,6 +176,7 @@ pub fn run(args: GradeArgs, cfg: &crate::config::DoreaConfig) -> Result<()> {
         proxy_w,
         proxy_h,
         tensorrt: args.tensorrt,
+        nvdec: args.nvdec,
     };
 
     let frame_count = pipeline::grading::run(&pipeline_cfg, &info)?;

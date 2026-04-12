@@ -18,4 +18,5 @@ pub struct PipelineConfig {
     pub proxy_w: usize,
     pub proxy_h: usize,
     pub tensorrt: bool,
+    pub nvdec: bool,
 }
