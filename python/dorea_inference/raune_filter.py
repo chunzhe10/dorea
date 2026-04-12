@@ -1,19 +1,17 @@
-"""RAUNE-Net OKLab chroma transfer — single-process, zero-pipe.
+"""RAUNE-Net OKLab chroma transfer — single-process, 10-bit.
 
-Decodes input video via PyAV, processes on GPU, encodes output via PyAV.
-No stdin/stdout pipe I/O — all frame data stays in-process.
+Decodes input video via PyAV (rgb48le for 10-bit preservation), processes
+on GPU with int32 frame cache to avoid redundant PCIe transfers, encodes
+output via PyAV (rgb48le → yuv422p10le for ProRes).
 
 Pipeline per batch:
-  1. PyAV decode → numpy → GPU upload
+  1. PyAV decode (rgb48le uint16) → numpy → int32 GPU upload (cached)
   2. Downscale to proxy on GPU (torch.interpolate)
-  3. Batch RAUNE inference on proxy
-  4. OKLab delta computation at proxy on GPU
-  5. Upscale deltas to full-res on GPU (Triton kernel)
-  6. Full-res OKLab transfer via fused Triton kernel
-  7. GPU download → PyAV encode
-
-Supports both single-process mode (--input/--output) and legacy pipe mode
-(reads rgb48le from stdin, writes to stdout) for backward compatibility.
+  3. Batch RAUNE inference on proxy (fp16)
+  4. OKLab delta computation at proxy on GPU (fp32)
+  5. Upscale deltas to full-res on GPU
+  6. Full-res OKLab transfer via fused Triton kernel (fp32 in, fp16 out)
+  7. GPU download (uint16) → PyAV encode (rgb48le)
 """
 
 import sys
@@ -173,10 +171,12 @@ if _USE_TRITON:
 def triton_oklab_transfer(frame_nchw_f32, delta_nchw_f32):
     """Fused Triton kernel: entire OKLab transfer in one kernel launch."""
     _, C, H, W = frame_nchw_f32.shape
-    frame_flat = frame_nchw_f32.squeeze(0).half().reshape(3, -1).contiguous()
-    delta_flat = delta_nchw_f32.squeeze(0).half().reshape(3, -1).contiguous()
+    # Pass fp32 to kernel — avoid precision loss before nonlinear transforms.
+    # Kernel output stays fp16 (sufficient for 10-bit).
+    frame_flat = frame_nchw_f32.squeeze(0).reshape(3, -1).contiguous()   # fp32
+    delta_flat = delta_nchw_f32.squeeze(0).reshape(3, -1).contiguous()   # fp32
     n_pixels = H * W
-    out_flat = torch.empty_like(frame_flat)
+    out_flat = torch.empty(3, n_pixels, dtype=torch.float16, device=frame_flat.device)
 
     BLOCK_SIZE = 1024
     grid = ((n_pixels + BLOCK_SIZE - 1) // BLOCK_SIZE,)
@@ -253,7 +253,7 @@ def run_single_process(args, model, normalize, model_dtype):
 
     # ─── 3-thread pipeline: decoder → GPU → encoder ────────────────────────
     # Bounded queues provide backpressure (memory bound: ~200MB at 4K)
-    q_decoded = queue.Queue(maxsize=2)   # holds: list[np.ndarray] (one batch)
+    q_decoded = queue.Queue(maxsize=2)   # holds: list[np.ndarray] uint16 (~794 MB at 4K, batch=8)
     q_processed = queue.Queue(maxsize=2) # holds: list[np.ndarray] (one batch)
 
     # Shared error state
@@ -309,12 +309,11 @@ def run_single_process(args, model, normalize, model_dtype):
                     if stop_event.is_set():
                         return
                     t0 = time.perf_counter()
-                    rgb = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
+                    rgb = frame.to_ndarray(format="rgb48le")  # (H, W, 3) uint16
                     if rgb.shape[1] != fw or rgb.shape[0] != fh:
-                        rgb = np.array(
-                            frame.to_image().resize((fw, fh)),
-                            dtype=np.uint8,
-                        )
+                        # PyAV reformat preserves 16-bit (PIL .to_image() is 8-bit)
+                        frame_resized = frame.reformat(width=fw, height=fh, format="rgb48le")
+                        rgb = frame_resized.to_ndarray(format="rgb48le")
                     decode_busy += time.perf_counter() - t0
                     batch.append(rgb)
                     if len(batch) >= batch_size:
@@ -376,7 +375,7 @@ def run_single_process(args, model, normalize, model_dtype):
                     return
                 for result_np in results:
                     t0 = time.perf_counter()
-                    out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb24")
+                    out_frame = av.VideoFrame.from_ndarray(result_np, format="rgb48le")
                     out_frame.pts = encoded_count
                     for pkt in out_stream.encode(out_frame):
                         out_container.mux(pkt)
@@ -473,23 +472,30 @@ def run_single_process(args, model, normalize, model_dtype):
 
 
 def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn, model_dtype):
-    """Process a batch of frames on GPU. Returns list of uint8 HWC numpy arrays."""
+    """Process a batch of frames on GPU. Returns list of uint16 HWC numpy arrays."""
     n = len(batch_frames_np)
     results = []
 
     with torch.no_grad():
-        # Build proxy batch for RAUNE
+        # Upload once as int32, keep on GPU for reuse in apply loop.
+        # int32 because PyTorch has no uint16 — torch.from_numpy(uint16)
+        # reinterprets as int16 (signed), corrupting values > 32767.
+        full_gpu_cache = []
         proxy_tensors = []
         for rgb_np in batch_frames_np:
-            # uint8 → float [0,1] on GPU
-            full_t = torch.from_numpy(rgb_np).cuda().float() / 255.0  # (H,W,3)
-            full_t = full_t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+            t_i32 = torch.from_numpy(rgb_np.astype(np.int32)).cuda()  # int32 on GPU
+            full_gpu_cache.append(t_i32)
+            full_f32 = t_i32.float() / 65535.0                   # (H,W,3) fp32 [0,1]
+            full_f32 = full_f32.permute(2, 0, 1).unsqueeze(0)    # (1,3,H,W)
             # Downscale to proxy
-            proxy_t = F.interpolate(full_t, size=(ph, pw), mode="bilinear", align_corners=False)
+            proxy_t = F.interpolate(full_f32, size=(ph, pw), mode="bilinear", align_corners=False)
             proxy_norm = (proxy_t - 0.5) / 0.5  # Normalize for RAUNE: [0,1] → [-1,1]
             proxy_tensors.append(proxy_norm.squeeze(0))
-            del full_t
+            del full_f32                                          # free fp32, keep int32
 
+        # RAUNE inference + OKLab delta — unchanged from 8-bit path.
+        # The proxy normalization produces [-1, 1] range regardless of whether
+        # the source was 8-bit or 10-bit, so this section is unaffected.
         proxy_batch = torch.stack(proxy_tensors).cuda()
         del proxy_tensors
 
@@ -522,117 +528,23 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         delta_full = F.interpolate(delta_lab, size=(fh, fw), mode="bilinear", align_corners=False)
         del delta_lab
 
-        # Apply transfer per frame
+        # Apply transfer per frame — reuse GPU cache, no re-upload
         for i in range(n):
-            full_t = torch.from_numpy(batch_frames_np[i]).cuda().float() / 255.0
+            full_t = full_gpu_cache[i].float() / 65535.0
             full_t = full_t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
 
             result = transfer_fn(full_t, delta_full[i:i+1])
             del full_t
 
-            # GPU → CPU → uint8
-            result_u8 = (result.squeeze(0).permute(1, 2, 0).clamp(0, 1) * 255.0
-                         ).to(torch.uint8).cpu().numpy()
-            results.append(result_u8)
+            # GPU → CPU → uint16 (round-half-up to avoid systematic -0.5 LSB bias)
+            result_u16 = (result.squeeze(0).permute(1, 2, 0).clamp(0, 1) * 65535.0 + 0.5
+                         ).to(torch.int32).cpu().numpy().astype(np.uint16)
+            results.append(result_u16)
             del result
 
-        del delta_full
+        del full_gpu_cache, delta_full
 
     return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Legacy pipe mode (stdin/stdout rgb48le)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def run_pipe_mode(args, model, normalize, model_dtype):
-    """Read rgb48le from stdin, process, write rgb48le to stdout."""
-    fw, fh = args.full_width, args.full_height
-    pw, ph = args.proxy_width, args.proxy_height
-    full_frame_bytes = fw * fh * 3 * 2  # rgb48le
-    batch_size = args.batch_size
-
-    print(f"[raune-filter] pipe mode: full={fw}x{fh}, proxy={pw}x{ph}, "
-          f"batch={batch_size}, dtype={model_dtype}",
-          file=sys.stderr, flush=True)
-
-    stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
-    frame_count = 0
-    read_buf = bytearray(full_frame_bytes)
-
-    while True:
-        batch_raw = []
-        for _ in range(batch_size):
-            n_read = stdin.readinto(read_buf)
-            if n_read is None or n_read < full_frame_bytes:
-                break
-            batch_raw.append(bytes(read_buf))
-
-        if not batch_raw:
-            break
-
-        n = len(batch_raw)
-
-        with torch.no_grad():
-            proxy_tensors = []
-            for raw in batch_raw:
-                arr_u16 = np.frombuffer(raw, dtype=np.uint16).reshape(fh, fw, 3)
-                full_t = torch.from_numpy(arr_u16.astype(np.float32)).cuda() / 65535.0
-                full_t = full_t.permute(2, 0, 1).unsqueeze(0)
-                proxy_t = F.interpolate(full_t, size=(ph, pw), mode="bilinear", align_corners=False)
-                proxy_norm = (proxy_t - 0.5) / 0.5
-                proxy_tensors.append(proxy_norm.squeeze(0))
-                del full_t
-
-            proxy_batch = torch.stack(proxy_tensors).cuda()
-            del proxy_tensors
-
-            if proxy_batch.dtype != model_dtype:
-                proxy_batch = proxy_batch.to(model_dtype)
-
-            raune_out = model(proxy_batch).float()
-            raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
-
-            rh, rw = raune_out.shape[2], raune_out.shape[3]
-            if rh != ph or rw != pw:
-                raune_out = F.interpolate(raune_out, size=(ph, pw), mode="bilinear", align_corners=False)
-
-            orig_proxy = (proxy_batch.float() * 0.5 + 0.5).clamp(0.0, 1.0)
-            del proxy_batch
-
-            raune_lab = rgb_to_lab(raune_out)
-            orig_lab = rgb_to_lab(orig_proxy)
-            delta_lab = raune_lab - orig_lab
-            del raune_out, orig_proxy, raune_lab, orig_lab
-
-            delta_full = F.interpolate(delta_lab, size=(fh, fw), mode="bilinear", align_corners=False)
-            del delta_lab
-
-            for i in range(n):
-                arr_u16 = np.frombuffer(batch_raw[i], dtype=np.uint16).reshape(fh, fw, 3)
-                full_t = torch.from_numpy(arr_u16.astype(np.float32)).cuda() / 65535.0
-                full_t = full_t.permute(2, 0, 1).unsqueeze(0)
-
-                full_lab = rgb_to_lab(full_t)
-                full_lab = full_lab + delta_full[i:i+1]
-                result = lab_to_rgb(full_lab)
-                del full_lab, full_t
-
-                result_u16 = (result.squeeze(0).permute(1, 2, 0) * 65535.0
-                              ).clamp(0, 65535).to(torch.int32).cpu().numpy().astype(np.uint16)
-                stdout.write(result_u16.tobytes())
-                del result, result_u16
-
-            del delta_full
-
-        stdout.flush()
-        frame_count += n
-        if frame_count % (batch_size * 4) == 0:
-            print(f"[raune-filter] {frame_count} frames", file=sys.stderr, flush=True)
-
-    print(f"[raune-filter] done: {frame_count} frames", file=sys.stderr, flush=True)
-    return frame_count
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -693,14 +605,11 @@ def main():
 
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 
-    # Dispatch to single-process or pipe mode
-    if args.input:
-        if not args.output:
-            print("error: --output required with --input", file=sys.stderr)
-            sys.exit(1)
-        run_single_process(args, model, normalize, model_dtype)
-    else:
-        run_pipe_mode(args, model, normalize, model_dtype)
+    # Single-process mode only (pipe mode removed)
+    if not args.input or not args.output:
+        print("error: --input and --output are required", file=sys.stderr)
+        sys.exit(1)
+    run_single_process(args, model, normalize, model_dtype)
 
 
 if __name__ == "__main__":
