@@ -6,7 +6,9 @@ and zero-copy inference with PyTorch CUDA tensors.
 
 import hashlib
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -25,6 +27,15 @@ def _require_tensorrt():
         )
 
 
+def _streaming_sha256(path: str) -> str:
+    """SHA-256 hash of a file using streaming reads (constant memory)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class RauneTRTEngine:
     """TensorRT engine for RAUNE-Net inference."""
 
@@ -39,7 +50,7 @@ class RauneTRTEngine:
         fp16: bool,
     ) -> str:
         """Deterministic cache key for engine invalidation."""
-        onnx_hash = hashlib.md5(Path(onnx_path).read_bytes()).hexdigest()
+        onnx_hash = _streaming_sha256(onnx_path)
         sig = json.dumps({
             "onnx": onnx_hash,
             "sm": f"{compute_cap[0]}.{compute_cap[1]}",
@@ -65,9 +76,7 @@ class RauneTRTEngine:
 
         logger = trt.Logger(trt.Logger.WARNING)
         builder = trt.Builder(logger)
-        network = builder.create_network(
-            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        )
+        network = builder.create_network()
         parser = trt.OnnxParser(network, logger)
 
         with open(onnx_path, "rb") as f:
@@ -78,10 +87,11 @@ class RauneTRTEngine:
                 raise RuntimeError("Failed to parse ONNX model")
 
         config = builder.create_builder_config()
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 31)  # 2GB
 
         if fp16:
             config.set_flag(trt.BuilderFlag.FP16)
+            config.set_flag(trt.BuilderFlag.PREFER_PRECISION_CONSTRAINTS)
 
         profile = builder.create_optimization_profile()
         profile.set_shape(
@@ -93,16 +103,24 @@ class RauneTRTEngine:
         config.add_optimization_profile(profile)
 
         print(f"[trt-engine] Building engine: {batch_size}x3x{height}x{width}, "
-              f"fp16={fp16}. This takes 2-5 minutes...",
+              f"fp16={fp16}, workspace=2GB. This takes 2-5 minutes...",
               file=sys.stderr, flush=True)
 
         serialized = builder.build_serialized_network(network, config)
         if serialized is None:
             raise RuntimeError("TensorRT engine build failed")
 
-        Path(engine_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(engine_path, "wb") as f:
-            f.write(serialized)
+        # Atomic write: write to temp file, then rename
+        parent = Path(engine_path).parent
+        parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=str(parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(serialized)
+            os.rename(tmp_path, engine_path)
+        except BaseException:
+            os.unlink(tmp_path)
+            raise
 
         print(f"[trt-engine] Engine saved to {engine_path} "
               f"({Path(engine_path).stat().st_size / 1e6:.1f} MB)",
@@ -137,21 +155,6 @@ class RauneTRTEngine:
 
         return cls(engine_path)
 
-    # Map TRT DataType to torch dtype
-    _TRT_TO_TORCH = None
-
-    @staticmethod
-    def _trt_dtype_to_torch(trt_dtype) -> torch.dtype:
-        """Convert TensorRT dtype to PyTorch dtype."""
-        if RauneTRTEngine._TRT_TO_TORCH is None:
-            RauneTRTEngine._TRT_TO_TORCH = {
-                trt.DataType.FLOAT: torch.float32,
-                trt.DataType.HALF: torch.float16,
-                trt.DataType.INT8: torch.int8,
-                trt.DataType.INT32: torch.int32,
-            }
-        return RauneTRTEngine._TRT_TO_TORCH[trt_dtype]
-
     def __init__(self, engine_path: str):
         """Deserialize engine from disk."""
         _require_tensorrt()
@@ -168,26 +171,33 @@ class RauneTRTEngine:
         self.stream = torch.cuda.Stream()
 
         # Cache engine I/O dtypes for tensor casting in infer()
-        self._input_dtype = self._trt_dtype_to_torch(
-            self.engine.get_tensor_dtype("input")
-        )
-        self._output_dtype = self._trt_dtype_to_torch(
-            self.engine.get_tensor_dtype("output")
-        )
+        _dtype_map = {
+            trt.DataType.FLOAT: torch.float32,
+            trt.DataType.HALF: torch.float16,
+            trt.DataType.INT8: torch.int8,
+            trt.DataType.INT32: torch.int32,
+        }
+        self._input_dtype = _dtype_map[self.engine.get_tensor_dtype("input")]
+        self._output_dtype = _dtype_map[self.engine.get_tensor_dtype("output")]
+
+        # Pre-allocate output tensor (reused across calls to avoid cudaMalloc)
+        self._output_buf: torch.Tensor | None = None
 
     def infer(self, input_tensor: torch.Tensor) -> torch.Tensor:
         """Run inference on a CUDA tensor.
 
-        Input: (B,3,H,W) CUDA tensor (any float dtype).
+        Input: (B,3,H,W) CUDA tensor (any float dtype, must be contiguous).
         Returns: (B,3,H',W') tensor in the same dtype as input.
 
         Note: RAUNE-Net may trim spatial dimensions (e.g. H'=H-2) due to
         padding/conv architecture. The output shape is determined by the engine.
-        The engine's internal I/O dtype (typically fp32) may differ from the
-        caller's tensor dtype; casting is handled automatically.
         """
         caller_dtype = input_tensor.dtype
         B, C, H, W = input_tensor.shape
+
+        # Ensure contiguous memory layout for data_ptr()
+        if not input_tensor.is_contiguous():
+            input_tensor = input_tensor.contiguous()
 
         # Cast to engine's expected input dtype if needed
         if input_tensor.dtype != self._input_dtype:
@@ -195,20 +205,25 @@ class RauneTRTEngine:
 
         self.context.set_input_shape("input", (B, C, H, W))
 
-        # Query the actual output shape from the execution context
+        # Reuse output buffer if shape matches, else allocate
         out_shape = tuple(self.context.get_tensor_shape("output"))
-        output = torch.empty(out_shape, dtype=self._output_dtype,
-                             device=input_tensor.device)
+        if self._output_buf is None or self._output_buf.shape != out_shape:
+            self._output_buf = torch.empty(
+                out_shape, dtype=self._output_dtype, device=input_tensor.device
+            )
 
         self.context.set_tensor_address("input", input_tensor.data_ptr())
-        self.context.set_tensor_address("output", output.data_ptr())
+        self.context.set_tensor_address("output", self._output_buf.data_ptr())
 
-        # Synchronize the default stream so the input tensor is fully
-        # materialized before TRT reads it on self.stream.
-        torch.cuda.current_stream().synchronize()
+        # Use CUDA event for inter-stream dependency (no CPU stall)
+        event = torch.cuda.current_stream().record_event()
+        self.stream.wait_event(event)
 
         self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
         self.stream.synchronize()
+
+        # Clone output so the buffer can be reused on next call
+        output = self._output_buf.clone()
 
         # Cast back to caller's dtype
         if output.dtype != caller_dtype:

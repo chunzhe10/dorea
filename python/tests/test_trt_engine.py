@@ -111,8 +111,12 @@ class TestTRTEngine:
         x = torch.randn(1, 3, 270, 480, device="cuda", dtype=torch.float16)
         trt_out = engine.infer(x)
 
-        # PyTorch reference (fp16)
+        # PyTorch reference — match production: fp16 with InstanceNorm kept in fp32
+        import torch.nn as nn
         pt_model = _load_pytorch_model().cuda().half()
+        for m in pt_model.modules():
+            if isinstance(m, (nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)):
+                m.float()
         with torch.no_grad():
             pt_out = pt_model(x)
 
@@ -122,11 +126,11 @@ class TestTRTEngine:
             trt_out = F.interpolate(trt_out.float(), size=pt_out.shape[2:],
                                     mode="bilinear", align_corners=False).half()
 
-        # FP16 TRT vs FP16 PyTorch — PSNR > 30dB (wider tolerance for TRT kernel fusion)
+        # FP16 TRT vs production FP16 PyTorch — PSNR > 40dB per spec
+        # Signal range [-1,1] → peak signal squared = (1-(-1))^2 = 4.0
         mse = torch.mean((trt_out.float() - pt_out.float()) ** 2)
-        if mse > 0:
-            psnr = 10 * torch.log10(4.0 / mse)
-            assert psnr > 30, f"PSNR {psnr:.1f}dB < 30dB threshold"
+        psnr = 10 * torch.log10(4.0 / mse.clamp(min=1e-10))
+        assert psnr > 40, f"PSNR {psnr:.1f}dB < 40dB threshold"
 
     def test_cache_key_changes_with_gpu(self, onnx_path):
         from dorea_inference.trt_engine import RauneTRTEngine

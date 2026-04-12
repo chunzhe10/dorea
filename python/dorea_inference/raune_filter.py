@@ -199,7 +199,7 @@ def pytorch_oklab_transfer(frame_nchw_f32, delta_nchw_f32):
 # Single-process mode (PyAV decode + encode, zero pipes)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_single_process(args, model, normalize, model_dtype):
+def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
     """Decode → GPU process → encode, all in one process via PyAV."""
     import av
 
@@ -346,7 +346,7 @@ def run_single_process(args, model, normalize, model_dtype):
                     results = _process_batch(
                         batch, model, normalize,
                         fw, fh, pw, ph, transfer_fn,
-                        model_dtype,
+                        model_dtype, _use_trt=_use_trt,
                     )
                 except torch.cuda.OutOfMemoryError:
                     print(
@@ -472,7 +472,7 @@ def run_single_process(args, model, normalize, model_dtype):
     return encoded_count
 
 
-def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn, model_dtype):
+def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn, model_dtype, _use_trt=False):
     """Process a batch of frames on GPU. Returns list of uint8 HWC numpy arrays."""
     n = len(batch_frames_np)
     results = []
@@ -498,11 +498,9 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
             proxy_batch = proxy_batch.to(model_dtype)
 
         # RAUNE inference
-        if hasattr(model, 'infer'):
-            # TRT engine path
+        if _use_trt:
             raune_out = model.infer(proxy_batch).float()
         else:
-            # PyTorch model path
             raune_out = model(proxy_batch).float()
         raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
 
@@ -594,10 +592,7 @@ def run_pipe_mode(args, model, normalize, model_dtype):
             if proxy_batch.dtype != model_dtype:
                 proxy_batch = proxy_batch.to(model_dtype)
 
-            if hasattr(model, 'infer'):
-                raune_out = model.infer(proxy_batch).float()
-            else:
-                raune_out = model(proxy_batch).float()
+            raune_out = model(proxy_batch).float()
             raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
 
             rh, rw = raune_out.shape[2], raune_out.shape[3]
@@ -666,6 +661,8 @@ def main():
                         help="TRT engine cache directory (default: <models-dir>/trt_cache)")
     parser.add_argument("--onnx-path", default=None,
                         help="Pre-exported ONNX model path (default: auto-export to <models-dir>/raune_net.onnx)")
+    parser.add_argument("--torch-compile", action="store_true",
+                        help="Apply torch.compile to PyTorch model (inductor backend, ~15-30%% speedup)")
     args = parser.parse_args()
 
     # Load RAUNE model — either TRT engine or PyTorch
@@ -680,14 +677,19 @@ def main():
         sys.path.insert(0, str(raune_dir))
 
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    _use_trt = args.tensorrt
 
     if args.tensorrt:
         from dorea_inference.trt_engine import RauneTRTEngine
         from dorea_inference.export_onnx import export_raune_onnx
 
-        # Resolve ONNX path
+        # Resolve ONNX path — validate if user-provided
         onnx_path = args.onnx_path
-        if onnx_path is None:
+        if onnx_path is not None:
+            if not Path(onnx_path).exists():
+                print(f"error: --onnx-path does not exist: {onnx_path}", file=sys.stderr)
+                sys.exit(1)
+        else:
             onnx_path = str(models_dir / "raune_net.onnx")
             if not Path(onnx_path).exists():
                 print(f"[raune-filter] Exporting ONNX to {onnx_path}...",
@@ -726,19 +728,17 @@ def main():
               f"({instance_norm_count} InstanceNorm layers kept in fp32, "
               f"model_dtype={model_dtype})",
               file=sys.stderr, flush=True)
-        # torch.compile for ~15-30% speedup on the PyTorch path.
-        # Must be called AFTER model.half() + InstanceNorm float() restoration
-        # so the compiled graph sees the final dtype layout.
-        model = torch.compile(model, mode="default")
-        print("[raune-filter] Applied torch.compile (inductor backend)",
-              file=sys.stderr, flush=True)
+        if args.torch_compile:
+            model = torch.compile(model, mode="default")
+            print("[raune-filter] Applied torch.compile (inductor backend)",
+                  file=sys.stderr, flush=True)
 
     # Dispatch to single-process or pipe mode
     if args.input:
         if not args.output:
             print("error: --output required with --input", file=sys.stderr)
             sys.exit(1)
-        run_single_process(args, model, normalize, model_dtype)
+        run_single_process(args, model, normalize, model_dtype, _use_trt=_use_trt)
     else:
         run_pipe_mode(args, model, normalize, model_dtype)
 

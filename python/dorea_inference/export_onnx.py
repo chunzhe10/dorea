@@ -46,32 +46,34 @@ def export_raune_onnx(
 
     dummy = torch.randn(1, 3, 540, 960)
 
-    raw_path = output + ".raw" if not output.endswith(".raw") else output
-    torch.onnx.export(
-        model,
-        dummy,
-        raw_path,
-        opset_version=opset,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes={
-            "input": {0: "batch", 2: "height", 3: "width"},
-            "output": {0: "batch", 2: "height", 3: "width"},
-        },
-    )
+    raw_path = output + ".raw"
+    try:
+        with torch.no_grad():
+            torch.onnx.export(
+                model,
+                dummy,
+                raw_path,
+                opset_version=opset,
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={
+                    "input": {0: "batch", 2: "height", 3: "width"},
+                    "output": {0: "batch", 2: "height", 3: "width"},
+                },
+            )
 
-    raw_model = onnx.load(raw_path)
-    simplified, ok = simplify(raw_model)
-    if not ok:
-        raise RuntimeError("onnxsim simplification failed — check model for unsupported ops")
+        raw_model = onnx.load(raw_path)
+        simplified, ok = simplify(raw_model)
+        if not ok:
+            raise RuntimeError("onnxsim simplification failed — check model for unsupported ops")
 
-    onnx.save(simplified, output)
-
-    raw = Path(raw_path)
-    if raw.exists() and raw_path != output:
-        raw.unlink()
-
-    onnx.checker.check_model(onnx.load(output))
+        # Validate in-memory before saving (avoids double disk load)
+        onnx.checker.check_model(simplified)
+        onnx.save(simplified, output)
+    finally:
+        raw = Path(raw_path)
+        if raw.exists():
+            raw.unlink()
 
     return output
 
