@@ -342,11 +342,19 @@ def run_single_process(args, model, normalize, model_dtype):
                 if batch is None:
                     return
                 t0 = time.perf_counter()
-                results = _process_batch(
-                    batch, model, normalize,
-                    fw, fh, pw, ph, transfer_fn,
-                    model_dtype,
-                )
+                try:
+                    results = _process_batch(
+                        batch, model, normalize,
+                        fw, fh, pw, ph, transfer_fn,
+                        model_dtype,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    print(
+                        f"[raune-filter] CUDA out of memory at batch={batch_size}. "
+                        f"Reduce with --direct-batch-size {max(1, batch_size // 2)}",
+                        file=sys.stderr, flush=True,
+                    )
+                    raise
                 gpu_busy += time.perf_counter() - t0
                 if not put_or_stop(q_processed, results, stop_event):
                     return

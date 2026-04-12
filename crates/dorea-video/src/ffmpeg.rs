@@ -166,7 +166,9 @@ pub fn probe(input: &Path) -> Result<VideoInfo, FfmpegError> {
             "-print_format", "json",
             "-show_streams",
             "-show_format",
-            input.to_str().unwrap_or(""),
+            input.to_str().ok_or_else(|| FfmpegError::InvalidMetadata(
+                format!("input path is not valid UTF-8: {}", input.display())
+            ))?,
         ])
         .output()
         .map_err(FfmpegError::NotFound)?;

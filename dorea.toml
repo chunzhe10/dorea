@@ -4,33 +4,11 @@
 
 [models]
 python          = "/opt/dorea-venv/bin/python"
-raune_weights   = "/workspaces/dorea-workspace/working/sea_thru_poc/models/RAUNE-Net/pretrained/RAUNENet/test/weights_95.pth"
-raune_models_dir = "/workspaces/dorea-workspace/working/sea_thru_poc"
-depth_model     = "/workspaces/dorea-workspace/models/depth_anything_v2_small"
-
-[inference]
-proxy_size = 518              # long-edge pixels for RAUNE + depth proxy decode
-# device = "cuda"             # uncomment to force cpu/cuda; default: auto-detect
+raune_weights   = "/workspaces/dorea-workspace/models/raune_net/weights_95.pth"
+raune_models_dir = "/workspaces/dorea-workspace/models/raune_net"
 
 [grade]
-warmth               = 1.0   # [0.0–2.0]
-strength             = 0.8   # LUT/HSL blend [0.0–1.0]
-contrast             = 1.0   # ambiance contrast [0.0–1.0]
-depth_skip_threshold = 0.005 # MSE keyframe threshold (lower = more keyframes)
-depth_max_interval   = 12    # max frames between forced keyframes
-fused_batch_size     = 32    # frames per RAUNE+depth inference batch
-depth_zones          = 16    # runtime adaptive zones per keyframe (16 + smooth blending = no banding)
-base_lut_zones       = 32    # base LUT zones per scene segment (color science)
-scene_threshold      = 0.15  # Wasserstein-1 depth distance to split scene segments [0.0–1.0]
-min_segment_keyframes = 3    # merge segments shorter than this into the previous one
-zone_smoothing_window = 3    # moving-average window for per-KF zone boundary smoothing
+# raune_proxy_size = 1440    # RAUNE input long-edge (default: 1440)
+# direct_batch_size = 8      # Frames per RAUNE batch (default: 8, max 32)
 # input_encoding = "auto"    # auto-detect from container/codec; options: dlog-m, ilog, srgb
 # output_codec = "auto"      # auto: prores for 10-bit, h264 for 8-bit; options: prores, hevc10, h264
-
-[maxine]
-upscale_factor     = 2       # SR factor: 2, 3, or 4 (used when SR is re-enabled)
-artifact_reduction = true    # artifact reduction before upscale
-
-[preview]
-frames = 8                   # contact sheet sample count [1–20]
-# warmth/strength/contrast inherit from [grade] if unset here

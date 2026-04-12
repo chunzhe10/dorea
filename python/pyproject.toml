@@ -5,13 +5,11 @@ build-backend = "setuptools.backends.legacy:build"
 [project]
 name = "dorea-inference"
 version = "0.1.0"
-description = "Dorea inference subprocess — RAUNE-Net + Depth Anything V2"
+description = "Dorea inference subprocess — RAUNE-Net chroma filter"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
-    "transformers>=4.38",
-    "Pillow>=10.0",
     "numpy>=1.24",
 ]
 
