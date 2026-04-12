@@ -199,7 +199,7 @@ def pytorch_oklab_transfer(frame_nchw_f32, delta_nchw_f32):
 # Single-process mode (PyAV decode + encode, zero pipes)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
+def run_single_process(args, model, normalize, model_dtype, _use_trt=False, _use_nvdec=False):
     """Decode → GPU process → encode, all in one process via PyAV."""
     import av
 
@@ -221,7 +221,14 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
         print("[raune-filter] Using PyTorch OKLab (Triton unavailable)", file=sys.stderr, flush=True)
 
     # Open input
-    in_container = av.open(args.input)
+    if _use_nvdec:
+        from av.codec.hwaccel import HWAccel
+        hwaccel = HWAccel(device_type='cuda', device=0,
+                          allow_software_fallback=False, is_hw_owned=True)
+        in_container = av.open(args.input, hwaccel=hwaccel)
+        print("[raune-filter] NVDEC hardware decode enabled", file=sys.stderr, flush=True)
+    else:
+        in_container = av.open(args.input)
     in_stream = in_container.streams.video[0]
     in_stream.thread_type = "AUTO"
     total_frames = in_stream.frames or 0
@@ -295,7 +302,7 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
     def decoder_thread() -> None:
         nonlocal decode_busy
         try:
-            batch: list[np.ndarray] = []
+            batch: list = []
             for packet in in_container.demux(in_stream):
                 if stop_event.is_set():
                     return
@@ -309,13 +316,19 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
                     if stop_event.is_set():
                         return
                     t0 = time.perf_counter()
-                    rgb = frame.to_ndarray(format="rgb48le")  # (H, W, 3) uint16
-                    if rgb.shape[1] != fw or rgb.shape[0] != fh:
-                        # PyAV reformat preserves 16-bit (PIL .to_image() is 8-bit)
-                        frame_resized = frame.reformat(width=fw, height=fh, format="rgb48le")
-                        rgb = frame_resized.to_ndarray(format="rgb48le")
-                    decode_busy += time.perf_counter() - t0
-                    batch.append(rgb)
+                    if _use_nvdec and frame.format.name == 'cuda':
+                        y = torch.from_dlpack(frame.planes[0].__dlpack__(stream=None)).clone()
+                        uv = torch.from_dlpack(frame.planes[1].__dlpack__(stream=None)).clone()
+                        decode_busy += time.perf_counter() - t0
+                        batch.append((y, uv))
+                    else:
+                        rgb = frame.to_ndarray(format="rgb48le")  # (H, W, 3) uint16
+                        if rgb.shape[1] != fw or rgb.shape[0] != fh:
+                            # PyAV reformat preserves 16-bit (PIL .to_image() is 8-bit)
+                            frame_resized = frame.reformat(width=fw, height=fh, format="rgb48le")
+                            rgb = frame_resized.to_ndarray(format="rgb48le")
+                        decode_busy += time.perf_counter() - t0
+                        batch.append(rgb)
                     if len(batch) >= batch_size:
                         if not put_or_stop(q_decoded, batch, stop_event):
                             return
@@ -482,16 +495,26 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         # reinterprets as int16 (signed), corrupting values > 32767.
         full_gpu_cache = []
         proxy_tensors = []
-        for rgb_np in batch_frames_np:
-            t_i32 = torch.from_numpy(rgb_np.astype(np.int32)).cuda()  # int32 on GPU
-            full_gpu_cache.append(t_i32)
-            full_f32 = t_i32.float() / 65535.0                   # (H,W,3) fp32 [0,1]
-            full_f32 = full_f32.permute(2, 0, 1).unsqueeze(0)    # (1,3,H,W)
-            # Downscale to proxy
-            proxy_t = F.interpolate(full_f32, size=(ph, pw), mode="bilinear", align_corners=False)
+        for item in batch_frames_np:
+            if isinstance(item, tuple):
+                from dorea_inference.nv12_to_rgb import nv12_to_rgb
+                y_plane, uv_plane = item
+                rgb_hwc = nv12_to_rgb(y_plane, uv_plane)  # (H,W,3) float32 [0,1]
+                del y_plane, uv_plane
+                full_nchw = rgb_hwc.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+                full_gpu_cache.append(full_nchw)
+                proxy_t = F.interpolate(full_nchw, size=(ph, pw), mode="bilinear", align_corners=False)
+                del rgb_hwc
+            else:
+                t_i32 = torch.from_numpy(item.astype(np.int32)).cuda()  # int32 on GPU
+                full_gpu_cache.append(t_i32)
+                full_nchw = t_i32.float() / 65535.0                   # (H,W,3) fp32 [0,1]
+                full_nchw = full_nchw.permute(2, 0, 1).unsqueeze(0)    # (1,3,H,W)
+                # Downscale to proxy
+                proxy_t = F.interpolate(full_nchw, size=(ph, pw), mode="bilinear", align_corners=False)
+                del full_nchw                                          # free fp32, keep int32
             proxy_norm = (proxy_t - 0.5) / 0.5  # Normalize for RAUNE: [0,1] → [-1,1]
             proxy_tensors.append(proxy_norm.squeeze(0))
-            del full_f32                                          # free fp32, keep int32
 
         # RAUNE inference + OKLab delta — unchanged from 8-bit path.
         # The proxy normalization produces [-1, 1] range regardless of whether
@@ -531,8 +554,12 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
 
         # Apply transfer per frame — reuse GPU cache, no re-upload
         for i in range(n):
-            full_t = full_gpu_cache[i].float() / 65535.0
-            full_t = full_t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+            cached = full_gpu_cache[i]
+            if cached.dim() == 4:
+                full_t = cached  # NVDEC path: already (1,3,H,W) float32
+            else:
+                full_t = cached.float() / 65535.0
+                full_t = full_t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
 
             result = transfer_fn(full_t, delta_full[i:i+1])
             del full_t
@@ -575,6 +602,8 @@ def main():
                         help="Pre-exported ONNX model path (default: auto-export to <models-dir>/raune_net.onnx)")
     parser.add_argument("--torch-compile", action="store_true",
                         help="Apply torch.compile to PyTorch model (inductor backend, ~15-30%% speedup)")
+    parser.add_argument("--nvdec", action="store_true",
+                        help="Use NVDEC hardware decode (requires CUDA-capable GPU)")
     args = parser.parse_args()
 
     # Load RAUNE model — either TRT engine or PyTorch
@@ -590,6 +619,7 @@ def main():
 
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     _use_trt = args.tensorrt
+    _use_nvdec = args.nvdec
 
     if args.tensorrt:
         from dorea_inference.trt_engine import RauneTRTEngine
@@ -649,7 +679,7 @@ def main():
     if not args.input or not args.output:
         print("error: --input and --output are required", file=sys.stderr)
         sys.exit(1)
-    run_single_process(args, model, normalize, model_dtype, _use_trt=_use_trt)
+    run_single_process(args, model, normalize, model_dtype, _use_trt=_use_trt, _use_nvdec=_use_nvdec)
 
 
 if __name__ == "__main__":
