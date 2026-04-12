@@ -173,10 +173,12 @@ if _USE_TRITON:
 def triton_oklab_transfer(frame_nchw_f32, delta_nchw_f32):
     """Fused Triton kernel: entire OKLab transfer in one kernel launch."""
     _, C, H, W = frame_nchw_f32.shape
-    frame_flat = frame_nchw_f32.squeeze(0).half().reshape(3, -1).contiguous()
-    delta_flat = delta_nchw_f32.squeeze(0).half().reshape(3, -1).contiguous()
+    # Pass fp32 to kernel — avoid precision loss before nonlinear transforms.
+    # Kernel output stays fp16 (sufficient for 10-bit).
+    frame_flat = frame_nchw_f32.squeeze(0).reshape(3, -1).contiguous()   # fp32
+    delta_flat = delta_nchw_f32.squeeze(0).reshape(3, -1).contiguous()   # fp32
     n_pixels = H * W
-    out_flat = torch.empty_like(frame_flat)
+    out_flat = torch.empty(3, n_pixels, dtype=torch.float16, device=frame_flat.device)
 
     BLOCK_SIZE = 1024
     grid = ((n_pixels + BLOCK_SIZE - 1) // BLOCK_SIZE,)
