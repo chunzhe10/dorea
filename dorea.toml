@@ -4,8 +4,8 @@
 
 [models]
 python          = "/opt/dorea-venv/bin/python"
-raune_weights   = "/workspaces/dorea-workspace/working/sea_thru_poc/models/RAUNE-Net/pretrained/RAUNENet/test/weights_95.pth"
-raune_models_dir = "/workspaces/dorea-workspace/working/sea_thru_poc"
+raune_weights   = "/workspaces/dorea-workspace/models/raune_net/weights_95.pth"
+raune_models_dir = "/workspaces/dorea-workspace/models/raune_net"
 
 [grade]
 # raune_proxy_size = 1440    # RAUNE input long-edge (default: 1440)

@@ -1,87 +1,76 @@
 # Dorea
 
-Automated underwater video color grading pipeline. Named after the Dorado
-constellation (the golden fish).
+Automated underwater video color grading — single-pass direct-mode pipeline.
+Named after the Dorado constellation.
 
-## v2 — Rust rewrite
+## Architecture
 
-Dorea v2 is a Rust workspace that ports the proven Python/NumPy algorithms from
-the Sea-Thru POC into a fast, maintainable native binary.
-
-### Architecture
+A thin Rust CLI (`dorea`) that probes input video, resolves config, and
+spawns a Python subprocess (`dorea_inference.raune_filter`) which does all
+the heavy lifting: PyAV decode, batched RAUNE-Net inference at proxy
+resolution on CUDA, OKLab delta computation, bilinear upscale to full
+resolution, fused Triton OKLab transfer, PyAV encode — all in a single
+producer-consumer 3-thread pipeline.
 
 ```
 crates/
-├── dorea-color   — D-Log M, sRGB↔LAB, RGB↔HSV color math
-├── dorea-lut     — Depth-stratified 33³ LUT build + trilinear apply
-├── dorea-hsl     — 6-vector HSL qualifier derive + apply
-├── dorea-cal     — .dorea-cal calibration file format (bincode)
-├── dorea-video   — Phase 2: ffmpeg NVDEC/NVENC integration (placeholder)
-└── dorea-cli     — `dorea` binary (calibrate / grade / preview)
+├── dorea-cli    — `dorea` binary (argument parsing, config, subprocess spawn)
+└── dorea-video  — ffmpeg probe, InputEncoding auto-detect, OutputCodec enum
+
+python/dorea_inference/
+├── raune_filter.py  — all runtime logic: decode → RAUNE → OKLab delta → encode
+└── __init__.py
 ```
 
-### Pipeline (Phase 1)
+## Hardware requirements
 
-```
-keyframes + depth maps + RAUNE targets
-         ↓
-dorea calibrate   →  calibration.dorea-cal
-         ↓
-dorea grade       →  graded video  (Phase 3)
-```
+- NVIDIA GPU with ≥ 6 GB VRAM (RTX 3060 or better) — required for RAUNE-Net fp16 inference + Triton OKLab transfer.
+- Linux workstation or devcontainer.
+- FFmpeg with HEVC/H.264 support.
 
-### Hardware requirements
-
-- Linux workstation (devcontainer or bare metal)
-- NVIDIA GPU with 6GB VRAM (RTX 3060 or better) — needed for RAUNE-Net inference (Phase 2)
-
-### Camera support
-
-- DJI Action 4 (D-Log M transfer function in `dorea-color::dlog_m`)
-- Insta360 X5 (pre-flattened via Insta360 Studio)
-
-## Quick start
+## Build
 
 ```bash
-# Build
-cargo build --release
-
-# Calibrate from keyframes
-# NOTE: --targets expects RAUNE-Net output images (Phase 2, not yet implemented).
-# For testing, you can pass the original keyframes directory as a placeholder,
-# which produces an identity-like calibration useful for validating the pipeline.
-# Phase 2 will add `dorea infer` to generate these automatically.
-dorea calibrate \
-  --keyframes /path/to/keyframes \
-  --depth     /path/to/depth_maps \
-  --targets   /path/to/raune_targets \
-  --output    calibration.dorea-cal
-
-# Grade (Phase 3 — not yet implemented)
-dorea grade --input dive.mp4 --calibration calibration.dorea-cal --output graded.mp4
+cargo build --release -p dorea-cli
 ```
 
-## Development
+The binary lands at `target/release/dorea`.
+
+## Run
 
 ```bash
-cargo test
-cargo clippy -- -D warnings
+# Auto-detects encoding + output codec. Direct mode, 1440p proxy, batch=8.
+dorea path/to/clip.mp4
+
+# Explicit output path
+dorea path/to/clip.mp4 --output path/to/graded.mov
+
+# Verbose logging
+dorea path/to/clip.mp4 --verbose
 ```
 
-## Key design decisions
+## Configuration
 
-- **σ=0** — no Gaussian smoothing on LUT cells (critical fix from POC)
-- **NN fill** — empty LUT cells get nearest populated cell's value (brute-force L2 in index space)
-- **Adaptive zone boundaries** — depth quantiles, not linspace
-- **6-vector HSL qualifier** — matches DaVinci Resolve secondary color corrector
+Create `dorea.toml` in the current working directory (or `~/.config/dorea/config.toml`):
 
-## Repository layout
+```toml
+[models]
+python           = "/opt/dorea-venv/bin/python"
+raune_weights    = "/path/to/RAUNENet/weights_95.pth"
+raune_models_dir = "/path/to/sea_thru_poc"
 
+[grade]
+# raune_proxy_size = 1440    # long-edge pixels; values above 1440 may OOM on 6 GB VRAM
+# direct_batch_size = 8      # frames per RAUNE forward pass; max 32
 ```
-Cargo.toml          Workspace manifest
-crates/             Rust crates (see above)
-luts/               Reference .cube LUT files (data, not generated)
-references/         Reference still images for LUT generation
-```
 
-See `underwater_pipeline_architecture.docx` for the full architecture document.
+CLI flags always override config values. See `dorea --help` for the full list.
+
+## Tunables
+
+- `--raune-proxy-size N` — RAUNE input long-edge in pixels. Default **1440**. Lower = faster but noisier upscale; higher = better ΔE but more VRAM + compute. Delta upscale bench (1080p vs 1440p) showed ~8% ΔE improvement at 1440p with no upscale-stage cost.
+- `--direct-batch-size N` — frames per RAUNE forward pass. Default **8**. fp16 activation memory is ~½ of fp32, so batch=8 fp16 fits in the same VRAM envelope as batch=4 fp32. Values above 8 show diminishing returns; `N > 16` regresses throughput.
+
+## Breaking changes from previous `dorea`
+
+This release removes the `calibrate`, `preview`, and `probe` subcommands and the entire 3D LUT / depth-zones / YOLO-seg / Maxine pipeline. `dorea grade` is gone; the new form is `dorea <input>` with `<input>` as a positional argument (no `--input` flag). Existing `dorea.toml` files will parse but fields for removed features (`[maxine]`, `[preview]`, `[inference]`, most of `[grade]`) are silently ignored.
