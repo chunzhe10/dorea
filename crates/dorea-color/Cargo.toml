@@ -1,5 +1,0 @@
-[package]
-name = "dorea-color"
-version.workspace = true
-edition.workspace = true
-
