@@ -199,7 +199,7 @@ def pytorch_oklab_transfer(frame_nchw_f32, delta_nchw_f32):
 # Single-process mode (PyAV decode + encode, zero pipes)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_single_process(args, model, normalize, model_dtype, _use_trt=False, _use_nvdec=False):
+def run_single_process(args, model, normalize, model_dtype, _use_trt=False, _use_nvdec=False, _hwaccel=None):
     """Decode → GPU process → encode, all in one process via PyAV."""
     import av
 
@@ -221,11 +221,8 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False, _use
         print("[raune-filter] Using PyTorch OKLab (Triton unavailable)", file=sys.stderr, flush=True)
 
     # Open input
-    if _use_nvdec:
-        from av.codec.hwaccel import HWAccel
-        hwaccel = HWAccel(device_type='cuda', device=0,
-                          allow_software_fallback=False, is_hw_owned=True)
-        in_container = av.open(args.input, hwaccel=hwaccel)
+    if _use_nvdec and _hwaccel is not None:
+        in_container = av.open(args.input, hwaccel=_hwaccel)
         print("[raune-filter] NVDEC hardware decode enabled", file=sys.stderr, flush=True)
     else:
         in_container = av.open(args.input)
@@ -621,6 +618,26 @@ def main():
     _use_trt = args.tensorrt
     _use_nvdec = args.nvdec
 
+    # Create HWAccel and force CUDA context init BEFORE PyTorch touches CUDA.
+    # PyAV's HWAccel creates a CUDA context with flags that conflict with
+    # PyTorch's primary context. Opening a container triggers the CUDA init,
+    # so we probe the input file here. PyTorch then joins the existing context.
+    _hwaccel = None
+    if _use_nvdec:
+        import av as _av_probe
+        from av.codec.hwaccel import HWAccel
+        _hwaccel = HWAccel(device_type='cuda', device=0,
+                           allow_software_fallback=False, is_hw_owned=True)
+        # Probe open forces CUDA context creation before PyTorch
+        with _av_probe.open(args.input, hwaccel=_hwaccel) as _probe:
+            _probe_stream = _probe.streams.video[0]
+            print(f"[raune-filter] NVDEC probe: {_probe_stream.codec_context.name} "
+                  f"hwaccel={_probe_stream.codec_context.is_hwaccel}",
+                  file=sys.stderr, flush=True)
+        # Re-create HWAccel for the actual decode (probe consumed the first one)
+        _hwaccel = HWAccel(device_type='cuda', device=0,
+                           allow_software_fallback=False, is_hw_owned=True)
+
     if args.tensorrt:
         from dorea_inference.trt_engine import RauneTRTEngine
         from dorea_inference.export_onnx import export_raune_onnx
@@ -679,7 +696,7 @@ def main():
     if not args.input or not args.output:
         print("error: --input and --output are required", file=sys.stderr)
         sys.exit(1)
-    run_single_process(args, model, normalize, model_dtype, _use_trt=_use_trt, _use_nvdec=_use_nvdec)
+    run_single_process(args, model, normalize, model_dtype, _use_trt=_use_trt, _use_nvdec=_use_nvdec, _hwaccel=_hwaccel)
 
 
 if __name__ == "__main__":
