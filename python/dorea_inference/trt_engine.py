@@ -203,6 +203,10 @@ class RauneTRTEngine:
         self.context.set_tensor_address("input", input_tensor.data_ptr())
         self.context.set_tensor_address("output", output.data_ptr())
 
+        # Synchronize the default stream so the input tensor is fully
+        # materialized before TRT reads it on self.stream.
+        torch.cuda.current_stream().synchronize()
+
         self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
         self.stream.synchronize()
 
