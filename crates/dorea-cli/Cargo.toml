@@ -8,23 +8,10 @@ name = "dorea"
 path = "src/main.rs"
 
 [dependencies]
-dorea-color = { workspace = true }
-dorea-lut = { workspace = true }
-dorea-hsl = { workspace = true }
-dorea-cal = { workspace = true }
-dorea-gpu = { workspace = true }
 dorea-video = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-crossbeam-channel = "0.5"
-image = "0.25"
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
-memmap2 = "0.9"
 serde = { workspace = true }
 toml = { workspace = true }
-
-[features]
-# Mirrors dorea-gpu: activated by build.rs (nvcc detection), not manually.
-# Declared here so Cargo recognises `#[cfg(feature = "cuda")]` as a valid condition.
-cuda = []
