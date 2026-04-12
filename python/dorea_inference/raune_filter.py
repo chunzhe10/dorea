@@ -473,23 +473,30 @@ def run_single_process(args, model, normalize, model_dtype):
 
 
 def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn, model_dtype):
-    """Process a batch of frames on GPU. Returns list of uint8 HWC numpy arrays."""
+    """Process a batch of frames on GPU. Returns list of uint16 HWC numpy arrays."""
     n = len(batch_frames_np)
     results = []
 
     with torch.no_grad():
-        # Build proxy batch for RAUNE
+        # Upload once as int32, keep on GPU for reuse in apply loop.
+        # int32 because PyTorch has no uint16 — torch.from_numpy(uint16)
+        # reinterprets as int16 (signed), corrupting values > 32767.
+        full_gpu_cache = []
         proxy_tensors = []
         for rgb_np in batch_frames_np:
-            # uint8 → float [0,1] on GPU
-            full_t = torch.from_numpy(rgb_np).cuda().float() / 255.0  # (H,W,3)
-            full_t = full_t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+            t_i32 = torch.from_numpy(rgb_np.astype(np.int32)).cuda()  # int32 on GPU
+            full_gpu_cache.append(t_i32)
+            full_f32 = t_i32.float() / 65535.0                   # (H,W,3) fp32 [0,1]
+            full_f32 = full_f32.permute(2, 0, 1).unsqueeze(0)    # (1,3,H,W)
             # Downscale to proxy
-            proxy_t = F.interpolate(full_t, size=(ph, pw), mode="bilinear", align_corners=False)
+            proxy_t = F.interpolate(full_f32, size=(ph, pw), mode="bilinear", align_corners=False)
             proxy_norm = (proxy_t - 0.5) / 0.5  # Normalize for RAUNE: [0,1] → [-1,1]
             proxy_tensors.append(proxy_norm.squeeze(0))
-            del full_t
+            del full_f32                                          # free fp32, keep int32
 
+        # RAUNE inference + OKLab delta — unchanged from 8-bit path.
+        # The proxy normalization produces [-1, 1] range regardless of whether
+        # the source was 8-bit or 10-bit, so this section is unaffected.
         proxy_batch = torch.stack(proxy_tensors).cuda()
         del proxy_tensors
 
@@ -522,21 +529,21 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         delta_full = F.interpolate(delta_lab, size=(fh, fw), mode="bilinear", align_corners=False)
         del delta_lab
 
-        # Apply transfer per frame
+        # Apply transfer per frame — reuse GPU cache, no re-upload
         for i in range(n):
-            full_t = torch.from_numpy(batch_frames_np[i]).cuda().float() / 255.0
+            full_t = full_gpu_cache[i].float() / 65535.0
             full_t = full_t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
 
             result = transfer_fn(full_t, delta_full[i:i+1])
             del full_t
 
-            # GPU → CPU → uint8
-            result_u8 = (result.squeeze(0).permute(1, 2, 0).clamp(0, 1) * 255.0
-                         ).to(torch.uint8).cpu().numpy()
-            results.append(result_u8)
+            # GPU → CPU → uint16 (round-half-up to avoid systematic -0.5 LSB bias)
+            result_u16 = (result.squeeze(0).permute(1, 2, 0).clamp(0, 1) * 65535.0 + 0.5
+                         ).to(torch.int32).cpu().numpy().astype(np.uint16)
+            results.append(result_u16)
             del result
 
-        del delta_full
+        del full_gpu_cache, delta_full
 
     return results
 
