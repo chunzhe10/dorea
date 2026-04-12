@@ -1,19 +1,17 @@
-"""RAUNE-Net OKLab chroma transfer — single-process, zero-pipe.
+"""RAUNE-Net OKLab chroma transfer — single-process, 10-bit.
 
-Decodes input video via PyAV, processes on GPU, encodes output via PyAV.
-No stdin/stdout pipe I/O — all frame data stays in-process.
+Decodes input video via PyAV (rgb48le for 10-bit preservation), processes
+on GPU with int32 frame cache to avoid redundant PCIe transfers, encodes
+output via PyAV (rgb48le → yuv422p10le for ProRes).
 
 Pipeline per batch:
-  1. PyAV decode → numpy → GPU upload
+  1. PyAV decode (rgb48le uint16) → numpy → int32 GPU upload (cached)
   2. Downscale to proxy on GPU (torch.interpolate)
-  3. Batch RAUNE inference on proxy
-  4. OKLab delta computation at proxy on GPU
-  5. Upscale deltas to full-res on GPU (Triton kernel)
-  6. Full-res OKLab transfer via fused Triton kernel
-  7. GPU download → PyAV encode
-
-Supports both single-process mode (--input/--output) and legacy pipe mode
-(reads rgb48le from stdin, writes to stdout) for backward compatibility.
+  3. Batch RAUNE inference on proxy (fp16)
+  4. OKLab delta computation at proxy on GPU (fp32)
+  5. Upscale deltas to full-res on GPU
+  6. Full-res OKLab transfer via fused Triton kernel (fp32 in, fp16 out)
+  7. GPU download (uint16) → PyAV encode (rgb48le)
 """
 
 import sys
