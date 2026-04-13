@@ -152,3 +152,22 @@ class TestSchemaRoundTrip:
         path.write_text(json.dumps({"schema_version": 999}))
         with pytest.raises(ValueError, match="schema_version"):
             BenchResult.load(path)
+
+
+class TestSysStateCapture:
+    def test_capture_returns_systemstate(self):
+        import sys as _sys
+        from pathlib import Path as _Path
+        bench_dir = _Path(__file__).resolve().parents[2] / "scripts" / "bench"
+        _sys.path.insert(0, str(bench_dir))
+        from sysstate import capture_system_state
+        from schema import SystemState
+
+        state = capture_system_state()
+        assert isinstance(state, SystemState)
+        assert state.gpu_name  # non-empty
+        assert state.driver_version  # non-empty
+        assert state.pcie_link_gen_current in (1, 2, 3, 4, 5)
+        assert state.pcie_health_gbps > 0
+        assert state.python_version.startswith("3.")
+        assert state.torch_version  # non-empty
