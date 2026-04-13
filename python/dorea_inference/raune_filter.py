@@ -482,8 +482,11 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         # reinterprets as int16 (signed), corrupting values > 32767.
         full_gpu_cache = []
         proxy_tensors = []
+        # Pre-allocate pinned upload buffer (reused per frame, pin once not per-frame)
+        pinned_ul = torch.empty((fh, fw, 3), dtype=torch.int32, pin_memory=True)
         for rgb_np in batch_frames_np:
-            t_i32 = torch.from_numpy(rgb_np.astype(np.int32)).cuda()  # int32 on GPU
+            np.copyto(pinned_ul.numpy(), rgb_np.astype(np.int32))
+            t_i32 = pinned_ul.cuda(non_blocking=True)
             full_gpu_cache.append(t_i32)
             full_f32 = t_i32.float() / 65535.0                   # (H,W,3) fp32 [0,1]
             full_f32 = full_f32.permute(2, 0, 1).unsqueeze(0)    # (1,3,H,W)
@@ -529,6 +532,9 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         delta_full = F.interpolate(delta_lab, size=(fh, fw), mode="bilinear", align_corners=False)
         del delta_lab
 
+        # Pre-allocate pinned host buffer for download (~3.5× faster than pageable)
+        pinned_dl = torch.empty((fh, fw, 3), dtype=torch.int32, pin_memory=True)
+
         # Apply transfer per frame — reuse GPU cache, no re-upload
         for i in range(n):
             full_t = full_gpu_cache[i].float() / 65535.0
@@ -537,11 +543,12 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
             result = transfer_fn(full_t, delta_full[i:i+1])
             del full_t
 
-            # GPU → CPU → uint16 (round-half-up to avoid systematic -0.5 LSB bias)
-            result_u16 = (result.squeeze(0).permute(1, 2, 0).clamp(0, 1) * 65535.0 + 0.5
-                         ).to(torch.int32).cpu().numpy().astype(np.uint16)
-            results.append(result_u16)
-            del result
+            # GPU → pinned CPU → uint16 (round-half-up to avoid systematic -0.5 LSB bias)
+            gpu_i32 = (result.squeeze(0).permute(1, 2, 0).clamp(0, 1) * 65535.0 + 0.5
+                      ).to(torch.int32)
+            pinned_dl.copy_(gpu_i32)
+            results.append(pinned_dl.numpy().astype(np.uint16))
+            del result, gpu_i32
 
         del full_gpu_cache, delta_full
 
