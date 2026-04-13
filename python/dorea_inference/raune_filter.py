@@ -289,6 +289,7 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
     # Per-stage cumulative timing (busy time, excluding queue waits)
     decode_busy = 0.0
     gpu_busy = 0.0
+    gpu_kernel_ms_total = 0.0  # CUDA event elapsed time, true GPU wall
     encode_busy = 0.0
 
     # ─── Thread 1: Decoder ─────────────────────────────────────────────────
@@ -332,7 +333,7 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
 
     # ─── Thread 2: GPU processing ──────────────────────────────────────────
     def gpu_thread() -> None:
-        nonlocal gpu_busy
+        nonlocal gpu_busy, gpu_kernel_ms_total
         try:
             while True:
                 if stop_event.is_set():
@@ -355,6 +356,7 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
                     )
                     raise
                 gpu_busy += time.perf_counter() - t0
+                gpu_kernel_ms_total += _process_batch.last_gpu_kernel_ms
                 if not put_or_stop(q_processed, results, stop_event):
                     return
         except BaseException as e:
@@ -464,7 +466,8 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
           file=sys.stderr, flush=True)
     print(f"[raune-filter] stage timing (busy ms/frame): "
           f"decode={decode_busy*1000/n:.1f} "
-          f"gpu={gpu_busy*1000/n:.1f} "
+          f"gpu_thread={gpu_busy*1000/n:.1f} "
+          f"gpu_kernel={gpu_kernel_ms_total/n:.1f} "
           f"encode={encode_busy*1000/n:.1f} "
           f"wall={elapsed*1000/n:.1f}",
           file=sys.stderr, flush=True)
@@ -476,12 +479,18 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
     n = len(batch_frames_np)
     results = []
 
+    # CUDA event for per-batch GPU wall-time measurement
+    _start_evt = torch.cuda.Event(enable_timing=True)
+    _end_evt = torch.cuda.Event(enable_timing=True)
+    _start_evt.record()
+
     with torch.no_grad():
         # Upload once as int32, keep on GPU for reuse in apply loop.
         # int32 because PyTorch has no uint16 — torch.from_numpy(uint16)
         # reinterprets as int16 (signed), corrupting values > 32767.
+        torch.cuda.nvtx.range_push("upload")
         full_gpu_cache = []
-        proxy_tensors = []
+        full_nchw_cache = []
         # Pre-allocate pinned upload buffer (reused per frame, pin once not per-frame)
         pinned_ul = torch.empty((fh, fw, 3), dtype=torch.int32, pin_memory=True)
         for rgb_np in batch_frames_np:
@@ -489,12 +498,17 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
             t_i32 = pinned_ul.cuda(non_blocking=True)
             full_gpu_cache.append(t_i32)
             full_f32 = t_i32.float() / 65535.0                   # (H,W,3) fp32 [0,1]
-            full_f32 = full_f32.permute(2, 0, 1).unsqueeze(0)    # (1,3,H,W)
-            # Downscale to proxy
-            proxy_t = F.interpolate(full_f32, size=(ph, pw), mode="bilinear", align_corners=False)
+            full_nchw_cache.append(full_f32.permute(2, 0, 1).unsqueeze(0))
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("proxy_downscale")
+        proxy_tensors = []
+        for full_nchw in full_nchw_cache:
+            proxy_t = F.interpolate(full_nchw, size=(ph, pw), mode="bilinear", align_corners=False)
             proxy_norm = (proxy_t - 0.5) / 0.5  # Normalize for RAUNE: [0,1] → [-1,1]
             proxy_tensors.append(proxy_norm.squeeze(0))
-            del full_f32                                          # free fp32, keep int32
+        del full_nchw_cache
+        torch.cuda.nvtx.range_pop()
 
         # RAUNE inference + OKLab delta — unchanged from 8-bit path.
         # The proxy normalization produces [-1, 1] range regardless of whether
@@ -506,13 +520,16 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         if proxy_batch.dtype != model_dtype:
             proxy_batch = proxy_batch.to(model_dtype)
 
+        torch.cuda.nvtx.range_push("trt_inference")
         # RAUNE inference
         if _use_trt:
             raune_out = model.infer(proxy_batch).float()
         else:
             raune_out = model(proxy_batch).float()
         raune_out = ((raune_out + 1.0) / 2.0).clamp(0.0, 1.0)
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("oklab_delta")
         # Handle U-Net padding
         rh, rw = raune_out.shape[2], raune_out.shape[3]
         if rh != ph or rw != pw:
@@ -531,28 +548,37 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
         # Upscale deltas to full resolution
         delta_full = F.interpolate(delta_lab, size=(fh, fw), mode="bilinear", align_corners=False)
         del delta_lab
+        torch.cuda.nvtx.range_pop()
 
         # Pre-allocate pinned host buffer for download (~3.5× faster than pageable)
         pinned_dl = torch.empty((fh, fw, 3), dtype=torch.int32, pin_memory=True)
 
-        # Apply transfer per frame — reuse GPU cache, no re-upload
         for i in range(n):
+            torch.cuda.nvtx.range_push("apply_transfer")
             full_t = full_gpu_cache[i].float() / 65535.0
             full_t = full_t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
-
             result = transfer_fn(full_t, delta_full[i:i+1])
             del full_t
+            torch.cuda.nvtx.range_pop()
 
+            torch.cuda.nvtx.range_push("download")
             # GPU → pinned CPU → uint16 (round-half-up to avoid systematic -0.5 LSB bias)
             gpu_i32 = (result.squeeze(0).permute(1, 2, 0).clamp(0, 1) * 65535.0 + 0.5
                       ).to(torch.int32)
             pinned_dl.copy_(gpu_i32)
             results.append(pinned_dl.numpy().astype(np.uint16))
             del result, gpu_i32
+            torch.cuda.nvtx.range_pop()
 
         del full_gpu_cache, delta_full
 
+    _end_evt.record()
+    torch.cuda.synchronize()
+    _process_batch.last_gpu_kernel_ms = _start_evt.elapsed_time(_end_evt)
     return results
+
+
+_process_batch.last_gpu_kernel_ms = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
