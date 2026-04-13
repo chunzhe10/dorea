@@ -1,21 +1,33 @@
 """Schema for bench harness JSON results.
 
-Pinned at schema_version=1. Changes to dataclass fields require a version bump
+Pinned at schema_version=2. Changes to dataclass fields require a version bump
 and migration logic in BenchResult.load().
+
+v2 changes from v1:
+- Dropped time_to_first_frame_ms (computation was mathematically wrong)
+- Dropped VramStats (was shipped with zeros — worse than absent)
+- Raise on N=1 in MetricAggregate.from_samples (was silently returning zero-width CI)
+- NaN/Inf disallowed in samples
 """
 
 import json
 import math
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+from scipy import stats
+
+SCHEMA_VERSION = 2
 
 
 @dataclass
 class MetricAggregate:
-    """Aggregated metric across N samples."""
+    """Aggregated metric across N samples.
+
+    N >= 2 is required. Single-sample aggregates are meaningless for comparison
+    (zero stddev hides real variance) and are rejected with a clear error.
+    """
     n_samples: int
     mean: float
     stddev: float
@@ -29,20 +41,25 @@ class MetricAggregate:
         if not samples:
             raise ValueError("MetricAggregate requires at least one sample")
         n = len(samples)
+        if n < 2:
+            raise ValueError(
+                f"MetricAggregate requires N >= 2 samples, got {n}. "
+                "A single sample has no variance estimate and cannot be used "
+                "for statistical comparison."
+            )
+        for x in samples:
+            if math.isnan(x) or math.isinf(x):
+                raise ValueError(
+                    f"MetricAggregate rejects NaN/Inf samples: got {samples!r}"
+                )
         sorted_s = sorted(samples)
         mean = sum(samples) / n
-        if n == 1:
-            stddev = 0.0
-            ci95_lo = mean
-            ci95_hi = mean
-        else:
-            variance = sum((x - mean) ** 2 for x in samples) / (n - 1)
-            stddev = math.sqrt(variance)
-            stderr = stddev / math.sqrt(n)
-            from scipy import stats
-            tcrit = stats.t.ppf(0.975, n - 1)
-            ci95_lo = mean - tcrit * stderr
-            ci95_hi = mean + tcrit * stderr
+        variance = sum((x - mean) ** 2 for x in samples) / (n - 1)
+        stddev = math.sqrt(variance)
+        stderr = stddev / math.sqrt(n)
+        tcrit = float(stats.t.ppf(0.975, n - 1))
+        ci95_lo = mean - tcrit * stderr
+        ci95_hi = mean + tcrit * stderr
         median = sorted_s[n // 2] if n % 2 == 1 else (sorted_s[n // 2 - 1] + sorted_s[n // 2]) / 2
         return cls(
             n_samples=n,
@@ -118,8 +135,20 @@ class RunConfig:
 
 @dataclass
 class ThroughputMetrics:
+    """Throughput metrics. All are MetricAggregate across N samples.
+
+    Metric semantics:
+    - steady_state_fps: frames / (reported_wall - warmup_estimate). Headline.
+    - wall_ms_per_frame: raune-filter's reported wall ms/frame (averaged, includes warmup)
+    - gpu_kernel_ms_per_frame: actual GPU kernel time via CUDA events (averaged)
+    - gpu_thread_wall_ms_per_frame: GPU thread wall time (should ≈ kernel time)
+    - decode/encode_thread_wall_ms_per_frame: CPU thread wall times
+
+    time_to_first_frame_ms was removed in v2 (computation was wrong — used mean
+    wall instead of first frame's actual wall). Will return in Phase 2 when
+    raune-filter emits a real first-frame timestamp.
+    """
     steady_state_fps: MetricAggregate
-    time_to_first_frame_ms: MetricAggregate
     wall_ms_per_frame: MetricAggregate
     gpu_kernel_ms_per_frame: MetricAggregate
     gpu_thread_wall_ms_per_frame: MetricAggregate
@@ -129,6 +158,11 @@ class ThroughputMetrics:
 
 @dataclass
 class NvtxSpanAggregate:
+    """Per-span aggregate. Populated in Phase 2 via torch.profiler NVTX mode.
+
+    Phase 1 always emits an empty list here; the markers are in place in
+    raune_filter.py but no collector is attached.
+    """
     name: str
     count_per_sample: MetricAggregate
     p50_ms: MetricAggregate
@@ -137,18 +171,11 @@ class NvtxSpanAggregate:
 
 
 @dataclass
-class VramStats:
-    peak_allocated_mb: MetricAggregate
-    peak_reserved_mb: MetricAggregate
-
-
-@dataclass
 class BenchResult:
     schema_version: int
     config: RunConfig
     throughput: ThroughputMetrics
     nvtx_spans: list[NvtxSpanAggregate]
-    vram: VramStats
     # Phase 2 slots (None in Phase 1)
     top_ops: list | None = None
     dmon_samples: list | None = None
@@ -163,7 +190,9 @@ class BenchResult:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            json.dump(asdict(self), f, indent=2)
+            # allow_nan=False catches any NaN that slipped through input validation
+            json.dump(asdict(self), f, indent=2, allow_nan=False)
+            f.write("\n")
 
     @classmethod
     def load(cls, path: Path) -> "BenchResult":

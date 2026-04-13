@@ -14,6 +14,7 @@ Pipeline per batch:
   7. GPU download (uint16) → PyAV encode (rgb48le)
 """
 
+import os
 import sys
 import argparse
 import time
@@ -343,7 +344,7 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
                     return
                 t0 = time.perf_counter()
                 try:
-                    results = _process_batch(
+                    results, batch_gpu_kernel_ms = _process_batch(
                         batch, model, normalize,
                         fw, fh, pw, ph, transfer_fn,
                         model_dtype, _use_trt=_use_trt,
@@ -356,7 +357,7 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
                     )
                     raise
                 gpu_busy += time.perf_counter() - t0
-                gpu_kernel_ms_total += _process_batch.last_gpu_kernel_ms
+                gpu_kernel_ms_total += batch_gpu_kernel_ms
                 if not put_or_stop(q_processed, results, stop_event):
                     return
         except BaseException as e:
@@ -475,14 +476,28 @@ def run_single_process(args, model, normalize, model_dtype, _use_trt=False):
 
 
 def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_fn, model_dtype, _use_trt=False):
-    """Process a batch of frames on GPU. Returns list of uint16 HWC numpy arrays."""
+    """Process a batch of frames on GPU.
+
+    Returns (results, gpu_kernel_ms):
+      - results: list of uint16 HWC numpy arrays
+      - gpu_kernel_ms: per-batch GPU wall time via CUDA events, or 0.0 if
+        DOREA_BENCH env var is not set (measurement is opt-in to keep the
+        hot path free of torch.cuda.synchronize() calls in production).
+    """
     n = len(batch_frames_np)
     results = []
 
-    # CUDA event for per-batch GPU wall-time measurement
-    _start_evt = torch.cuda.Event(enable_timing=True)
-    _end_evt = torch.cuda.Event(enable_timing=True)
-    _start_evt.record()
+    # CUDA event timing is opt-in: only enabled when DOREA_BENCH is set.
+    # Forcing torch.cuda.synchronize() on every batch has non-trivial cost
+    # (it serializes the GPU thread with pending CPU work) and would
+    # contaminate non-profiling production runs.
+    _bench_mode = os.environ.get("DOREA_BENCH", "") == "1"
+    _start_evt = None
+    _end_evt = None
+    if _bench_mode:
+        _start_evt = torch.cuda.Event(enable_timing=True)
+        _end_evt = torch.cuda.Event(enable_timing=True)
+        _start_evt.record()
 
     with torch.no_grad():
         # Upload once as int32, keep on GPU for reuse in apply loop.
@@ -572,13 +587,15 @@ def _process_batch(batch_frames_np, model, normalize, fw, fh, pw, ph, transfer_f
 
         del full_gpu_cache, delta_full
 
-    _end_evt.record()
-    torch.cuda.synchronize()
-    _process_batch.last_gpu_kernel_ms = _start_evt.elapsed_time(_end_evt)
-    return results
+    # Bench-mode GPU timing (no-op in production)
+    gpu_kernel_ms = 0.0
+    if _bench_mode:
+        _end_evt.record()
+        # event.synchronize() blocks only on this event, not the whole device
+        _end_evt.synchronize()
+        gpu_kernel_ms = _start_evt.elapsed_time(_end_evt)
 
-
-_process_batch.last_gpu_kernel_ms = 0.0
+    return results, gpu_kernel_ms
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

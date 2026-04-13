@@ -1,10 +1,11 @@
-"""Tests for bench harness JSON schema."""
+"""Tests for bench harness JSON schema (v2)."""
 
 import json
 import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 _BENCH_DIR = Path(__file__).resolve().parents[2] / "scripts" / "bench"
 sys.path.insert(0, str(_BENCH_DIR))
@@ -47,13 +48,10 @@ def _sample_system_state():
 
 
 class TestMetricAggregate:
-    def test_from_samples_single_value(self):
+    def test_from_samples_single_value_raises(self):
         from schema import MetricAggregate
-        m = MetricAggregate.from_samples([5.0])
-        assert m.n_samples == 1
-        assert m.mean == 5.0
-        assert m.stddev == 0.0
-        assert m.median == 5.0
+        with pytest.raises(ValueError, match="N >= 2"):
+            MetricAggregate.from_samples([5.0])
 
     def test_from_samples_known_values(self):
         from schema import MetricAggregate
@@ -66,6 +64,12 @@ class TestMetricAggregate:
         assert abs(m.ci95_lo - (3.0 - 1.963)) < 0.1
         assert abs(m.ci95_hi - (3.0 + 1.963)) < 0.1
 
+    def test_from_samples_even_length_median(self):
+        from schema import MetricAggregate
+        # Median of [1,2,3,4] should be 2.5, not 2 or 3
+        m = MetricAggregate.from_samples([1.0, 2.0, 3.0, 4.0])
+        assert m.median == 2.5
+
     def test_raw_samples_retained(self):
         from schema import MetricAggregate
         raw = [1.1, 2.2, 3.3]
@@ -77,15 +81,45 @@ class TestMetricAggregate:
         with pytest.raises(ValueError, match="at least one sample"):
             MetricAggregate.from_samples([])
 
+    def test_nan_rejected(self):
+        from schema import MetricAggregate
+        with pytest.raises(ValueError, match="NaN"):
+            MetricAggregate.from_samples([float("nan"), 1.0, 2.0])
+
+    def test_inf_rejected(self):
+        from schema import MetricAggregate
+        with pytest.raises(ValueError, match="NaN"):
+            MetricAggregate.from_samples([float("inf"), 1.0, 2.0])
+
 
 class TestSchemaRoundTrip:
     def test_bench_result_round_trip(self, tmp_path):
         from schema import (
             BenchResult, RunConfig, ThroughputMetrics,
-            NvtxSpanAggregate, VramStats, SystemState, SCHEMA_VERSION,
+            NvtxSpanAggregate, SCHEMA_VERSION,
         )
 
-        agg = _sample_aggregate()
+        # Use distinct aggregates per metric so a field-assignment bug in
+        # _from_dict would be caught by the round trip.
+        fps_agg = __import__("schema").MetricAggregate.from_samples(
+            [2.77, 2.81, 2.75, 2.83, 2.78]
+        )
+        gpu_agg = __import__("schema").MetricAggregate.from_samples(
+            [324.5, 325.1, 323.8, 324.9, 324.3]
+        )
+        wall_agg = __import__("schema").MetricAggregate.from_samples(
+            [354.4, 355.1, 353.8, 354.9, 354.3]
+        )
+        decode_agg = __import__("schema").MetricAggregate.from_samples(
+            [24.5, 24.7, 24.3, 24.6, 24.4]
+        )
+        encode_agg = __import__("schema").MetricAggregate.from_samples(
+            [47.0, 47.1, 46.9, 47.0, 47.0]
+        )
+        thread_agg = __import__("schema").MetricAggregate.from_samples(
+            [324.6, 325.2, 323.9, 325.0, 324.4]
+        )
+
         result = BenchResult(
             schema_version=SCHEMA_VERSION,
             config=RunConfig(
@@ -109,32 +143,14 @@ class TestSchemaRoundTrip:
                 pinning_applied=None,
             ),
             throughput=ThroughputMetrics(
-                steady_state_fps=agg,
-                time_to_first_frame_ms=agg,
-                wall_ms_per_frame=agg,
-                gpu_kernel_ms_per_frame=agg,
-                gpu_thread_wall_ms_per_frame=agg,
-                decode_thread_wall_ms_per_frame=agg,
-                encode_thread_wall_ms_per_frame=agg,
+                steady_state_fps=fps_agg,
+                wall_ms_per_frame=wall_agg,
+                gpu_kernel_ms_per_frame=gpu_agg,
+                gpu_thread_wall_ms_per_frame=thread_agg,
+                decode_thread_wall_ms_per_frame=decode_agg,
+                encode_thread_wall_ms_per_frame=encode_agg,
             ),
-            nvtx_spans=[
-                NvtxSpanAggregate(
-                    name="trt_inference",
-                    count_per_sample=agg,
-                    p50_ms=agg,
-                    p95_ms=agg,
-                    total_ms=agg,
-                ),
-            ],
-            vram=VramStats(peak_allocated_mb=agg, peak_reserved_mb=agg),
-            top_ops=None,
-            dmon_samples=None,
-            dram_throughput_pct=None,
-            sm_throughput_pct=None,
-            pyspy_flamegraph_path=None,
-            torch_trace_path=None,
-            nsys_trace_path=None,
-            ncu_report_path=None,
+            nvtx_spans=[],
         )
 
         path = tmp_path / "result.json"
@@ -143,8 +159,10 @@ class TestSchemaRoundTrip:
         assert loaded == result
         assert loaded.schema_version == SCHEMA_VERSION
         assert loaded.config.git_sha == "abc1234"
-        assert loaded.throughput.steady_state_fps.mean == agg.mean
-        assert loaded.nvtx_spans[0].name == "trt_inference"
+        # Check fields were assigned correctly (distinct values would catch swap bugs)
+        assert loaded.throughput.steady_state_fps.mean == fps_agg.mean
+        assert loaded.throughput.gpu_kernel_ms_per_frame.mean == gpu_agg.mean
+        assert loaded.throughput.decode_thread_wall_ms_per_frame.mean == decode_agg.mean
 
     def test_schema_version_mismatch_rejected(self, tmp_path):
         from schema import BenchResult
@@ -153,13 +171,17 @@ class TestSchemaRoundTrip:
         with pytest.raises(ValueError, match="schema_version"):
             BenchResult.load(path)
 
+    def test_schema_version_missing_rejected(self, tmp_path):
+        from schema import BenchResult
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps({"no_version_field": True}))
+        with pytest.raises(ValueError, match="schema_version"):
+            BenchResult.load(path)
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestSysStateCapture:
     def test_capture_returns_systemstate(self):
-        import sys as _sys
-        from pathlib import Path as _Path
-        bench_dir = _Path(__file__).resolve().parents[2] / "scripts" / "bench"
-        _sys.path.insert(0, str(bench_dir))
         from sysstate import capture_system_state
         from schema import SystemState
 
